@@ -1,11 +1,10 @@
 import json
 import os
 import re
-import signal
 import socket
 import sqlite3
-import subprocess
 import sys
+import threading
 import time
 import uuid
 from datetime import datetime, timezone
@@ -18,6 +17,10 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, Response
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
+try:
+    from .g1_robot import connect_robot, execute_robot_program, robot_status, stop_robot
+except ImportError:
+    from g1_robot import connect_robot, execute_robot_program, robot_status, stop_robot
 
 # 确保 unitree_sdk2py 在路径中
 # 假设 backend 文件夹与 unitree_sdk2py 同级，或者已安装
@@ -39,11 +42,14 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# 全局变量存储当前运行的进程
-current_process: Optional[subprocess.Popen] = None
-
 class CodeRequest(BaseModel):
     code: str
+
+class ConnectRobotRequest(BaseModel):
+    interface: Optional[str] = None
+
+class HFTextMotionRequest(BaseModel):
+    prompt: str
 
 class LoginRequest(BaseModel):
     username: str
@@ -72,6 +78,7 @@ DEFAULT_USERS: Dict[str, Dict[str, str]] = {
     "student2": {"username": "student2", "password": "student2", "role": "student"},
 }
 SESSION_TOKENS: Dict[str, str] = {}
+_QUEUE_RUN_LOCK = threading.Lock()
 
 
 def get_db_connection() -> sqlite3.Connection:
@@ -242,9 +249,10 @@ def delete_queue_item_by_id(item_id: str):
 
 def clear_queue_items():
     conn = get_db_connection()
-    conn.execute("DELETE FROM queue")
+    result = conn.execute("DELETE FROM queue WHERE status != 'running'")
     conn.commit()
     conn.close()
+    return result.rowcount
 
 
 def list_projects_for_user(username: str):
@@ -356,106 +364,6 @@ def auth_required(authorization: Optional[str] = Header(default=None)):
     return user
 
 
-def execute_python_code(code: str):
-    global current_process
-
-    if current_process and current_process.poll() is None:
-        kill_process()
-
-    filename = "user_script.py"
-    header = """import sys
-import os
-import time
-import math
-
-sys.path.append(os.getcwd())
-
-class Robot:
-    def stand(self):
-        print("Robot stand")
-
-    def walkForward(self, speed=1.0):
-        print(f"Robot walkForward speed={speed}")
-
-    def walkBackward(self, speed=1.0):
-        print(f"Robot walkBackward speed={speed}")
-
-    def walkSidewaysLeft(self, speed=1.0):
-        print(f"Robot walkSidewaysLeft speed={speed}")
-
-    def walkSidewaysRight(self, speed=1.0):
-        print(f"Robot walkSidewaysRight speed={speed}")
-
-    def turnLeft(self, degrees=90):
-        print(f"Robot turnLeft degrees={degrees}")
-
-    def turnRight(self, degrees=90):
-        print(f"Robot turnRight degrees={degrees}")
-
-    def raiseLeftArm(self, position="mid", degrees=90):
-        print(f"Robot raiseLeftArm position={position} degrees={degrees}")
-
-    def raiseRightArm(self, position="mid", degrees=90):
-        print(f"Robot raiseRightArm position={position} degrees={degrees}")
-
-    def raiseLeftLeg(self, position="mid", degrees=90):
-        print(f"Robot raiseLeftLeg position={position} degrees={degrees}")
-
-    def raiseRightLeg(self, position="mid", degrees=90):
-        print(f"Robot raiseRightLeg position={position} degrees={degrees}")
-
-    def raiseLeftKnee(self):
-        print("Robot raiseLeftKnee")
-
-    def raiseRightKnee(self):
-        print("Robot raiseRightKnee")
-
-    def wait(self, seconds=0.5):
-        time.sleep(float(seconds))
-
-    def waveLeft(self):
-        print("Robot waveLeft")
-
-    def raiseBothArms(self):
-        print("Robot raiseBothArms")
-
-    def kick(self, level="low"):
-        print(f"Robot kick level={level}")
-
-    def danceRoutine(self):
-        print("Robot danceRoutine")
-
-    def walk(self, steps=1):
-        print(f"Robot walk steps={steps}")
-
-    def backward(self, steps=1):
-        print(f"Robot backward steps={steps}")
-
-    def turn(self, direction="left", angle=90):
-        print(f"Robot turn direction={direction} angle={angle}")
-
-    def sidestep(self, direction="left"):
-        print(f"Robot sidestep direction={direction}")
-
-robot = Robot()
-"""
-
-    with open(filename, "w", encoding="utf-8") as f:
-        f.write(header + code)
-
-    try:
-        current_process = subprocess.Popen(
-            [sys.executable, filename],
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True,
-            preexec_fn=os.setsid,
-        )
-        return {"status": "started", "pid": current_process.pid}
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e)) from e
-
-
 @app.get("/api/github-proxy")
 async def github_proxy(url: Optional[str] = Query(None)):
     if not url:
@@ -476,6 +384,47 @@ async def github_proxy(url: Optional[str] = Query(None)):
             )
     except httpx.HTTPError as exc:
         raise HTTPException(status_code=502, detail=f"Failed to fetch the target URL: {exc}") from exc
+
+
+@app.post("/api/hf/text-to-motion")
+async def hf_text_to_motion(request: HFTextMotionRequest, user: dict = Depends(auth_required)):
+    token = os.getenv("HUGGINGFACE_API_TOKEN") or os.getenv("HF_TOKEN")
+    model = os.getenv("HF_TEXT_TO_MOTION_MODEL", "HuggingFaceTB/SmolLM3-3B")
+    if not token:
+        raise HTTPException(status_code=503, detail="Hugging Face inference is not configured on the server")
+    if not request.prompt.strip():
+        raise HTTPException(status_code=400, detail="Prompt is required")
+
+    instruction = (
+        "Convert the user's request into a short sequence using only G1-supported actions: "
+        "walk forward or backward by steps or seconds, slow/fast walking, turn left/right, "
+        "sidestep, wave, raise arms, kick, raise a knee, stand, square path, or zigzag. "
+        "Do not suggest sitting, waiting, stopping, or lowering arms. Return only the sequence.\n"
+        f"User request: {request.prompt.strip()}"
+    )
+    endpoint = f"https://router.huggingface.co/hf-inference/models/{model}"
+    try:
+        async with httpx.AsyncClient(timeout=45.0, follow_redirects=True) as client:
+            response = await client.post(
+                endpoint,
+                headers={"Authorization": f"Bearer {token}"},
+                json={"inputs": instruction, "parameters": {"max_new_tokens": 120, "return_full_text": False}},
+            )
+        data = response.json()
+        if response.status_code >= 400:
+            detail = data.get("error", "Hugging Face inference failed") if isinstance(data, dict) else "Hugging Face inference failed"
+            raise HTTPException(status_code=502, detail=detail)
+        if isinstance(data, list) and data and isinstance(data[0], dict):
+            generated_text = data[0].get("generated_text", "")
+        elif isinstance(data, dict):
+            generated_text = data.get("generated_text", "")
+        else:
+            generated_text = ""
+        if not generated_text.strip():
+            raise HTTPException(status_code=502, detail="Hugging Face returned no generated text")
+        return {"model": model, "text": generated_text.strip()}
+    except httpx.HTTPError as exc:
+        raise HTTPException(status_code=502, detail=f"Hugging Face request failed: {exc}") from exc
 
 
 @app.post("/api/classroom/signup")
@@ -604,22 +553,37 @@ def run_next(user: dict = Depends(auth_required)):
     if user["role"] != "teacher":
         raise HTTPException(status_code=403, detail="Teacher role required")
 
-    queue = list_queue_items()
-    for item in queue:
-        if item["status"] == "queued":
-            set_queue_item_status(item["id"], "running")
-            item["status"] = "running"
-            result = execute_python_code(item["code"])
-            return {"status": "running", "item": item, "process": result}
+    if not _QUEUE_RUN_LOCK.acquire(blocking=False):
+        raise HTTPException(status_code=409, detail="A queued robot program is already running.")
+    try:
+        queue = list_queue_items()
+        for item in queue:
+            if item["status"] == "queued":
+                set_queue_item_status(item["id"], "running")
+                item["status"] = "running"
+                try:
+                    result = execute_robot_program(item["code"])
+                except HTTPException as error:
+                    set_queue_item_status(
+                        item["id"],
+                        "queued" if error.status_code == 409 else "failed",
+                    )
+                    raise
+                set_queue_item_status(item["id"], "completed")
+                item["status"] = "completed"
+                return {"status": "completed", "item": item, "process": result}
 
-    raise HTTPException(status_code=404, detail="No queued student jobs")
+        raise HTTPException(status_code=404, detail="No queued student jobs")
+    finally:
+        _QUEUE_RUN_LOCK.release()
 
 
 @app.post("/api/classroom/stop-current")
 def stop_current(user: dict = Depends(auth_required)):
     if user["role"] != "teacher":
         raise HTTPException(status_code=403, detail="Teacher role required")
-    if kill_process():
+    result = stop_robot()
+    if result["status"] == "stopping":
         queue = list_queue_items()
         for item in reversed(queue):
             if item["status"] == "running":
@@ -642,8 +606,13 @@ def delete_item(item_id: str, user: dict = Depends(auth_required)):
 def clear_queue(user: dict = Depends(auth_required)):
     if user["role"] != "teacher":
         raise HTTPException(status_code=403, detail="Teacher role required")
-    clear_queue_items()
-    return {"status": "cleared"}
+    deleted_count = clear_queue_items()
+    remaining_items = list_queue_items()
+    return {
+        "status": "cleared",
+        "deleted": deleted_count,
+        "remaining": remaining_items,
+    }
 
 
 @app.get("/api/g1-model")
@@ -654,16 +623,40 @@ def g1_model_info():
     with open(G1_URDF_PATH, "r", encoding="utf-8") as urdf_file:
         urdf_text = urdf_file.read()
 
-    joint_names = re.findall(r'<joint\s+name="([^"]+)"[^>]*type="revolute"[^>]*>', urdf_text)
-    links = re.findall(r'<link\s+name="([^"]+)"', urdf_text)
+    cleaned_urdf = re.sub(r'<!--.*?-->', '', urdf_text, flags=re.DOTALL)
+    joint_blocks = re.findall(r'<joint\b[^>]*>.*?</joint>', cleaned_urdf, flags=re.DOTALL)
+    joint_details = []
+    for block in joint_blocks:
+        name_match = re.search(r'<joint\s+name="([^"]+)"', block)
+        type_match = re.search(r'<joint\s+[^>]*type="([^"]+)"', block)
+        if not name_match:
+            continue
+        joint_details.append({
+            "name": name_match.group(1),
+            "type": type_match.group(1) if type_match else "fixed",
+            "parent": re.search(r'<parent\s+link="([^"]+)"', block).group(1) if re.search(r'<parent\s+link="([^"]+)"', block) else None,
+            "child": re.search(r'<child\s+link="([^"]+)"', block).group(1) if re.search(r'<child\s+link="([^"]+)"', block) else None,
+            "axis": re.search(r'<axis\s+xyz="([^"]+)"', block).group(1) if re.search(r'<axis\s+xyz="([^"]+)"', block) else "0 0 0",
+            "origin": re.search(r'<origin\s+xyz="([^"]+)"', block).group(1) if re.search(r'<origin\s+xyz="([^"]+)"', block) else "0 0 0",
+        })
+
+    all_joints = [joint["name"] for joint in joint_details if not joint["name"].startswith("floating_")]
+    revolute_joints = [joint["name"] for joint in joint_details if joint["type"] == "revolute" and not joint["name"].startswith("floating_")]
+    fixed_joints = [joint["name"] for joint in joint_details if joint["type"] == "fixed" and not joint["name"].startswith("floating_")]
+    links = re.findall(r'<link\s+name="([^"]+)"', cleaned_urdf)
 
     return {
         "robotType": "Unitree G1",
         "source": "URDF",
         "sourceFile": "g1_23dof.urdf.txt",
         "baseLink": "pelvis" if "pelvis" in links else (links[0] if links else "pelvis"),
-        "jointCount": len(joint_names),
-        "joints": joint_names,
+        "jointCount": len(revolute_joints),
+        "joints": revolute_joints,
+        "revoluteJoints": revolute_joints,
+        "fixedJoints": fixed_joints,
+        "allJoints": all_joints,
+        "links": links,
+        "jointDetails": joint_details,
     }
 
 
@@ -675,7 +668,7 @@ def serve_g1_urdf():
 @app.get("/api/classroom/status")
 def classroom_status(user: dict = Depends(auth_required)):
     queue = list_queue_items()
-    if current_process and current_process.poll() is None:
+    if robot_status()["running"]:
         return {"status": "running", "queue_length": len(queue)}
     return {"status": "idle", "queue_length": len(queue)}
 
@@ -688,35 +681,32 @@ def classroom_users(user: dict = Depends(auth_required)):
 
 
 @app.post("/api/run")
-def run_code(request: CodeRequest):
-    return execute_python_code(request.code)
+def run_code(request: CodeRequest, user: dict = Depends(auth_required)):
+    if user["role"] != "teacher":
+        raise HTTPException(status_code=403, detail="Teacher role required")
+    return execute_robot_program(request.code)
+
+@app.post("/api/robot/connect")
+def robot_connect(request: ConnectRobotRequest, user: dict = Depends(auth_required)):
+    if user["role"] != "teacher":
+        raise HTTPException(status_code=403, detail="Teacher role required")
+    return connect_robot(request.interface or os.getenv("UNITREE_INTERFACE", "eth0"))
+
+@app.get("/api/robot/status")
+def get_robot_status(user: dict = Depends(auth_required)):
+    if user["role"] != "teacher":
+        raise HTTPException(status_code=403, detail="Teacher role required")
+    return robot_status()
 
 @app.post("/api/stop")
-def stop_code():
-    if kill_process():
-        return {"status": "stopped"}
-    else:
-        return {"status": "no_process_running"}
+def stop_code(user: dict = Depends(auth_required)):
+    if user["role"] != "teacher":
+        raise HTTPException(status_code=403, detail="Teacher role required")
+    return stop_robot()
 
 @app.get("/api/status")
 def get_status():
-    global current_process
-    if current_process and current_process.poll() is None:
-        return {"status": "running"}
-    return {"status": "idle"}
-
-def kill_process():
-    global current_process
-    if current_process and current_process.poll() is None:
-        try:
-            # 杀掉进程组，确保子线程也停止
-            os.killpg(os.getpgid(current_process.pid), signal.SIGTERM)
-            current_process = None
-            return True
-        except Exception as e:
-            print(f"Error killing process: {e}")
-            return False
-    return False
+    return robot_status()
 
 
 def find_available_port(start_port: int = 5179, max_tries: int = 20) -> int:

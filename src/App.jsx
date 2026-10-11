@@ -12,7 +12,11 @@ import * as Zh from 'blockly/msg/zh-hans';
 import 'blockly/blocks';
 import g1BasicConfigZh from '../block_configurations/g1_basic/g1_basic.json';
 import g1BasicConfigEn from '../block_configurations/g1_basic/g1_basic_en.json';
-import { G1_EDU_23_ENV, G1_MOTION_TEMPLATES, SIMULATOR_MODES, createEmptyG1Edu23State, simulateG1Edu23Program } from './sim/g1Edu23Env';
+import { G1_EDU_23_ENV, G1_MOTION_TEMPLATES, SIMULATOR_MODES, buildPlannerMotionCommands, clampScenePoint, createEmptyG1Edu23State, simulateG1Edu23Program } from './sim/g1Edu23Env';
+import G1Simulation3D from './components/G1Simulation3D';
+import { compileMotionPrompt } from './sim/textToMotion';
+import { flattenG1Commands, formatG1Program, G1_COMMANDS, getG1BlocklyCommandBlocks, parseG1Program } from './sim/g1Commands';
+import { createRobotConnection } from './robot/RobotConnection';
 
 const blocklyRuntime = Object.assign({}, Blockly, { Python: pythonGenerator });
 window.Blockly = blocklyRuntime;
@@ -161,7 +165,7 @@ const UI_TEXT = {
     actUndo: "撤销", actRedo: "重做", actToggleCode: "切换代码预览", actAbout: "关于",
     actConfigImport: "导入配置", actConfigExport: "导出配置",
     configTitle: "机器人积木配置",
-    configDesc: "在此自定义机器人专属积木。系统积木和函数积木已内置，无需在此编辑。",
+    configDesc: "机器人命令由共享命令目录管理。旧配置仅供迁移参考，不能增加可执行命令。",
     applyBtn: "应用配置", closeBtn: "关闭", resetBtn: "恢复默认", confirmBtn: "确定", cancelBtn: "取消",
     codeTitle: "PYTHON 预览", loading: "正在加载引擎资源...",
     aboutContent: "Uni++ EDU Studio 是一个专为 Unitree 机器人设计的图形化编程环境。",
@@ -178,7 +182,7 @@ const UI_TEXT = {
     actUndo: "Undo", actRedo: "Redo", actToggleCode: "Toggle Code View", actAbout: "About",
     actConfigImport: "Import Config", actConfigExport: "Export Config",
     configTitle: "Robot Block Config",
-    configDesc: "Customize robot-specific blocks here. System blocks are built-in.",
+    configDesc: "Executable commands come from the shared G1 command catalog. Legacy configs are for migration only and cannot add robot commands.",
     applyBtn: "Apply Config", closeBtn: "Close", resetBtn: "Reset Default", confirmBtn: "OK", cancelBtn: "Cancel",
     codeTitle: "PYTHON PREVIEW", loading: "Loading Engine Resources...",
     aboutContent: "Uni++ EDU Studio is a graphical programming environment for Unitree Robots.",
@@ -602,16 +606,17 @@ export default function App() {
   const codeEditorRef = useRef(null);
   const resizeObserverRef = useRef(null);
   const fileInputRef = useRef(null);
+  const compiledPlannerCodeRef = useRef(null);
   
   const [lang, setLang] = useState('en');
   const [robotConfig, setRobotConfig] = useState(DEFAULT_ROBOT_CONFIG_EN);
-  const [generatedCode, setGeneratedCode] = useState("");
+  const [generatedCode, setGeneratedCode] = useState('');
+  const generatedCodeRef = useRef('');
   const [configText, setConfigText] = useState(JSON.stringify(DEFAULT_ROBOT_CONFIG_EN, null, 2));
   
   const [activeMenu, setActiveMenu] = useState(null);
   const [showConfigEditor, setShowConfigEditor] = useState(false);
   const [showAbout, setShowAbout] = useState(false);
-  const [isCodeOpen, setIsCodeOpen] = useState(false);
   const [isBlocklyLoaded, setIsBlocklyLoaded] = useState(false);
   
   const [promptState, setPromptState] = useState({ isOpen: false, message: '', defaultValue: '', callback: null, inputValue: '' });
@@ -620,20 +625,25 @@ export default function App() {
   // 运行状态管理
   const [isRunning, setIsRunning] = useState(false);
   const [mainTab, setMainTab] = useState('blocks');
-  const [toolPanelWidth, setToolPanelWidth] = useState(420);
+  const [toolPanelRect, setToolPanelRect] = useState({ top: 12, right: 16, width: 520, height: 760 });
   const [toolPanelCollapsed, setToolPanelCollapsed] = useState(false);
+  const toolPanelInteractionRef = useRef(null);
+  const [isSimulatorOpen, setIsSimulatorOpen] = useState(false);
+  const [motionPrompt, setMotionPrompt] = useState('Walk forward 3 steps, turn left 90 degrees, then wave');
+  const [motionPromptResult, setMotionPromptResult] = useState(null);
+  const [motionPromptStatus, setMotionPromptStatus] = useState('local');
   const [simulatorMode, setSimulatorMode] = useState('kid-preview');
-  const [simulatorChallenge, setSimulatorChallenge] = useState('simple-path');
   const [simulatorSidebarTab, setSimulatorSidebarTab] = useState('add-object');
   const [sceneObjects, setSceneObjects] = useState([]);
+  const [activeDragItem, setActiveDragItem] = useState(null);
   const [projectName, setProjectName] = useState('default');
   const [projectLibrary, setProjectLibrary] = useState([]);
   const [isPreviewPlaying, setIsPreviewPlaying] = useState(false);
-  const [plannerWaypoints, setPlannerWaypoints] = useState([
-    { id: 'planner-1', x: -8, y: 0 },
-    { id: 'planner-2', x: 0, y: 10 },
-    { id: 'planner-3', x: 14, y: 8 },
-  ]);
+  const [playbackProgress, setPlaybackProgress] = useState(0);
+  const [playbackSpeed, setPlaybackSpeed] = useState(1);
+  const [gridSize, setGridSize] = useState(20);
+  const [plannerWaypoints, setPlannerWaypoints] = useState([]);
+  const [isWaypointPlacementEnabled, setIsWaypointPlacementEnabled] = useState(false);
   const [simulatorState, setSimulatorState] = useState(createEmptyG1Edu23State());
   const [session, setSession] = useState(() => {
     try {
@@ -652,74 +662,27 @@ export default function App() {
   const [authMode, setAuthMode] = useState('login');
   const [loginError, setLoginError] = useState('');
   const [classroomStatus, setClassroomStatus] = useState('idle');
-  const [robotAddress, setRobotAddress] = useState('192.168.123.164');
   const [robotConnectionStatus, setRobotConnectionStatus] = useState('Not connected');
   const [isRobotConnected, setIsRobotConnected] = useState(false);
+  const [isRobotConnecting, setIsRobotConnecting] = useState(false);
   const [safetyNotice, setSafetyNotice] = useState('');
+  const [blockSyncError, setBlockSyncError] = useState('');
 
   const t = UI_TEXT[lang];
   const sceneObjectsKey = session?.user?.username ? `edu-scene-objects:${session.user.username}` : 'edu-scene-objects';
-  const insertRobotCommandWithValue = (commandType, defaultValue = 3, unitLabel = 'steps') => {
-    const valueText = window.prompt(`Enter ${unitLabel}:`, String(defaultValue));
-    if (valueText === null) return;
 
-    const numericValue = Number(valueText);
-    if (!Number.isFinite(numericValue)) {
-      alert(`Please enter a valid ${unitLabel}.`);
-      return;
-    }
-
-    const commandMap = {
-      walkForward: `robot.walkForward(${clampSafeValue('STEPS', numericValue)});`,
-      walkBackward: `robot.walkBackward(${clampSafeValue('STEPS', numericValue)});`,
-      walkSidewaysLeft: `robot.walkSidewaysLeft(${clampSafeValue('STEPS', numericValue)});`,
-      walkSidewaysRight: `robot.walkSidewaysRight(${clampSafeValue('STEPS', numericValue)});`,
-      wait: `robot.wait(${clampSafeValue('SECONDS', numericValue)});`,
-      repeat: `robot.repeatLoop(${clampSafeValue('STEPS', numericValue)});`,
-      raiseBothArms: 'robot.raiseBothArms();',
-      lowerBothArms: 'robot.lowerBothArms();',
-      stop: 'robot.stop();',
-      sit: 'robot.sit();',
-    };
-
-    const snippet = commandMap[commandType];
-    if (!snippet) return;
-
-    insertRobotCommand(snippet);
-  };
-
-  const quickRobotCommands = [
-    { label: 'robot.stand();', snippet: 'robot.stand();' },
-    { label: 'robot.stop();', snippet: 'robot.stop();' },
-    { label: 'robot.sit();', snippet: 'robot.sit();' },
-    { label: 'robot.walkForward();', snippet: 'robot.walkForward();' },
-    { label: 'Walk Forward (steps)', action: () => insertRobotCommandWithValue('walkForward', 3, 'steps') },
-    { label: 'robot.walkBackward();', snippet: 'robot.walkBackward();' },
-    { label: 'Walk Back (steps)', action: () => insertRobotCommandWithValue('walkBackward', 3, 'steps') },
-    { label: 'Walk Left (steps)', action: () => insertRobotCommandWithValue('walkSidewaysLeft', 2, 'steps') },
-    { label: 'Walk Right (steps)', action: () => insertRobotCommandWithValue('walkSidewaysRight', 2, 'steps') },
-    { label: 'robot.turnLeft(90);', snippet: 'robot.turnLeft(90);' },
-    { label: 'robot.turnRight(90);', snippet: 'robot.turnRight(90);' },
-    { label: 'robot.raiseBothArms();', snippet: 'robot.raiseBothArms();' },
-    { label: 'robot.lowerBothArms();', snippet: 'robot.lowerBothArms();' },
-    { label: 'robot.raiseLeftArm("high", 90);', snippet: 'robot.raiseLeftArm("high", 90);' },
-    { label: 'robot.raiseRightArm("mid", 90);', snippet: 'robot.raiseRightArm("mid", 90);' },
-    { label: 'robot.raiseLeftKnee();', snippet: 'robot.raiseLeftKnee();' },
-    { label: 'robot.raiseRightKnee();', snippet: 'robot.raiseRightKnee();' },
-    { label: 'Wait (seconds)', action: () => insertRobotCommandWithValue('wait', 1, 'seconds') },
-    { label: 'Repeat (times)', action: () => insertRobotCommandWithValue('repeat', 3, 'times') },
-    { label: 'robot.waveLeft();', snippet: 'robot.waveLeft();' },
-    { label: 'robot.waveRight();', snippet: 'robot.waveRight();' },
-  ];
-
+  useEffect(() => {
+    generatedCodeRef.current = generatedCode;
+  }, [generatedCode]);
   const overlayTabs = [
     { id: 'blocks', label: 'Blocks' },
-    { id: 'planner', label: 'Motion Planner' },
-    { id: 'camera', label: 'Camera Motion Tracker' },
     { id: 'ide', label: 'IDE' },
+    { id: 'planner', label: 'Path Planner' },
+    { id: 'prompt', label: 'Prompt to Motion' },
+    { id: 'camera', label: 'Vision to Motion' },
   ];
 
-  const apiFetch = async (url, options = {}) => {
+  const apiFetch = useCallback(async (url, options = {}) => {
     const headers = {
       'Content-Type': 'application/json',
       ...(session?.token ? { Authorization: `Bearer ${session.token}` } : {}),
@@ -734,7 +697,12 @@ export default function App() {
       throw new Error(data.detail || data.message || 'Request failed');
     }
     return data;
-  };
+  }, [session?.token]);
+
+  const robotConnection = useMemo(
+    () => createRobotConnection('sdk', { request: apiFetch }),
+    [apiFetch],
+  );
 
   const refreshClassroomData = useCallback(async () => {
     if (!session?.token) return;
@@ -754,7 +722,7 @@ export default function App() {
     } catch (err) {
       console.error('Failed to refresh classroom data:', err);
     }
-  }, [session]);
+  }, [session, apiFetch]);
 
   useEffect(() => {
     if (session) {
@@ -770,6 +738,19 @@ export default function App() {
         setSceneObjects([]);
       }
       refreshClassroomData();
+      if (session.user.role === 'teacher') {
+        robotConnection.status()
+          .then((status) => {
+            setIsRobotConnected(status.sdkAvailable);
+            setRobotConnectionStatus(status.sdkAvailable
+              ? `SDK connected on ${status.interface}`
+              : 'Disconnected • backend must run on the G1 computer');
+          })
+          .catch((error) => {
+            setIsRobotConnected(false);
+            setRobotConnectionStatus(`Robot status unavailable: ${error.message}`);
+          });
+      }
       apiFetch('/api/classroom/project?name=default')
         .then((response) => {
           if (response.project && Array.isArray(response.project.sceneObjects)) {
@@ -779,7 +760,7 @@ export default function App() {
             setPlannerWaypoints(response.project.plannerWaypoints);
           }
           if (response.project && typeof response.project.generatedCode === 'string') {
-            setGeneratedCode(response.project.generatedCode);
+            applyGeneratedCode(response.project.generatedCode, { syncBlocks: true });
           }
         })
         .catch(() => {
@@ -788,7 +769,7 @@ export default function App() {
     } else {
       localStorage.removeItem('edu-classroom-session');
     }
-  }, [session, refreshClassroomData, sceneObjectsKey]);
+  }, [session, refreshClassroomData, sceneObjectsKey, robotConnection, apiFetch]);
 
   useEffect(() => {
     if (session?.user?.username) {
@@ -887,7 +868,7 @@ export default function App() {
       const response = await apiFetch('/api/classroom/run-next', { method: 'POST' });
       setClassroomStatus(response.status || 'running');
       await refreshClassroomData();
-      alert('Started the next queued student job.');
+      alert(`SDK finished sending ${response.process?.commandsExecuted ?? 0} command(s) from ${response.item?.name || 'the queued program'}. Physical movement is not verified by the SDK.`);
     } catch (e) {
       alert('Could not start next queue item: ' + e.message);
     }
@@ -913,31 +894,58 @@ export default function App() {
   };
 
   const handleClearQueue = async () => {
+    if (!window.confirm('Clear all waiting and finished queue items? A currently running job will be kept.')) return;
     try {
-      await apiFetch('/api/classroom/clear-queue', { method: 'POST' });
-      await refreshClassroomData();
+      const result = await apiFetch('/api/classroom/clear-queue', { method: 'POST' });
+      setQueueItems(result.remaining || []);
+      alert(`Cleared ${result.deleted} queue item${result.deleted === 1 ? '' : 's'}.`);
     } catch (e) {
       alert('Clear queue failed: ' + e.message);
     }
   };
 
-  const handleConnectRobot = () => {
+  const handleConnectRobot = async () => {
     if (!session || session.user.role !== 'teacher') {
       alert('Teacher login is required to connect the robot.');
       return;
     }
 
-    const cleanAddress = robotAddress.trim();
-    if (!cleanAddress) {
-      alert('Please enter the G1 IP address first.');
+    setIsRobotConnecting(true);
+    setRobotConnectionStatus('Connecting through the G1 host network interface...');
+    try {
+      const connection = await robotConnection.connect();
+      if (connection.status !== 'connected') {
+        throw new Error('Backend did not confirm a connected robot.');
+      }
+      setIsRobotConnected(true);
+      setRobotConnectionStatus(`Connected • SDK on ${connection.interface}, domain ${connection.domain}${connection.logFile ? ` • session log: ${connection.logFile}` : ''}`);
+    } catch (error) {
+      setIsRobotConnected(false);
+      setRobotConnectionStatus(`Connection failed: ${error.message}`);
+      alert(`Robot connection failed: ${error.message}`);
+    } finally {
+      setIsRobotConnecting(false);
+    }
+  };
+
+  const handleTestRobotMotion = async () => {
+    if (!isRobotConnected) {
+      alert('Connect the G1 SDK before testing motion.');
       return;
     }
+    if (!window.confirm('Only continue if the G1 is upright and stable, the area is clear, and someone is ready at the emergency stop. This sends a 0.5-second slow forward movement (about 10 cm). The app cannot verify physical movement. Continue?')) return;
 
-    setRobotConnectionStatus(`Connecting to ${cleanAddress}...`);
-    setTimeout(() => {
-      setIsRobotConnected(true);
-      setRobotConnectionStatus(`Connected to ${cleanAddress} • ready for classroom queue`);
-    }, 400);
+    setIsRunning(true);
+    setRobotConnectionStatus('Sending a brief slow-motion test...');
+    try {
+      const result = await robotConnection.run('robot.slowwalktime(0.5)');
+      setRobotConnectionStatus(`SDK finished sending the motion test (${result.commandsExecuted} command). Physical movement is not verified.`);
+    } catch (error) {
+      setRobotConnectionStatus(`Motion test failed: ${error.message}`);
+      alert(`Motion test failed: ${error.message}`);
+    } finally {
+      setIsRunning(false);
+    }
   };
 
   useEffect(() => {
@@ -955,11 +963,20 @@ export default function App() {
 
   useEffect(() => {
     if (typeof window !== 'undefined') {
-      window.Blockly = Object.assign({}, Blockly, { Python: pythonGenerator });
-      window.Blockly.setLocale(lang === 'zh' ? Zh : En);
-      window.Blockly.Msg["PROCEDURES_DEFNORETURN_TITLE"] = lang === 'zh' ? "功能名称：" : "Function Name:";
-      window.Blockly.Msg["PROCEDURES_DEFRETURN_TITLE"] = lang === 'zh' ? "功能名称：" : "Function Name:";
-      setIsBlocklyLoaded(true);
+      try {
+        window.Blockly = Object.assign({}, Blockly, { Python: pythonGenerator });
+        if (typeof window.Blockly.setLocale === 'function') {
+          window.Blockly.setLocale(lang === 'zh' ? Zh : En);
+        }
+        if (window.Blockly.Msg) {
+          window.Blockly.Msg["PROCEDURES_DEFNORETURN_TITLE"] = lang === 'zh' ? "功能名称：" : "Function Name:";
+          window.Blockly.Msg["PROCEDURES_DEFRETURN_TITLE"] = lang === 'zh' ? "功能名称：" : "Function Name:";
+        }
+      } catch (error) {
+        console.error('Blockly startup configuration failed; continuing with default locale.', error);
+      } finally {
+        setIsBlocklyLoaded(true);
+      }
     }
   }, [lang]);
 
@@ -977,54 +994,25 @@ export default function App() {
     setRobotConfig(targetDefault);
   };
 
-  const generateToolboxXML = useCallback((robotCategories, language) => {
+  const generateToolboxXML = useCallback((language) => {
     const cats = UI_TEXT[language].toolbox;
-    const systemCategories = language === 'zh' ? SYSTEM_CONFIG_ZH : SYSTEM_CONFIG_EN;
-    const fullCategories = [...systemCategories, ...robotCategories];
-    const robotIdeCategory = `
-      <category name="Robot IDE" colour="210">
-        ${ROBOT_IDE_COMMAND_BLOCKS.map(block => `<block type="${block.type}"></block>`).join('')}
-      </category>
-    `;
-
-    const customCategoriesXml = fullCategories.map(cat => {
-      const blocksXml = cat.blocks.map(block => {
-        const inputs = block.args0?.filter(arg => arg.type === 'input_value') || [];
-        let innerXml = '';
-        inputs.forEach(input => {
-          if (input.check === 'Number') innerXml += `<value name="${input.name}"><shadow type="math_number"><field name="NUM">0</field></shadow></value>`;
-        });
-        return `<block type="${block.type}">${innerXml}</block>`;
-      }).join('');
-      return `<category name="${cat.category}" colour="${cat.colour}">${blocksXml}</category>`;
+    const categories = [...new Set(G1_COMMANDS.map((definition) => definition.category))];
+    const commandCategoriesXml = categories.map((category) => {
+      const blocks = getG1BlocklyCommandBlocks()
+        .filter((block) => G1_COMMANDS.find((definition) => definition.blockType === block.type)?.category === category)
+        .map((block) => `<block type="${block.type}"></block>`)
+        .join('');
+      return `<category name="${category}" colour="${category === 'Gestures' ? 280 : 160}">${blocks}</category>`;
     }).join('');
 
     return `
     <xml xmlns="https://developers.google.com/blockly/xml">
-      ${customCategoriesXml}
-      ${robotIdeCategory}
+      ${commandCategoriesXml}
       <category name="${cats.functions}" colour="290" custom="PROCEDURE"></category>
       <sep></sep>
-      <category name="${cats.logic}" colour="210">
-        <block type="controls_if"></block>
-        <block type="logic_compare"></block>
-        <block type="logic_operation"></block>
-        <block type="logic_boolean"></block>
-      </category>
       <category name="${cats.loops}" colour="120">
         <block type="controls_repeat_ext"><value name="TIMES"><shadow type="math_number"><field name="NUM">10</field></shadow></value></block>
-        <block type="controls_whileUntil"></block>
       </category>
-      <category name="${cats.math}" colour="230">
-        <block type="math_number"></block>
-        <block type="math_arithmetic"></block>
-        <block type="math_random_int"></block>
-      </category>
-      <category name="${cats.text}" colour="160">
-        <block type="text"></block>
-        <block type="text_print"></block>
-      </category>
-      <category name="${cats.variables}" colour="330" custom="VARIABLE"></category>
     </xml>
     `;
   }, []);
@@ -1059,11 +1047,20 @@ export default function App() {
 
     const systemCategories = lang === 'zh' ? SYSTEM_CONFIG_ZH : SYSTEM_CONFIG_EN;
     const allBlocks = [...systemCategories, ...robotCategories].flatMap(cat => cat.blocks);
-    const commandBlocks = ROBOT_IDE_COMMAND_BLOCKS.map(({ codeTemplate, ...rest }) => ({ ...rest }));
-    const definitions = [...allBlocks, ...commandBlocks].map(({ codeTemplate, extensions, ...rest }) => ({ ...rest, extensions: extensions || undefined }));
+    const commandBlocks = [
+      ...ROBOT_IDE_COMMAND_BLOCKS,
+      ...getG1BlocklyCommandBlocks(),
+    ];
+    const definitions = [...allBlocks, ...commandBlocks].map((blockDef) => {
+      const definition = { ...blockDef };
+      delete definition.codeTemplate;
+      definition.extensions = definition.extensions || undefined;
+      return definition;
+    });
     Blockly.common.defineBlocksWithJsonArray(definitions);
     
     [...allBlocks, ...commandBlocks].forEach(blockDef => {
+      if (!blockDef.codeTemplate) return;
       pythonGenerator.forBlock[blockDef.type] = function(block, generator) {
         let code = blockDef.codeTemplate;
         
@@ -1113,12 +1110,15 @@ export default function App() {
       setTimeout(() => promptInputRef.current?.focus(), 100);
     });
 
+    registerBlocks(robotConfig);
+    if (workspaceRef.current) {
+      workspaceRef.current.updateToolbox(generateToolboxXML(lang));
+      return undefined;
+    }
+
     const initTimer = setTimeout(() => {
-        registerBlocks(robotConfig);
-        if (workspaceRef.current) workspaceRef.current.dispose();
-        
         workspaceRef.current = Blockly.inject(blocklyDiv.current, {
-          toolbox: generateToolboxXML(robotConfig, lang),
+          toolbox: generateToolboxXML(lang),
           scrollbars: false,
           move: {
             scrollbars: false,
@@ -1141,9 +1141,6 @@ export default function App() {
         };
 
         const handleBlocklyEvents = (event) => {
-          if ([Blockly.Events.BLOCK_CHANGE, Blockly.Events.BLOCK_MOVE, Blockly.Events.BLOCK_DELETE, Blockly.Events.VAR_CREATE, Blockly.Events.VAR_DELETE, Blockly.Events.VAR_RENAME].includes(event.type)) {
-            try { setGeneratedCode(pythonGenerator.workspaceToCode(workspaceRef.current)); } catch(e) {}
-          }
           if (event.type === Blockly.Events.UI || event.element === 'category') {
              setTimeout(forceResize, 50);
              setTimeout(forceResize, 200);
@@ -1162,16 +1159,27 @@ export default function App() {
         const updateCode = () => {
           try {
             const code = pythonGenerator.workspaceToCode(workspaceRef.current);
-            setGeneratedCode(code);
-          } catch(e) {}
+            applyGeneratedCode(code, { syncBlocks: false });
+            setBlockSyncError('');
+          } catch (error) {
+            setBlockSyncError(`Cannot read the Blocks workspace: ${error.message}`);
+            console.error('Failed to generate code from the Blockly workspace.', error);
+          }
         };
         workspaceRef.current.addChangeListener(updateCode);
+        setTimeout(() => {
+          if (workspaceRef.current && generatedCodeRef.current.trim()) {
+            syncBlocksFromGeneratedCode(generatedCodeRef.current);
+          }
+        }, 150);
     }, 100);
     
     return () => {
-      if (resizeObserverRef.current) resizeObserverRef.current.disconnect();
+      clearTimeout(initTimer);
     };
   }, [isBlocklyLoaded, registerBlocks, generateToolboxXML, robotConfig, lang]);
+
+  useEffect(() => () => resizeObserverRef.current?.disconnect(), []);
 
   const handleApplyConfig = () => { try { setRobotConfig(JSON.parse(configText)); setShowConfigEditor(false); } catch (e) { alert("JSON Error: " + e.message); } };
   const handleImportConfig = (e) => { const r = new FileReader(); r.onload = (ev) => setConfigText(ev.target.result); if(e.target.files[0]) r.readAsText(e.target.files[0]); };
@@ -1203,7 +1211,8 @@ export default function App() {
       workspaceRef.current?.clear();
       setSceneObjects([]);
       setPlannerWaypoints([]);
-      setGeneratedCode('');
+      setIsWaypointPlacementEnabled(false);
+      applyGeneratedCode('', { syncBlocks: false });
       setIsPreviewPlaying(false);
       if (session?.user?.username) {
         localStorage.removeItem(`edu-scene-objects:${session.user.username}`);
@@ -1216,29 +1225,34 @@ export default function App() {
     setProjectName(project.name || 'default');
     setSceneObjects(Array.isArray(project.sceneObjects) ? project.sceneObjects : []);
     setPlannerWaypoints(Array.isArray(project.plannerWaypoints) ? project.plannerWaypoints : []);
-    setGeneratedCode(typeof project.generatedCode === 'string' ? project.generatedCode : '');
-    if (workspaceRef.current && window.Blockly) {
-      syncBlocksFromGeneratedCode(typeof project.generatedCode === 'string' ? project.generatedCode : '');
-    }
+    setIsWaypointPlacementEnabled(false);
+    const nextCode = typeof project.generatedCode === 'string' ? project.generatedCode : '';
+    applyGeneratedCode(nextCode, { syncBlocks: true });
     setMainTab('blocks');
   };
 
-  const addPlannerWaypoint = () => {
-    setPlannerWaypoints((prev) => {
-      const lastPoint = prev[prev.length - 1] || { x: 0, y: 0 };
-      return [
-        ...prev,
-        {
-          id: `planner-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`,
-          x: lastPoint.x + 4,
-          y: lastPoint.y + 2,
-        },
-      ];
-    });
+  const placePlannerWaypoint = ({ x, y }) => {
+    const position = clampScenePoint(x, y, gridSize);
+    setPlannerWaypoints((prev) => [
+      ...prev,
+      {
+        id: `planner-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`,
+        ...position,
+      },
+    ]);
+    setIsWaypointPlacementEnabled(false);
   };
 
   const updatePlannerWaypoint = (id, patch) => {
-    setPlannerWaypoints((prev) => prev.map((point) => point.id === id ? { ...point, ...patch } : point));
+    setPlannerWaypoints((prev) => prev.map((point) => {
+      if (point.id !== id) return point;
+      const nextPosition = clampScenePoint(
+        patch.x !== undefined ? patch.x : point.x,
+        patch.y !== undefined ? patch.y : point.y,
+        gridSize,
+      );
+      return { ...point, ...patch, x: nextPosition.x, y: nextPosition.y };
+    }));
   };
 
   const removePlannerWaypoint = (id) => {
@@ -1250,232 +1264,266 @@ export default function App() {
       alert('Add at least two waypoints before compiling a motion path.');
       return;
     }
+    if (generatedCode.trim() && !window.confirm('Compiling this path will replace the current Blocks and IDE code. Continue?')) return;
 
-    const ordered = [...plannerWaypoints].sort((a, b) => a.x - b.x || a.y - b.y);
-    const commands = ['robot.stand();', 'robot.wait(0.5);'];
-
-    for (let i = 1; i < ordered.length; i += 1) {
-      const from = ordered[i - 1];
-      const to = ordered[i];
-      const dx = to.x - from.x;
-      const dy = to.y - from.y;
-      const distance = Math.hypot(dx, dy);
-      const turn = Math.atan2(dy, dx) * (180 / Math.PI);
-
-      if (Math.abs(turn) > 1) {
-        const direction = turn > 0 ? 'Left' : 'Right';
-        const angle = Math.min(180, Math.abs(turn));
-        commands.push(`robot.turn${direction}(${angle.toFixed(0)});`);
-      }
-
-      if (distance > 0.1) {
-        commands.push(`robot.walkForward(${Math.max(1, Math.round(distance / 4))});`);
-      }
+    const commands = buildPlannerMotionCommands(plannerWaypoints);
+    const plannerCode = commands.join('\n');
+    const safePlannerCode = sanitizeRobotCode(plannerCode).code || plannerCode;
+    if (safePlannerCode !== generatedCode) {
+      compiledPlannerCodeRef.current = safePlannerCode;
     }
-
-    commands.push('robot.stand();');
-    commands.push('console.log("Program complete!");');
-    updateGeneratedCode(commands.join('\n'));
-    setMainTab('ide');
+    updateGeneratedCode(plannerCode);
+    setIsWaypointPlacementEnabled(false);
   };
 
   const handleRunCode = async () => {
     if (isRunning) {
-      try { await fetch('/api/stop', { method: 'POST' }); setIsRunning(false); } catch (e) { alert("Stop Failed: " + e.message); }
+      try {
+        const result = await robotConnection.stop();
+        setIsRunning(false);
+        setRobotConnectionStatus(result.status === 'stopping' ? 'Stopping robot...' : 'Robot is not connected');
+      } catch (error) {
+        alert(`Stop failed: ${error.message}`);
+      }
     } else {
       try {
+        if (!isRobotConnected) throw new Error('Connect the G1 SDK before sending a program.');
+        parseG1Program(generatedCode);
         setIsRunning(true);
-        const res = await fetch('/api/run', { method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({ code: generatedCode }) });
-        if (!res.ok) throw new Error("Server Error");
-      } catch (e) { setIsRunning(false); alert("Run Failed: " + e.message); }
+        const result = await robotConnection.run(generatedCode);
+        setRobotConnectionStatus(`SDK finished sending ${result.commandsExecuted} command(s). Physical movement is not verified.`);
+      } catch (error) {
+        alert(`Robot run failed: ${error.message}`);
+      } finally {
+        setIsRunning(false);
+      }
     }
   };
 
-  const challengeConfig = useMemo(
-    () => G1_EDU_23_ENV.challengeLayouts[simulatorChallenge] || G1_EDU_23_ENV.challengeLayouts['simple-path'],
-    [simulatorChallenge],
-  );
-  const activeObstacles = useMemo(
-    () => (currentUser.role === 'teacher'
-      ? challengeConfig.obstacles
-      : [...challengeConfig.obstacles, ...sceneObjects]),
-    [challengeConfig, currentUser.role, sceneObjects],
-  );
+  const activeObstacles = useMemo(() => sceneObjects, [sceneObjects]);
 
   const previewPreviewState = useCallback(() => {
     const state = simulateG1Edu23Program(generatedCode, {
       mode: simulatorMode,
       obstacles: activeObstacles,
-      challenge: challengeConfig,
     });
     setSimulatorState(state);
-  }, [generatedCode, simulatorMode, challengeConfig, activeObstacles]);
-
-  useEffect(() => {
-    if (!isPreviewPlaying) return;
-    const interval = setInterval(() => {
-      previewPreviewState();
-    }, 700);
-    return () => clearInterval(interval);
-  }, [isPreviewPlaying, previewPreviewState]);
+  }, [generatedCode, simulatorMode, activeObstacles]);
 
   const startSimulationPreview = () => {
     if (!generatedCode.trim()) {
       alert('Add some robot commands before starting the simulation preview.');
       return;
     }
+    setPlaybackProgress((progress) => progress >= 1 ? 0 : progress);
     setIsPreviewPlaying(true);
     previewPreviewState();
   };
 
   const pauseSimulationPreview = () => {
     setIsPreviewPlaying(false);
-    setSimulatorState(simulateG1Edu23Program(generatedCode, {
-      mode: simulatorMode,
-      obstacles: activeObstacles,
-      challenge: challengeConfig,
-    }));
+  };
+
+  const resetSimulationPreview = () => {
+    setIsPreviewPlaying(false);
+    setPlaybackProgress(0);
+  };
+
+  const handleRunSimulation = () => {
+    if (!generatedCode.trim()) {
+      alert('Add code or blocks before running the simulation.');
+      return;
+    }
+    setPlaybackProgress(0);
+    setIsPreviewPlaying(true);
+    setIsWaypointPlacementEnabled(false);
+  };
+
+  const handlePlaybackSpeedChange = (value) => {
+    const numericValue = Number(value);
+    if (!Number.isFinite(numericValue)) return;
+    setPlaybackSpeed(Math.min(3, Math.max(0.1, Math.round(numericValue * 10) / 10)));
   };
 
   const syncBlocksFromGeneratedCode = useCallback((code) => {
-    if (!workspaceRef.current || !window.Blockly) return;
+    if (!workspaceRef.current || !window.Blockly) return false;
     const workspace = workspaceRef.current;
-    workspace.clear();
-
-    const lines = (code || '').split(/\n+/).map((line) => line.trim()).filter(Boolean);
-    if (!lines.length) return;
-
-    let previousBlock = null;
-
-    lines.forEach((line) => {
-      const match = line.match(/^robot\.(\w+)\((.*)\);?$/);
-      const blockTypeMap = {
-        stand: 'robot_stand',
-        walk: 'robot_walk_forward',
-        walkForward: 'robot_walk_forward',
-        walkForwardSteps: 'robot_walk_forward_steps',
-        backward: 'robot_walk_back',
-        walkBackward: 'robot_walk_back',
-        walkBackwardSteps: 'robot_walk_back_steps',
-        sidestep: 'robot_walk_sideways_left',
-        walkSidewaysLeft: 'robot_walk_sideways_left',
-        walkSidewaysLeftSteps: 'robot_walk_sideways_left_steps',
-        walkSidewaysRight: 'robot_walk_sideways_right',
-        walkSidewaysRightSteps: 'robot_walk_sideways_right_steps',
-        turn: 'robot_turn_left',
-        turnLeft: 'robot_turn_left',
-        turnRight: 'robot_turn_right',
-        wait: 'robot_wait',
-        waitSeconds: 'robot_wait_seconds',
-        repeatLoop: 'robot_repeat_loop',
-        stop: 'robot_stop',
-        sit: 'robot_sit',
-        waveLeft: 'robot_wave_left',
-        waveRight: 'robot_wave_right',
-        raiseBothArms: 'robot_raise_both_arms',
-        lowerBothArms: 'robot_lower_both_arms',
-        raiseLeftArm: 'robot_raise_left_arm',
-        raiseRightArm: 'robot_raise_right_arm',
-        raiseLeftLeg: 'robot_left_leg_kick',
-        raiseRightLeg: 'robot_right_leg_kick',
-        raiseLeftKnee: 'robot_raise_left_knee',
-        raiseRightKnee: 'robot_raise_right_knee',
-        kick: 'robot_kick',
-      };
-
-      let blockType = 'raw_code';
-      let data = line;
-      let blockValues = {};
-
-      if (match) {
-        const methodName = match[1];
-        const argsRaw = match[2] || '';
-        blockType = blockTypeMap[methodName] || 'raw_code';
-
-        if (['walk', 'walkForward', 'walkBackward', 'walkSidewaysLeft', 'walkSidewaysRight', 'backward', 'sidestep'].includes(methodName)) {
-          const numberMatch = argsRaw.match(/-?\d*\.?\d+/);
-          const safeSpeed = clampSafeValue('SPEED', numberMatch ? numberMatch[0] : 1);
-          blockValues = { SPEED: safeSpeed };
-        }
-        if (['walkForwardSteps', 'walkBackwardSteps', 'walkSidewaysLeftSteps', 'walkSidewaysRightSteps', 'repeatLoop'].includes(methodName)) {
-          const numberMatch = argsRaw.match(/-?\d*\.?\d+/);
-          const safeSteps = clampSafeValue('STEPS', numberMatch ? numberMatch[0] : 3);
-          blockValues = { STEPS: safeSteps, TIMES: safeSteps };
-        }
-        if (['turn', 'turnLeft', 'turnRight'].includes(methodName)) {
-          if (methodName === 'turn') {
-            const turnArgs = argsRaw.match(/"(.*?)"\s*,\s*(\d+(?:\.\d+)?)/) || argsRaw.match(/'(.*?)'\s*,\s*(\d+(?:\.\d+)?)/);
-            if (turnArgs) {
-              const direction = (turnArgs[1] || 'left').toLowerCase();
-              const safeAngle = clampSafeValue('ANGLE', turnArgs[2]);
-              blockValues = { ANGLE: safeAngle, DIR: direction === 'right' ? 'right' : 'left' };
-              if (direction === 'right') {
-                blockType = 'robot_turn_right';
-              } else {
-                blockType = 'robot_turn_left';
-              }
-            }
+    let nodes;
+    try {
+      nodes = parseG1Program(code || '');
+    } catch (error) {
+      setBlockSyncError(`Cannot display this code as Blocks: ${error.message}`);
+      return false;
+    }
+    setBlockSyncError('');
+    Blockly.Events.disable();
+    try {
+      workspace.clear();
+      const createBlocks = (program, parentConnection = null) => {
+        let previousBlock = null;
+        program.forEach((node) => {
+          const block = node.type === 'repeat'
+            ? workspace.newBlock('controls_repeat_ext')
+            : workspace.newBlock(`g1_command_${node.method}`);
+          if (node.type === 'repeat') {
+            const repeatCount = workspace.newBlock('math_number');
+            repeatCount.setFieldValue(String(node.times), 'NUM');
+            repeatCount.initSvg();
+            repeatCount.render();
+            block.getInput('TIMES').connection.connect(repeatCount.outputConnection);
           } else {
-            const numberMatch = argsRaw.match(/-?\d*\.?\d+/);
-            blockValues = { ANGLE: clampSafeValue('ANGLE', numberMatch ? numberMatch[0] : 90) };
+            const definition = G1_COMMANDS.find((entry) => entry.method === node.method);
+            definition.args.forEach((argument, index) => {
+              block.setFieldValue(String(node.values[index]), argument.name);
+            });
           }
-        }
-        if (['raiseLeftArm', 'raiseRightArm', 'raiseLeftLeg', 'raiseRightLeg'].includes(methodName)) {
-          const quoted = argsRaw.match(/"(.*?)"/) || argsRaw.match(/'(.*?)'/);
-          const degreeMatch = argsRaw.match(/-?\d*\.?\d+/);
-          blockValues = {
-            POSITION: quoted ? quoted[1].toLowerCase() : 'mid',
-            DEGREES: clampSafeValue('DEGREES', degreeMatch ? degreeMatch[0] : 90),
-          };
-        }
-        if (['wait', 'waitSeconds'].includes(methodName)) {
-          const numberMatch = argsRaw.match(/-?\d*\.?\d+/);
-          blockValues = { SECONDS: clampSafeValue('SECONDS', numberMatch ? numberMatch[0] : 0.5) };
-        }
-        if (methodName === 'kick') {
-          const kickArgs = argsRaw.match(/"(.*?)"/) || argsRaw.match(/'(.*?)'/);
-          if (kickArgs) {
-            blockValues = { LEVEL: kickArgs[1].toLowerCase() };
-          }
-        }
+          block.initSvg();
+          block.render();
+          if (previousBlock) previousBlock.nextConnection.connect(block.previousConnection);
+          else if (parentConnection) parentConnection.connect(block.previousConnection);
+          if (node.type === 'repeat') createBlocks(node.body, block.getInput('DO').connection);
+          previousBlock = block;
+        });
+      };
+      createBlocks(nodes);
 
-        if (blockType !== 'raw_code') {
-          data = null;
-        }
+      if (workspace.getAllBlocks().length) {
+        workspace.zoomToFit(0.8);
       }
-
-      const block = workspace.newBlock(blockType);
-      if (data) {
-        block.data = data;
-      }
-      Object.entries(blockValues).forEach(([key, value]) => {
-        if (typeof value === 'string' || typeof value === 'number') {
-          block.setFieldValue(String(value), key);
-        }
-      });
-
-      if (previousBlock) {
-        previousBlock.nextConnection.connect(block.previousConnection);
-      }
-      block.initSvg();
-      block.render();
-      previousBlock = block;
-    });
-
-    if (workspace.getAllBlocks().length) {
-      workspace.centerOnBlocks();
+      return true;
+    } catch (error) {
+      setBlockSyncError(`Cannot display this code as Blocks: ${error.message}`);
+      console.error('Failed to synchronize IDE code to Blockly.', error);
+      return false;
+    } finally {
+      Blockly.Events.enable();
     }
   }, []);
 
-  const updateGeneratedCode = useCallback((nextCode) => {
-    const result = sanitizeRobotCode(nextCode);
-    const safeCode = result.code || nextCode;
+  useEffect(() => {
+    if (mainTab !== 'blocks' || !workspaceRef.current) return;
+    const frame = requestAnimationFrame(() => {
+      if (!workspaceRef.current) return;
+      syncBlocksFromGeneratedCode(generatedCodeRef.current);
+      Blockly.svgResize(workspaceRef.current);
+    });
+    return () => cancelAnimationFrame(frame);
+  }, [mainTab, syncBlocksFromGeneratedCode]);
+
+  const derivePlannerWaypointsFromCode = useCallback((code = '') => {
+    if (!code || !code.trim()) return [];
+    let commands;
+    try {
+      commands = flattenG1Commands(parseG1Program(code));
+    } catch {
+      return [];
+    }
+    if (!commands.length) return [];
+    let x = 0;
+    let y = 0;
+    let heading = 0;
+    const points = [{ id: 'planner-0', x, y }];
+    commands.forEach(({ method, values }) => {
+      const numberOfSteps = Number(values[0] || 0);
+      let forwardDistance = 0;
+      if (method === 'walk') forwardDistance = numberOfSteps * 0.4;
+      if (method === 'backward') forwardDistance = -numberOfSteps * 0.4;
+      if (method === 'walktime') forwardDistance = numberOfSteps * 0.4;
+      if (method === 'backwardtime') forwardDistance = -numberOfSteps * 0.4;
+      if (method === 'slowwalk') forwardDistance = numberOfSteps * 0.2;
+      if (method === 'slowwalktime') forwardDistance = numberOfSteps * 0.2;
+      if (method === 'fastwalk') forwardDistance = numberOfSteps * 0.8;
+      if (method === 'fastwalktime') forwardDistance = numberOfSteps * 0.8;
+      if (method === 'sidestep') {
+        const sideHeading = heading + (values[0] === 'left' ? 90 : -90);
+        x += Math.cos((sideHeading * Math.PI) / 180) * 0.3;
+        y += Math.sin((sideHeading * Math.PI) / 180) * 0.3;
+      } else if (method === 'turn') {
+        heading += values[0] === 'right' ? -Number(values[1]) : Number(values[1]);
+      } else if (forwardDistance) {
+        x += Math.cos((heading * Math.PI) / 180) * forwardDistance;
+        y += Math.sin((heading * Math.PI) / 180) * forwardDistance;
+      } else {
+        return;
+      }
+      points.push({ id: `planner-${points.length}`, x: Number(x.toFixed(2)), y: Number(y.toFixed(2)) });
+    });
+
+    if (points.length < 2) {
+      return [{ id: 'planner-1', x: 0, y: 0 }];
+    }
+
+    return points;
+  }, []);
+
+  useEffect(() => {
+    const isCompiledPlannerPath = compiledPlannerCodeRef.current === generatedCode;
+    compiledPlannerCodeRef.current = null;
+    if (!isCompiledPlannerPath) {
+      const nextWaypoints = derivePlannerWaypointsFromCode(generatedCode);
+      setPlannerWaypoints((previousWaypoints) => {
+        const previousSnapshot = JSON.stringify(previousWaypoints);
+        const nextSnapshot = JSON.stringify(nextWaypoints);
+        return previousSnapshot === nextSnapshot ? previousWaypoints : nextWaypoints;
+      });
+    }
+    setPlaybackProgress(0);
+    setIsPreviewPlaying(false);
+  }, [generatedCode, derivePlannerWaypointsFromCode]);
+
+  const applyGeneratedCode = useCallback((nextCode, options = {}) => {
+    const { syncBlocks = true } = options;
+    let boundedCode = nextCode;
+    let boundsChanged = false;
+    if (nextCode.trim()) {
+      try {
+        boundedCode = formatG1Program(parseG1Program(nextCode));
+        boundsChanged = boundedCode.trim() !== nextCode.trim();
+      } catch {
+        // Keep in-progress IDE edits intact; physical execution validates the complete program.
+      }
+    }
+    const result = sanitizeRobotCode(boundedCode);
+    const safeCode = result.code || boundedCode;
+    generatedCodeRef.current = safeCode;
     setGeneratedCode(safeCode);
-    setSafetyNotice(result.changed ? 'One or more values were adjusted to the safe range.' : '');
-    if (workspaceRef.current && window.Blockly) {
+    setSafetyNotice(result.changed || boundsChanged ? 'Commands were normalized to the shared syntax and safe ranges.' : '');
+    if (syncBlocks && workspaceRef.current && window.Blockly) {
       syncBlocksFromGeneratedCode(safeCode);
     }
   }, [syncBlocksFromGeneratedCode]);
+
+  const updateGeneratedCode = useCallback((nextCode) => {
+    applyGeneratedCode(nextCode, { syncBlocks: true });
+  }, [applyGeneratedCode]);
+
+  const applyMotionPromptResult = (promptText, source) => {
+    const result = compileMotionPrompt(promptText);
+    setMotionPromptResult({ ...result, source });
+    if (result.code) updateGeneratedCode(result.code);
+  };
+
+  const generateMotionFromPrompt = async (useHuggingFace = false) => {
+    if (generatedCode.trim() && !window.confirm('Generating this motion will replace the current Blocks and IDE code. Continue?')) return;
+    setMotionPromptStatus(useHuggingFace ? 'loading' : 'local');
+    if (!useHuggingFace) {
+      applyMotionPromptResult(motionPrompt, 'Local safe compiler');
+      return;
+    }
+
+    try {
+      const response = await apiFetch('/api/hf/text-to-motion', {
+        method: 'POST',
+        body: JSON.stringify({ prompt: motionPrompt }),
+      });
+      setMotionPrompt(response.text);
+      applyMotionPromptResult(response.text, `Hugging Face: ${response.model}`);
+      setMotionPromptStatus('hf');
+    } catch (error) {
+      applyMotionPromptResult(motionPrompt, 'Local fallback');
+      setMotionPromptStatus('fallback');
+    }
+  };
 
   const insertRobotCommand = (snippet) => {
     const nextCode = generatedCode ? `${generatedCode.trimEnd()}\n${snippet}\n` : `${snippet}\n`;
@@ -1484,14 +1532,11 @@ export default function App() {
 
   const handleRecordMotionCapture = () => {
     const sampleScript = [
-      'robot.stand();',
-      'robot.wait(0.5);',
-      'robot.walkForward(3);',
-      'robot.wait(0.5);',
-      'robot.turnLeft(90);',
-      'robot.walkForward(2);',
-      'robot.stand();',
-      'console.log("Program complete!");',
+      'robot.stand()',
+      'robot.walk(3)',
+      'robot.turn("left", 90)',
+      'robot.walk(2)',
+      'robot.stand()',
     ].join('\n');
 
     if (generatedCode && generatedCode.trim()) {
@@ -1504,19 +1549,16 @@ export default function App() {
   };
 
   useEffect(() => {
-    setSimulatorState(simulateG1Edu23Program(generatedCode, { mode: simulatorMode, obstacles: activeObstacles, challenge: challengeConfig }));
-  }, [generatedCode, simulatorMode, challengeConfig, activeObstacles]);
+    setSimulatorState(simulateG1Edu23Program(generatedCode, { mode: simulatorMode, obstacles: activeObstacles }));
+  }, [generatedCode, simulatorMode, activeObstacles]);
 
   const applyMotionTemplate = (template) => {
     updateGeneratedCode(template.code);
   };
 
-  const handleChallengeChange = (challengeKey) => {
-    setSimulatorChallenge(challengeKey);
-  };
-
   const addStudentObstacle = (type = 'box') => {
     const preset = OBJECT_LIBRARY.find((item) => item.id === type) || OBJECT_LIBRARY[0];
+    const defaultPosition = clampScenePoint(0, 0, gridSize);
     setSceneObjects((prev) => [
       ...prev,
       {
@@ -1524,15 +1566,23 @@ export default function App() {
         type: preset.id,
         label: preset.label,
         color: preset.color,
-        x: 0,
-        y: 0,
+        x: defaultPosition.x,
+        y: defaultPosition.y,
         radius: preset.defaultRadius,
       },
     ]);
   };
 
   const updateStudentObstacle = (id, patch) => {
-    setSceneObjects((prev) => prev.map((obstacle) => obstacle.id === id ? { ...obstacle, ...patch } : obstacle));
+    setSceneObjects((prev) => prev.map((obstacle) => {
+      if (obstacle.id !== id) return obstacle;
+      const nextPosition = clampScenePoint(
+        patch.x !== undefined ? patch.x : obstacle.x,
+        patch.y !== undefined ? patch.y : obstacle.y,
+        gridSize,
+      );
+      return { ...obstacle, ...patch, x: nextPosition.x, y: nextPosition.y };
+    }));
   };
 
   const removeStudentObstacle = (id) => {
@@ -1541,44 +1591,70 @@ export default function App() {
 
   const obstacleDragRef = useRef(null);
   const plannerDragRef = useRef(null);
+  const sceneOrigin = 110;
+  const sceneScale = 220 / gridSize;
+  const sceneX = (meters) => sceneOrigin + meters * sceneScale;
+  const sceneY = (meters) => sceneOrigin - meters * sceneScale;
 
   const getSvgCoords = (event) => {
     const svg = event.currentTarget.ownerSVGElement || event.currentTarget;
-    const rect = svg.getBoundingClientRect();
-    const localX = (event.clientX - rect.left - 110) / 1.5;
-    const localY = (110 - (event.clientY - rect.top - 110) / 1.5);
+    const screenPoint = svg.createSVGPoint();
+    screenPoint.x = event.clientX;
+    screenPoint.y = event.clientY;
+    const svgPoint = screenPoint.matrixTransform(svg.getScreenCTM().inverse());
+    const localX = (svgPoint.x - sceneOrigin) / sceneScale;
+    const localY = (sceneOrigin - svgPoint.y) / sceneScale;
     return {
-      x: Math.max(-35, Math.min(35, localX)),
-      y: Math.max(-35, Math.min(35, localY)),
+      x: Math.max(-gridSize / 2, Math.min(gridSize / 2, localX)),
+      y: Math.max(-gridSize / 2, Math.min(gridSize / 2, localY)),
     };
   };
 
   const handleObstaclePointerDown = (event, obstacleId) => {
     if (currentUser.role === 'teacher') return;
     obstacleDragRef.current = { obstacleId, pointerId: event.pointerId };
+    setActiveDragItem({ kind: 'obstacle', id: obstacleId });
+    event.stopPropagation();
     event.currentTarget.setPointerCapture?.(event.pointerId);
   };
 
   const handlePlannerWaypointPointerDown = (event, waypointId) => {
     plannerDragRef.current = { waypointId, pointerId: event.pointerId };
+    setActiveDragItem({ kind: 'waypoint', id: waypointId });
+    event.stopPropagation();
     event.currentTarget.setPointerCapture?.(event.pointerId);
   };
 
   const handleObstaclePointerMove = (event) => {
     if (!obstacleDragRef.current || currentUser.role === 'teacher') return;
-    const { x, y } = getSvgCoords(event);
+    const { x, y } = clampScenePoint(...Object.values(getSvgCoords(event)), gridSize);
     updateStudentObstacle(obstacleDragRef.current.obstacleId, { x, y });
   };
 
   const handlePlannerWaypointPointerMove = (event) => {
     if (!plannerDragRef.current) return;
-    const { x, y } = getSvgCoords(event);
+    const { x, y } = clampScenePoint(...Object.values(getSvgCoords(event)), gridSize);
     updatePlannerWaypoint(plannerDragRef.current.waypointId, { x, y });
+  };
+
+  const handleScenePointerMove = (event) => {
+    if (plannerDragRef.current) {
+      handlePlannerWaypointPointerMove(event);
+      return;
+    }
+    if (obstacleDragRef.current) {
+      handleObstaclePointerMove(event);
+    }
   };
 
   const handleObstaclePointerUp = () => {
     obstacleDragRef.current = null;
     plannerDragRef.current = null;
+    setActiveDragItem(null);
+  };
+
+  const handleScenePointerUp = () => {
+    handleObstaclePointerUp();
   };
 
   const handlePromptSubmit = () => { promptState.callback?.(promptState.inputValue); setPromptState({ ...promptState, isOpen: false }); };
@@ -1590,11 +1666,21 @@ export default function App() {
       if (block) {
         block.data = codeEditorState.code;
         if (workspaceRef.current) {
-           const event = new window.Blockly.Events.BlockChange(block, 'comment', null, '', ''); 
-           workspaceRef.current.fireChangeListener(event);
+          const event = new window.Blockly.Events.BlockChange(block, 'comment', null, '', '');
+          workspaceRef.current.fireChangeListener(event);
         }
       }
     }
+
+    if (workspaceRef.current && window.Blockly) {
+      try {
+        const nextCode = pythonGenerator.workspaceToCode(workspaceRef.current);
+        applyGeneratedCode(nextCode, { syncBlocks: true });
+      } catch (error) {
+        console.warn('Failed to refresh generated code after block edit.', error);
+      }
+    }
+
     setCodeEditorState({ ...codeEditorState, isOpen: false });
   };
 
@@ -1603,6 +1689,58 @@ export default function App() {
       fileInputRef.current.click();
     }
     setActiveMenu(null);
+  };
+
+  const beginToolPanelInteraction = (event, mode) => {
+    if (toolPanelCollapsed) return;
+    event.preventDefault();
+    event.stopPropagation();
+    toolPanelInteractionRef.current = {
+      mode,
+      startX: event.clientX,
+      startY: event.clientY,
+      rect: { ...toolPanelRect },
+    };
+    event.currentTarget.setPointerCapture?.(event.pointerId);
+  };
+
+  const updateToolPanelInteraction = (event) => {
+    const interaction = toolPanelInteractionRef.current;
+    if (!interaction) return;
+
+    const deltaX = event.clientX - interaction.startX;
+    const deltaY = event.clientY - interaction.startY;
+    const nextRect = { ...interaction.rect };
+    const minimumWidth = 320;
+    const minimumHeight = 360;
+    const maximumWidth = Math.max(minimumWidth, window.innerWidth - 32);
+    const maximumHeight = Math.max(minimumHeight, window.innerHeight - 110);
+
+    if (interaction.mode === 'move') {
+      nextRect.right = Math.max(8, interaction.rect.right - deltaX);
+      nextRect.top = Math.max(8, interaction.rect.top + deltaY);
+    } else {
+      if (interaction.mode.includes('left')) {
+        nextRect.width = Math.min(maximumWidth, Math.max(minimumWidth, interaction.rect.width - deltaX));
+        nextRect.right = Math.max(8, interaction.rect.right + deltaX);
+      }
+      if (interaction.mode.includes('right')) {
+        nextRect.width = Math.min(maximumWidth, Math.max(minimumWidth, interaction.rect.width + deltaX));
+      }
+      if (interaction.mode.includes('top')) {
+        nextRect.height = Math.min(maximumHeight, Math.max(minimumHeight, interaction.rect.height - deltaY));
+        nextRect.top = Math.max(8, interaction.rect.top + deltaY);
+      }
+      if (interaction.mode.includes('bottom')) {
+        nextRect.height = Math.min(maximumHeight, Math.max(minimumHeight, interaction.rect.height + deltaY));
+      }
+    }
+
+    setToolPanelRect(nextRect);
+  };
+
+  const endToolPanelInteraction = () => {
+    toolPanelInteractionRef.current = null;
   };
 
   if (!session) {
@@ -1713,101 +1851,6 @@ export default function App() {
 
   if (!isBlocklyLoaded) return <div className="flex h-screen items-center justify-center bg-gray-50 flex-col gap-4"><Loader2 className="animate-spin text-blue-600" size={48} /><p className="text-gray-500 font-medium">{UI_TEXT.en.loading}</p></div>;
 
-  const robotAnchor = { x: 110 + simulatorState.x * 1.5, y: 110 - simulatorState.y * 1.5 };
-  const robotJoints = simulatorState.joints || {};
-  const toRadians = (degrees) => (degrees * Math.PI) / 180;
-  const armLen = 22;
-  const forearmLen = 20;
-  const legLen = 30;
-  const shinLen = 28;
-  const getJointAngle = (name, defaultValue = 0) => Number(robotJoints[name] ?? defaultValue);
-
-  const leftArm = (() => {
-    const shoulder = getJointAngle('left_shoulder_pitch', 12);
-    const elbow = getJointAngle('left_elbow_pitch', 8);
-    const shoulderRad = toRadians(shoulder + 180);
-    const elbowRad = toRadians(elbow + 110);
-    const shoulderX = 0;
-    const shoulderY = -28;
-    const elbowX = shoulderX + Math.cos(shoulderRad) * armLen;
-    const elbowY = shoulderY + Math.sin(shoulderRad) * armLen;
-    const wristX = elbowX + Math.cos(shoulderRad + elbowRad - Math.PI) * forearmLen;
-    const wristY = elbowY + Math.sin(shoulderRad + elbowRad - Math.PI) * forearmLen;
-    return { shoulderX, shoulderY, elbowX, elbowY, wristX, wristY };
-  })();
-
-  const rightArm = (() => {
-    const shoulder = getJointAngle('right_shoulder_pitch', 12);
-    const elbow = getJointAngle('right_elbow_pitch', 8);
-    const shoulderRad = toRadians(shoulder + 180);
-    const elbowRad = toRadians(elbow + 110);
-    const shoulderX = 0;
-    const shoulderY = -28;
-    const elbowX = shoulderX + Math.cos(shoulderRad) * armLen;
-    const elbowY = shoulderY + Math.sin(shoulderRad) * armLen;
-    const wristX = elbowX + Math.cos(shoulderRad + elbowRad - Math.PI) * forearmLen;
-    const wristY = elbowY + Math.sin(shoulderRad + elbowRad - Math.PI) * forearmLen;
-    return { shoulderX, shoulderY, elbowX, elbowY, wristX, wristY };
-  })();
-
-  const leftLeg = (() => {
-    const hip = getJointAngle('left_hip_pitch', 8);
-    const knee = getJointAngle('left_knee_pitch', 10);
-    const hipRad = toRadians(hip + 200);
-    const kneeRad = toRadians(knee + 80);
-    const hipX = 0;
-    const hipY = 28;
-    const kneeX = hipX + Math.cos(hipRad) * legLen;
-    const kneeY = hipY + Math.sin(hipRad) * legLen;
-    const ankleX = kneeX + Math.cos(hipRad + kneeRad - Math.PI) * shinLen;
-    const ankleY = kneeY + Math.sin(hipRad + kneeRad - Math.PI) * shinLen;
-    return { hipX, hipY, kneeX, kneeY, ankleX, ankleY };
-  })();
-
-  const rightLeg = (() => {
-    const hip = getJointAngle('right_hip_pitch', 8);
-    const knee = getJointAngle('right_knee_pitch', 10);
-    const hipRad = toRadians(hip + 200);
-    const kneeRad = toRadians(knee + 80);
-    const hipX = 0;
-    const hipY = 28;
-    const kneeX = hipX + Math.cos(hipRad) * legLen;
-    const kneeY = hipY + Math.sin(hipRad) * legLen;
-    const ankleX = kneeX + Math.cos(hipRad + kneeRad - Math.PI) * shinLen;
-    const ankleY = kneeY + Math.sin(hipRad + kneeRad - Math.PI) * shinLen;
-    return { hipX, hipY, kneeX, kneeY, ankleX, ankleY };
-  })();
-
-  const robotBody = (
-    <g transform={`translate(${robotAnchor.x} ${robotAnchor.y}) rotate(${simulatorState.heading})`}>
-      <ellipse cx="0" cy="44" rx="38" ry="10" fill="rgba(15,23,42,0.18)" />
-      <g stroke="#dfe7f3" strokeWidth="2" strokeLinecap="round" fill="none">
-        <line x1="0" y1="-10" x2="0" y2="-42" stroke="#b4c4d8" strokeWidth="6" />
-        <line x1="0" y1="-42" x2="0" y2="-70" stroke="#b4c4d8" strokeWidth="8" />
-        <ellipse cx="0" cy="-70" rx="16" ry="18" fill="#e2e8f0" stroke="#475569" strokeWidth="2" />
-        <circle cx="0" cy="-74" r="5" fill="#94a3b8" />
-        <line x1="-8" y1="-66" x2="-18" y2="-58" stroke="#475569" strokeWidth="2" />
-        <line x1="8" y1="-66" x2="18" y2="-58" stroke="#475569" strokeWidth="2" />
-
-        <line x1="-10" y1="-40" x2={leftArm.shoulderX} y2={leftArm.shoulderY - 8} stroke="#cbd5e1" strokeWidth="5" />
-        <line x1={leftArm.shoulderX} y1={leftArm.shoulderY} x2={leftArm.elbowX} y2={leftArm.elbowY} stroke="#dfe7f3" strokeWidth="4" />
-        <line x1={leftArm.elbowX} y1={leftArm.elbowY} x2={leftArm.wristX} y2={leftArm.wristY} stroke="#dfe7f3" strokeWidth="4" />
-
-        <line x1="10" y1="-40" x2={rightArm.shoulderX} y2={rightArm.shoulderY - 8} stroke="#cbd5e1" strokeWidth="5" />
-        <line x1={rightArm.shoulderX} y1={rightArm.shoulderY} x2={rightArm.elbowX} y2={rightArm.elbowY} stroke="#dfe7f3" strokeWidth="4" />
-        <line x1={rightArm.elbowX} y1={rightArm.elbowY} x2={rightArm.wristX} y2={rightArm.wristY} stroke="#dfe7f3" strokeWidth="4" />
-
-        <line x1="-8" y1="8" x2={leftLeg.hipX} y2={leftLeg.hipY - 2} stroke="#cbd5e1" strokeWidth="5" />
-        <line x1={leftLeg.hipX} y1={leftLeg.hipY} x2={leftLeg.kneeX} y2={leftLeg.kneeY} stroke="#dfe7f3" strokeWidth="4" />
-        <line x1={leftLeg.kneeX} y1={leftLeg.kneeY} x2={leftLeg.ankleX} y2={leftLeg.ankleY} stroke="#dfe7f3" strokeWidth="4" />
-
-        <line x1="8" y1="8" x2={rightLeg.hipX} y2={rightLeg.hipY - 2} stroke="#cbd5e1" strokeWidth="5" />
-        <line x1={rightLeg.hipX} y1={rightLeg.hipY} x2={rightLeg.kneeX} y2={rightLeg.kneeY} stroke="#dfe7f3" strokeWidth="4" />
-        <line x1={rightLeg.kneeX} y1={rightLeg.kneeY} x2={rightLeg.ankleX} y2={rightLeg.ankleY} stroke="#dfe7f3" strokeWidth="4" />
-      </g>
-    </g>
-  );
-
   return (
     <div className="flex flex-col h-screen bg-gray-50 text-gray-800 font-sans relative overflow-hidden">
       
@@ -1817,6 +1860,25 @@ export default function App() {
           border-right: 1px solid #e5e7eb;
           -ms-overflow-style: none;
           scrollbar-width: none;
+        }
+        .blocklyToolbox {
+          background-color: #f8fafc !important;
+          color: #334155 !important;
+        }
+        .blocklyToolboxCategoryLabel,
+        .blocklyToolboxCategoryLabelText {
+          color: #334155 !important;
+          font-weight: 600;
+        }
+        .blocklyToolboxCategory:hover,
+        .blocklyToolboxCategory[aria-selected="true"] {
+          background-color: #e2e8f0 !important;
+        }
+        .blocklyFlyout {
+          background-color: #f8fafc !important;
+        }
+        .blocklyFlyoutLabelText {
+          fill: #334155 !important;
         }
         .blocklyToolboxDiv::-webkit-scrollbar {
           display: none;
@@ -1906,7 +1968,7 @@ export default function App() {
           {[
             { id: 'file', label: t.menuFile, content: <><MenuItem label={t.actNew} icon={FileText} onClick={() => { handleClear(); setActiveMenu(null); }} /><MenuItem label={t.actOpen} icon={FolderOpen} onClick={handleOpenProjectClick} /><MenuItem label={t.actSave} icon={Save} onClick={() => { saveProject(); setActiveMenu(null); }} /><div className="h-px bg-gray-200 my-1"></div><MenuItem label={t.actExportPy} icon={Download} onClick={() => { downloadPython(); setActiveMenu(null); }} /></> },
             { id: 'edit', label: t.menuEdit, content: <><MenuItem label={t.actUndo} icon={Undo} shortcut="Ctrl+Z" onClick={() => { handleUndo(); setActiveMenu(null); }} /><MenuItem label={t.actRedo} icon={Redo} shortcut="Ctrl+Y" onClick={() => { handleRedo(); setActiveMenu(null); }} /></> },
-            { id: 'view', label: t.menuView, content: <><MenuItem label={t.actToggleCode} icon={Sidebar} onClick={() => { setIsCodeOpen(!isCodeOpen); setActiveMenu(null); }} /></> },
+            { id: 'view', label: t.menuView, content: <><MenuItem label="Open IDE" icon={Code} onClick={() => { setMainTab('ide'); setActiveMenu(null); }} /></> },
             { id: 'help', label: t.menuHelp, content: <><MenuItem label={t.actAbout} icon={Info} onClick={() => { setShowAbout(true); setActiveMenu(null); }} /></> }
           ].map(menu => (
             <div key={menu.id} className="relative h-full"><button className={`h-full px-3 hover:bg-gray-200 transition-colors ${activeMenu === menu.id ? 'bg-gray-200 text-blue-700' : 'text-gray-700'}`} onClick={(e) => { e.stopPropagation(); setActiveMenu(activeMenu === menu.id ? null : menu.id); }}>{menu.label}</button>{activeMenu === menu.id && (<div className="absolute top-full left-0 w-56 bg-white border shadow-xl rounded-b-lg rounded-r-lg py-1 z-50 animate-in fade-in zoom-in-95 duration-100" onClick={e => e.stopPropagation()}>{menu.content}</div>)}</div>
@@ -1916,57 +1978,61 @@ export default function App() {
         <button onClick={toggleLanguage} className="flex items-center gap-1 text-xs text-gray-500 hover:text-blue-600 px-3 transition-colors"><Globe size={12} /> {lang === 'zh' ? 'English' : '中文'}</button>
       </div>
 
-      <div className="h-12 bg-white border-b flex items-center px-4 gap-2 z-30 shadow-sm">
-        <button onClick={() => setShowConfigEditor(true)} className="p-2 text-gray-600 hover:bg-blue-50 hover:text-blue-600 rounded transition-colors" title={t.configTitle}><Settings size={20} /></button>
-        <div className="w-px h-6 bg-gray-200 mx-1"></div>
-        <button onClick={handleUndo} className="p-2 text-gray-600 hover:bg-gray-100 rounded transition-colors" title={t.actUndo}><Undo size={20} /></button>
-        <button onClick={handleRedo} className="p-2 text-gray-600 hover:bg-gray-100 rounded transition-colors" title={t.actRedo}><Redo size={20} /></button>
-        <div className="w-px h-6 bg-gray-200 mx-1"></div>
-        {currentUser.role === 'teacher' ? (
-          <>
-            <button onClick={handleRunNext} className="flex items-center gap-2 px-3 py-1.5 text-white bg-blue-600 hover:bg-blue-700 rounded text-sm font-medium">Run Next</button>
-            <button onClick={handleStopCurrent} className="flex items-center gap-2 px-3 py-1.5 text-white bg-amber-500 hover:bg-amber-600 rounded text-sm font-medium">Pause</button>
-            <button onClick={handleClearQueue} className="flex items-center gap-2 px-3 py-1.5 text-white bg-red-500 hover:bg-red-600 rounded text-sm font-medium">Clear Queue</button>
-          </>
-        ) : (
-          <>
-            <button onClick={handleSaveCodeToAccount} className="flex items-center gap-2 px-3 py-1.5 text-white bg-emerald-600 hover:bg-emerald-700 rounded text-sm font-medium">Save</button>
-            <button onClick={handleSubmitToQueue} className="flex items-center gap-2 px-3 py-1.5 text-white bg-violet-600 hover:bg-violet-700 rounded text-sm font-medium">Submit</button>
-          </>
-        )}
-        <button onClick={handleRunCode} className={`flex items-center gap-2 px-4 py-1.5 text-white rounded font-medium text-sm transition-colors shadow-sm ${isRunning ? 'bg-red-600 hover:bg-red-700' : 'bg-green-600 hover:bg-green-700'}`} title={isRunning ? t.btnStop : t.btnRun}>
-          {isRunning ? <Square size={16} fill="currentColor" /> : <Play size={16} fill="currentColor" />} {isRunning ? t.btnStop : t.btnRun}
-        </button>
-        <div className="flex-1"></div>
-        <div className="flex items-center gap-2 text-xs text-slate-500">
-          <span className="rounded-full bg-slate-100 px-2 py-1 font-medium">{currentUser.role}</span>
-          <span>{currentUser.username}</span>
-          <button onClick={handleLogout} className="px-2 py-1 rounded bg-slate-100 hover:bg-slate-200">Logout</button>
-        </div>
-        <button onClick={() => setIsCodeOpen(!isCodeOpen)} className={`flex items-center gap-2 px-3 py-1.5 text-sm font-medium rounded border transition-all ${isCodeOpen ? 'bg-blue-50 border-blue-200 text-blue-700' : 'bg-white border-gray-200 text-gray-600 hover:bg-gray-50'}`}><Code size={16} />{isCodeOpen ? 'Hide Code' : 'Show Code'}</button>
-      </div>
-
-      <div className="absolute right-4 top-20 z-40 w-[320px] flex flex-col gap-3">
+      {isSimulatorOpen && (
+      <div className="fixed inset-0 z-50 bg-slate-950/20" onClick={() => setIsSimulatorOpen(false)}>
+      <div className="absolute right-4 top-24 z-10 flex max-h-[calc(100vh-7rem)] w-[min(360px,calc(100vw-2rem))] flex-col gap-3 overflow-y-auto overscroll-contain pr-1" onClick={(event) => event.stopPropagation()}>
         <div className="max-h-[420px] overflow-auto rounded-xl border border-slate-200 bg-white shadow-xl">
           <div className="border-b border-slate-200 p-3 bg-slate-50 flex items-center justify-between">
             <h3 className="font-semibold text-slate-800">{currentUser.role === 'teacher' ? 'Teacher Queue' : 'My Saved Code'}</h3>
-            <span className="text-xs rounded-full bg-blue-100 text-blue-700 px-2 py-1">{classroomStatus}</span>
+            <div className="flex items-center gap-2">
+              <span className="text-xs rounded-full bg-blue-100 text-blue-700 px-2 py-1" aria-label={`Classroom queue: ${classroomStatus}`}>
+                Queue: {classroomStatus}
+              </span>
+              <button type="button" onClick={() => setIsSimulatorOpen(false)} className="rounded-md p-1 text-slate-500 hover:bg-slate-200 hover:text-slate-800" aria-label="Close simulator">
+                <X size={16} />
+              </button>
+            </div>
           </div>
           <div className="p-3 space-y-3">
             {currentUser.role === 'teacher' && (
               <>
                 <div className="rounded-xl border border-blue-200 bg-blue-50 p-3">
-                  <p className="text-[10px] uppercase tracking-wide text-blue-700 font-semibold">G1 connection</p>
-                  <div className="mt-2 flex gap-2">
-                    <input
-                      type="text"
-                      value={robotAddress}
-                      onChange={(e) => setRobotAddress(e.target.value)}
-                      className="w-full border border-blue-200 rounded-lg px-2 py-1.5 text-sm bg-white focus:outline-none focus:ring-2 focus:ring-blue-500"
-                      placeholder="192.168.123.164"
-                    />
-                    <button onClick={handleConnectRobot} className="rounded-lg bg-blue-600 text-white px-2.5 py-1.5 text-xs font-medium">Connect</button>
+                  <div className="flex items-center justify-between gap-2">
+                    <p className="text-[10px] uppercase tracking-wide text-blue-700 font-semibold">Robot connection</p>
+                    <span
+                      role="status"
+                      aria-live="polite"
+                      className={`rounded-full px-2 py-1 text-[10px] font-bold ${
+                        isRobotConnected
+                          ? 'bg-green-100 text-green-800'
+                          : isRobotConnecting
+                            ? 'bg-amber-100 text-amber-800'
+                            : 'bg-slate-200 text-slate-700'
+                      }`}
+                    >
+                      {isRobotConnected ? 'CONNECTED' : isRobotConnecting ? 'CONNECTING' : 'DISCONNECTED'}
+                    </span>
                   </div>
+                  <div className="mt-2 flex gap-2">
+                    <button
+                      onClick={handleConnectRobot}
+                      disabled={isRobotConnecting || isRunning}
+                      className="flex-1 rounded-lg bg-blue-600 text-white px-2.5 py-1.5 text-xs font-medium disabled:cursor-wait disabled:opacity-60"
+                    >
+                      {isRobotConnecting ? 'Connecting…' : isRobotConnected ? 'Reconnect' : 'Connect'}
+                    </button>
+                    {isRobotConnected && (
+                      <button
+                        type="button"
+                        onClick={handleTestRobotMotion}
+                        disabled={isRunning || isRobotConnecting}
+                        className="flex-1 rounded-lg bg-amber-500 text-slate-950 px-2.5 py-1.5 text-xs font-semibold disabled:cursor-wait disabled:opacity-60"
+                      >
+                        {isRunning ? 'Motion test running…' : 'Test motion'}
+                      </button>
+                    )}
+                  </div>
+                  <p className="mt-2 text-[10px] text-slate-600">Connect uses the G1 host&apos;s configured Ethernet interface. Simulation works while disconnected.</p>
                   <p className={`mt-2 text-xs ${isRobotConnected ? 'text-green-700' : 'text-slate-600'}`}>{robotConnectionStatus}</p>
                 </div>
 
@@ -1982,6 +2048,12 @@ export default function App() {
                       </div>
                     ))}
                   </div>
+                </div>
+
+                <div className="grid grid-cols-3 gap-2">
+                  <button type="button" onClick={handleRunNext} className="rounded-lg bg-blue-600 px-2 py-2 text-[10px] font-semibold text-white hover:bg-blue-700">Run next</button>
+                  <button type="button" onClick={handleStopCurrent} className="rounded-lg bg-amber-500 px-2 py-2 text-[10px] font-semibold text-slate-950 hover:bg-amber-400">Pause</button>
+                  <button type="button" onClick={handleClearQueue} className="rounded-lg bg-red-500 px-2 py-2 text-[10px] font-semibold text-white hover:bg-red-600">Clear queue</button>
                 </div>
               </>
             )}
@@ -2027,7 +2099,7 @@ export default function App() {
           </div>
         </div>
 
-        <div className="rounded-xl border border-slate-200 bg-white shadow-xl overflow-hidden">
+        <div className="flex max-h-[calc(100vh-8rem)] min-h-0 flex-col rounded-xl border border-slate-200 bg-white shadow-xl">
           <div className="border-b border-slate-200 bg-slate-50 p-3 flex items-center justify-between">
             <div>
               <h3 className="font-semibold text-slate-800">{G1_EDU_23_ENV.robotType} Internal Simulator</h3>
@@ -2041,7 +2113,6 @@ export default function App() {
               {[
                 { id: 'add-object', label: 'Add Object' },
                 { id: 'scene-objects', label: 'Scene Objects' },
-                { id: 'planner', label: 'Motion Planner' },
                 { id: 'settings', label: 'Settings' },
               ].map((tab) => (
                 <button
@@ -2056,7 +2127,7 @@ export default function App() {
             </div>
           </div>
 
-          <div className="p-3 space-y-3">
+          <div className="min-h-0 flex-1 space-y-3 overflow-y-auto overscroll-contain p-3">
             {simulatorSidebarTab === 'add-object' && (
               <>
                 <div className="grid grid-cols-3 gap-2">
@@ -2073,21 +2144,6 @@ export default function App() {
                   ))}
                 </div>
 
-                <div className="rounded-lg border border-slate-200 bg-white p-2">
-                  <p className="text-[10px] uppercase tracking-wide text-slate-500 mb-2">Teacher challenge</p>
-                  <div className="grid grid-cols-2 gap-2">
-                    {Object.entries(G1_EDU_23_ENV.challengeLayouts).map(([key, challenge]) => (
-                      <button
-                        key={key}
-                        type="button"
-                        onClick={() => handleChallengeChange(key)}
-                        className={`rounded-md px-2 py-1.5 text-[10px] font-medium ${simulatorChallenge === key ? 'bg-emerald-600 text-white' : 'bg-slate-100 text-slate-700 hover:bg-slate-200'}`}
-                      >
-                        {challenge.label}
-                      </button>
-                    ))}
-                  </div>
-                </div>
               </>
             )}
 
@@ -2122,41 +2178,6 @@ export default function App() {
               </div>
             )}
 
-            {simulatorSidebarTab === 'planner' && (
-              <div className="space-y-3">
-                <div className="flex gap-2">
-                  <button type="button" onClick={addPlannerWaypoint} className="flex-1 rounded-lg bg-blue-600 px-2 py-1.5 text-[10px] font-semibold text-white hover:bg-blue-700">Add waypoint</button>
-                  <button type="button" onClick={compilePlannerPath} className="flex-1 rounded-lg bg-emerald-600 px-2 py-1.5 text-[10px] font-semibold text-white hover:bg-emerald-700">Compile path</button>
-                </div>
-                <div className="rounded-lg border border-slate-200 bg-slate-50 p-2 text-[10px] text-slate-600">
-                  <p className="font-semibold uppercase tracking-wide text-slate-500">Planner instructions</p>
-                  <p className="mt-2">Place and drag waypoints in the scene. Compile creates robot walk commands that update the IDE and block output.</p>
-                </div>
-                {plannerWaypoints.length === 0 ? (
-                  <p className="rounded-lg border border-dashed border-slate-200 bg-slate-50 p-3 text-xs text-slate-500">No waypoints yet.</p>
-                ) : (
-                  plannerWaypoints.map((point, index) => (
-                    <div key={point.id} className="rounded-lg border border-slate-200 bg-white p-2">
-                      <div className="mb-2 flex items-center justify-between">
-                        <span className="text-[10px] font-semibold uppercase tracking-wide text-slate-600">Waypoint {index + 1}</span>
-                        <button type="button" onClick={() => removePlannerWaypoint(point.id)} className="text-[10px] text-red-600">Delete</button>
-                      </div>
-                      <div className="grid grid-cols-2 gap-2 text-[10px] text-slate-600">
-                        <label>
-                          X
-                          <input type="number" value={point.x} step="0.5" onChange={(event) => updatePlannerWaypoint(point.id, { x: Number(event.target.value) })} className="mt-1 w-full rounded border border-slate-200 bg-slate-50 px-1 py-1" />
-                        </label>
-                        <label>
-                          Y
-                          <input type="number" value={point.y} step="0.5" onChange={(event) => updatePlannerWaypoint(point.id, { y: Number(event.target.value) })} className="mt-1 w-full rounded border border-slate-200 bg-slate-50 px-1 py-1" />
-                        </label>
-                      </div>
-                    </div>
-                  ))
-                )}
-              </div>
-            )}
-
             {simulatorSidebarTab === 'settings' && (
               <div className="space-y-3">
                 <div className="rounded-lg border border-slate-200 bg-white p-2">
@@ -2177,34 +2198,30 @@ export default function App() {
 
                 <div className="rounded-lg border border-slate-200 bg-slate-50 p-2 text-[11px] text-slate-600">
                   <div className="flex items-center justify-between"><span>Robot</span><span className="font-medium text-slate-700">{G1_EDU_23_ENV.robotType}</span></div>
+                  <div className="mt-2 flex items-center justify-between"><span>Grid cells</span><span className="font-medium text-slate-700">1 m x 1 m</span></div>
                   <div className="mt-2 flex items-center justify-between"><span>Goal</span><span className="font-medium text-slate-700">{simulatorState.goal ? `${simulatorState.goal.x.toFixed(1)}, ${simulatorState.goal.y.toFixed(1)}` : 'None'}</span></div>
                   <div className="mt-2 flex items-center justify-between"><span>Collisions</span><span className="font-medium text-slate-700">{simulatorState.collisions || 0}</span></div>
+                </div>
+                <div className="rounded-lg border border-slate-200 bg-white p-2 text-[10px] text-slate-600">
+                  <label className="flex items-center justify-between font-semibold">
+                    <span>Grid size</span>
+                    <span>{gridSize} m x {gridSize} m</span>
+                  </label>
+                  <input type="range" min="10" max="80" step="1" value={gridSize} onChange={(event) => setGridSize(Number(event.target.value))} className="mt-2 w-full accent-blue-600" />
+                  <label className="mt-3 flex items-center justify-between font-semibold">
+                    <span>Simulation speed</span>
+                    <span>{playbackSpeed.toFixed(1)}x</span>
+                  </label>
+                  <input type="range" min="0.1" max="3" step="0.1" value={playbackSpeed} onChange={(event) => setPlaybackSpeed(Number(event.target.value))} className="mt-2 w-full accent-cyan-600" />
+                  <p className="mt-2 text-[10px] text-slate-500">Speed changes timing only. Distances remain in meters.</p>
                 </div>
               </div>
             )}
 
-            <div className="flex gap-2">
-              <button
-                type="button"
-                onClick={startSimulationPreview}
-                className={`flex-1 rounded-lg px-2 py-1.5 text-[10px] font-semibold ${isPreviewPlaying ? 'bg-slate-200 text-slate-600' : 'bg-emerald-600 text-white hover:bg-emerald-700'}`}
-                disabled={isPreviewPlaying}
-              >
-                Play sim
-              </button>
-              <button
-                type="button"
-                onClick={pauseSimulationPreview}
-                className={`flex-1 rounded-lg px-2 py-1.5 text-[10px] font-semibold ${isPreviewPlaying ? 'bg-amber-500 text-white hover:bg-amber-600' : 'bg-slate-100 text-slate-600 hover:bg-slate-200'}`}
-              >
-                Pause sim
-              </button>
-            </div>
-
             <div className="rounded-xl border border-slate-200 bg-slate-100 p-2">
-              <svg viewBox="0 0 220 220" className="w-full h-40 block" onPointerMove={handleObstaclePointerMove} onPointerUp={handleObstaclePointerUp} onPointerLeave={handleObstaclePointerUp}>
+              <svg viewBox="0 0 220 220" className="block aspect-square w-full" onPointerMove={handleScenePointerMove} onPointerUp={handleScenePointerUp} onPointerLeave={handleScenePointerUp}>
                 <defs>
-                  <pattern id="grid-pattern" width="20" height="20" patternUnits="userSpaceOnUse">
+                  <pattern id="grid-pattern" width={sceneScale} height={sceneScale} patternUnits="userSpaceOnUse">
                     <path d="M 20 0 L 0 0 0 20" fill="none" stroke="#dfe7f3" strokeWidth="1"/>
                   </pattern>
                 </defs>
@@ -2212,27 +2229,29 @@ export default function App() {
                 {activeObstacles.map((obstacle) => {
                   const isStudentObstacle = String(obstacle.id).startsWith('student-');
                   const isEditable = currentUser.role !== 'teacher' && isStudentObstacle;
+                  const isDragging = activeDragItem?.kind === 'obstacle' && activeDragItem.id === obstacle.id;
                   const color = obstacle.color || (isStudentObstacle ? '#a78bfa' : '#fbbf24');
                   return (
-                    <g key={obstacle.id} onPointerDown={isEditable ? (event) => handleObstaclePointerDown(event, obstacle.id) : undefined} style={{ cursor: isEditable ? 'grab' : 'default' }}>
+                    <g key={obstacle.id} onPointerDown={isEditable ? (event) => handleObstaclePointerDown(event, obstacle.id) : undefined} style={{ cursor: isEditable ? (isDragging ? 'grabbing' : 'grab') : 'default' }}>
+                      {isDragging && <circle cx={sceneX(obstacle.x)} cy={sceneY(obstacle.y)} r={(obstacle.radius / 12) * sceneScale + 4} fill="none" stroke="#0891b2" strokeWidth="2" strokeDasharray="4 2" />}
                       <circle
-                        cx={110 + obstacle.x * 1.5}
-                        cy={110 - obstacle.y * 1.5}
-                        r={obstacle.radius * 1.5}
+                        cx={sceneX(obstacle.x)}
+                        cy={sceneY(obstacle.y)}
+                        r={(obstacle.radius / 12) * sceneScale}
                         fill={color}
                         fillOpacity={isStudentObstacle ? 0.45 : 0.35}
                         stroke={isStudentObstacle ? '#7c3aed' : '#f59e0b'}
                         strokeWidth={isEditable ? 2.5 : 2}
                         strokeDasharray={isEditable ? '0' : '6 3'}
                       />
-                      {isEditable && <text x={110 + obstacle.x * 1.5} y={110 - obstacle.y * 1.5 + 4} textAnchor="middle" fontSize="8" fill="#fff">drag</text>}
+                      {isEditable && <text x={sceneX(obstacle.x)} y={sceneY(obstacle.y) + 4} textAnchor="middle" fontSize="8" fill="#fff">drag</text>}
                     </g>
                   );
                 })}
                 {plannerWaypoints.length > 0 && (
                   <g>
                     <polyline
-                      points={plannerWaypoints.map((point) => `${110 + point.x * 1.5},${110 - point.y * 1.5}`).join(' ')}
+                      points={plannerWaypoints.map((point) => `${sceneX(point.x)},${sceneY(point.y)}`).join(' ')}
                       fill="none"
                       stroke="#22c55e"
                       strokeWidth="3"
@@ -2240,21 +2259,22 @@ export default function App() {
                       opacity="0.9"
                     />
                     {plannerWaypoints.map((point, index) => (
-                      <g key={point.id} onPointerDown={(event) => handlePlannerWaypointPointerDown(event, point.id)} style={{ cursor: 'pointer' }}>
-                        <circle cx={110 + point.x * 1.5} cy={110 - point.y * 1.5} r="6" fill="#22c55e" stroke="#14532d" strokeWidth="2" />
-                        <text x={110 + point.x * 1.5} y={110 - point.y * 1.5 + 3} textAnchor="middle" fontSize="7" fill="#fff" fontWeight="700">{index + 1}</text>
+                      <g key={point.id} onPointerDown={(event) => handlePlannerWaypointPointerDown(event, point.id)} style={{ cursor: activeDragItem?.kind === 'waypoint' && activeDragItem.id === point.id ? 'grabbing' : 'grab' }}>
+                        {activeDragItem?.kind === 'waypoint' && activeDragItem.id === point.id && <circle cx={sceneX(point.x)} cy={sceneY(point.y)} r="10" fill="none" stroke="#0891b2" strokeWidth="2" strokeDasharray="4 2" />}
+                        <circle cx={sceneX(point.x)} cy={sceneY(point.y)} r="6" fill="#22c55e" stroke="#14532d" strokeWidth="2" />
+                        <text x={sceneX(point.x)} y={sceneY(point.y) + 3} textAnchor="middle" fontSize="7" fill="#fff" fontWeight="700">{index + 1}</text>
                       </g>
                     ))}
                   </g>
                 )}
                 {simulatorState.goal && (
                   <g>
-                    <circle cx={110 + simulatorState.goal.x * 1.5} cy={110 - simulatorState.goal.y * 1.5} r={simulatorState.goal.radius * 1.5} fill={simulatorState.goalReached ? '#34d399' : '#a7f3d0'} fillOpacity="0.35" stroke="#22c55e" strokeWidth="2"/>
-                    <text x={110 + simulatorState.goal.x * 1.5} y={110 - simulatorState.goal.y * 1.5 - 12} textAnchor="middle" fontSize="9" fill="#166534" fontWeight="700">GOAL</text>
+                    <circle cx={sceneX(simulatorState.goal.x)} cy={sceneY(simulatorState.goal.y)} r={simulatorState.goal.radius * sceneScale} fill={simulatorState.goalReached ? '#34d399' : '#a7f3d0'} fillOpacity="0.35" stroke="#22c55e" strokeWidth="2"/>
+                    <text x={sceneX(simulatorState.goal.x)} y={sceneY(simulatorState.goal.y) - 12} textAnchor="middle" fontSize="9" fill="#166534" fontWeight="700">GOAL</text>
                   </g>
                 )}
                 <polyline
-                  points={simulatorState.path.map((point) => `${110 + point.x * 1.5},${110 - point.y * 1.5}`).join(' ')}
+                  points={simulatorState.path.map((point) => `${sceneX(point.x)},${sceneY(point.y)}`).join(' ')}
                   fill="none"
                   stroke="#60a5fa"
                   strokeWidth="3"
@@ -2262,7 +2282,7 @@ export default function App() {
                   strokeLinecap="round"
                   opacity="0.9"
                 />
-                <g transform={`translate(${110 + simulatorState.x * 1.5}, ${110 - simulatorState.y * 1.5}) rotate(${simulatorState.heading})`}>
+                <g transform={`translate(${sceneX(simulatorState.x)}, ${sceneY(simulatorState.y)}) rotate(${simulatorState.heading})`}>
                   <rect x="-12" y="-10" width="24" height="20" rx="6" fill="#2563eb" stroke="#0f172a" strokeWidth="2"/>
                   <polygon points="18,0 28,6 18,12" fill="#f59e0b"/>
                   <circle cx="0" cy="0" r="3" fill="#f8fafc"/>
@@ -2316,102 +2336,62 @@ export default function App() {
           </div>
         </div>
       </div>
-
-      <div className="border-b border-slate-200 bg-slate-900 px-4 py-3 shadow-sm">
-        <div className="flex items-center gap-2 overflow-x-auto">
-          {overlayTabs.map((tab) => (
-            <button
-              key={tab.id}
-              type="button"
-              onClick={() => setMainTab(tab.id)}
-              className={`rounded-lg px-3 py-2 text-sm font-medium transition whitespace-nowrap ${mainTab === tab.id ? 'bg-blue-600 text-white shadow-sm' : 'bg-slate-100 text-slate-600 hover:bg-slate-200'}`}
-            >
-              {tab.label}
-            </button>
-          ))}
-        </div>
       </div>
+      )}
 
       <div className="relative flex-1 overflow-hidden scene-shell">
         <div className="absolute inset-0 bg-[radial-gradient(circle_at_top,_rgba(148,163,184,0.28),_rgba(15,23,42,0.04)_45%,_rgba(15,23,42,0.1))]" />
         <div className="scene-platform absolute left-[-8%] right-[-8%] top-[16%] bottom-[-8%] rounded-[28%]" />
-        <div className="absolute inset-0">
-          <svg viewBox="0 0 220 220" className="scene-svg h-full w-full block">
-            <defs>
-              <pattern id="workspace-grid" width="20" height="20" patternUnits="userSpaceOnUse">
-                <path d="M 20 0 L 0 0 0 20" fill="none" stroke="#dfe7f3" strokeWidth="1"/>
-              </pattern>
-            </defs>
-            <rect x="0" y="0" width="220" height="220" fill="url(#workspace-grid)" />
-            {activeObstacles.map((obstacle) => {
-              const isStudentObstacle = String(obstacle.id).startsWith('student-');
-              const color = obstacle.color || (isStudentObstacle ? '#a78bfa' : '#fbbf24');
-              return (
-                <g key={obstacle.id}>
-                  <circle
-                    cx={110 + obstacle.x * 1.5}
-                    cy={110 - obstacle.y * 1.5}
-                    r={obstacle.radius * 1.5}
-                    fill={color}
-                    fillOpacity={isStudentObstacle ? 0.45 : 0.35}
-                    stroke={isStudentObstacle ? '#7c3aed' : '#f59e0b'}
-                    strokeWidth="2"
-                    strokeDasharray={isStudentObstacle ? '0' : '6 3'}
-                  />
-                </g>
-              );
-            })}
-            {plannerWaypoints.length > 0 && (
-              <g>
-                <polyline
-                  points={plannerWaypoints.map((point) => `${110 + point.x * 1.5},${110 - point.y * 1.5}`).join(' ')}
-                  fill="none"
-                  stroke="#22c55e"
-                  strokeWidth="3"
-                  strokeDasharray="6 4"
-                  opacity="0.9"
-                />
-                {plannerWaypoints.map((point, index) => (
-                  <g key={point.id}>
-                    <circle cx={110 + point.x * 1.5} cy={110 - point.y * 1.5} r="6" fill="#22c55e" stroke="#14532d" strokeWidth="2" />
-                    <text x={110 + point.x * 1.5} y={110 - point.y * 1.5 + 3} textAnchor="middle" fontSize="7" fill="#fff" fontWeight="700">{index + 1}</text>
-                  </g>
-                ))}
-              </g>
-            )}
-            {simulatorState.goal && (
-              <g>
-                <circle cx={110 + simulatorState.goal.x * 1.5} cy={110 - simulatorState.goal.y * 1.5} r={simulatorState.goal.radius * 1.5} fill={simulatorState.goalReached ? '#34d399' : '#a7f3d0'} fillOpacity="0.35" stroke="#22c55e" strokeWidth="2" />
-                <text x={110 + simulatorState.goal.x * 1.5} y={110 - simulatorState.goal.y * 1.5 - 12} textAnchor="middle" fontSize="9" fill="#166534" fontWeight="700">GOAL</text>
-              </g>
-            )}
-            <polyline
-              points={simulatorState.path.map((point) => `${110 + point.x * 1.5},${110 - point.y * 1.5}`).join(' ')}
-              fill="none"
-              stroke="#60a5fa"
-              strokeWidth="3"
-              strokeLinejoin="round"
-              strokeLinecap="round"
-              opacity="0.9"
-            />
-            {robotBody}
-          </svg>
-        </div>
-
-        {mainTab === 'blocks' && (
-          <div className="absolute inset-0 z-10 pointer-events-none">
-            <div ref={blocklyDiv} className="absolute inset-y-0 left-0 right-20 overflow-hidden pointer-events-auto" />
-          </div>
-        )}
+        <G1Simulation3D
+          code={generatedCode}
+          simulatorState={simulatorState}
+          obstacles={activeObstacles}
+          waypoints={plannerWaypoints}
+          isWaypointPlacementEnabled={isWaypointPlacementEnabled}
+          isObstacleEditable={currentUser.role !== 'teacher'}
+          onObstacleChange={updateStudentObstacle}
+          onWaypointChange={updatePlannerWaypoint}
+          onWaypointPlace={placePlannerWaypoint}
+          isPlaying={isPreviewPlaying}
+          playbackSpeed={playbackSpeed}
+          playbackProgress={playbackProgress}
+          gridSize={gridSize}
+          onPlaybackProgress={setPlaybackProgress}
+          onPlaybackToggle={(playing) => playing ? startSimulationPreview() : pauseSimulationPreview()}
+          onPlaybackReset={resetSimulationPreview}
+          onPlaybackSpeedChange={handlePlaybackSpeedChange}
+        />
 
         <div
-          className="absolute right-0 top-0 bottom-0 z-20 flex flex-col border-l border-slate-700 bg-slate-950/85 backdrop-blur-sm shadow-[0_0_30px_rgba(15,23,42,0.4)] transition-all duration-300"
-          style={{ width: toolPanelCollapsed ? 48 : toolPanelWidth }}
+          className="absolute z-20 flex flex-col overflow-visible rounded-xl border border-slate-700 bg-slate-950/90 shadow-[0_0_30px_rgba(15,23,42,0.5)] backdrop-blur-sm"
+          style={{
+            top: toolPanelRect.top,
+            right: toolPanelCollapsed ? 16 : toolPanelRect.right,
+            width: toolPanelCollapsed ? 48 : toolPanelRect.width,
+            height: toolPanelCollapsed ? 48 : toolPanelRect.height,
+            maxHeight: 'calc(100% - 24px)',
+          }}
+          onPointerMove={updateToolPanelInteraction}
+          onPointerUp={endToolPanelInteraction}
+          onPointerCancel={endToolPanelInteraction}
         >
-          <div className="flex items-center justify-between border-b border-slate-700 bg-slate-900 px-2 py-2">
+          {!toolPanelCollapsed && (
+            <>
+              <div className="absolute -left-1 top-3 bottom-3 z-40 w-2 cursor-ew-resize" onPointerDown={(event) => beginToolPanelInteraction(event, 'left')} />
+              <div className="absolute -right-1 top-3 bottom-3 z-40 w-2 cursor-ew-resize" onPointerDown={(event) => beginToolPanelInteraction(event, 'right')} />
+              <div className="absolute left-3 right-3 -top-1 z-40 h-2 cursor-ns-resize" onPointerDown={(event) => beginToolPanelInteraction(event, 'top')} />
+              <div className="absolute left-3 right-3 -bottom-1 z-40 h-2 cursor-ns-resize" onPointerDown={(event) => beginToolPanelInteraction(event, 'bottom')} />
+              <div className="absolute -left-1 -top-1 z-40 h-3 w-3 cursor-nwse-resize" onPointerDown={(event) => beginToolPanelInteraction(event, 'left top')} />
+              <div className="absolute -right-1 -top-1 z-40 h-3 w-3 cursor-nesw-resize" onPointerDown={(event) => beginToolPanelInteraction(event, 'right top')} />
+              <div className="absolute -left-1 -bottom-1 z-40 h-3 w-3 cursor-nesw-resize" onPointerDown={(event) => beginToolPanelInteraction(event, 'left bottom')} />
+              <div className="absolute -right-1 -bottom-1 z-40 h-3 w-3 cursor-nwse-resize" onPointerDown={(event) => beginToolPanelInteraction(event, 'right bottom')} />
+            </>
+          )}
+          <div className="flex cursor-move items-center justify-between border-b border-slate-700 bg-slate-900 px-2 py-2" onPointerDown={(event) => beginToolPanelInteraction(event, 'move')}>
             <button
               type="button"
               onClick={() => setToolPanelCollapsed((value) => !value)}
+              onPointerDown={(event) => event.stopPropagation()}
               className="inline-flex h-7 w-7 items-center justify-center rounded-md bg-slate-800 text-slate-200 hover:bg-slate-700"
             >
               {toolPanelCollapsed ? '»' : '«'}
@@ -2421,17 +2401,46 @@ export default function App() {
                 {overlayTabs.find((tab) => tab.id === mainTab)?.label}
               </span>
             )}
-            {!toolPanelCollapsed && (
-              <button
-                type="button"
-                onClick={() => setToolPanelWidth((value) => Math.min(560, value + 40))}
-                className="inline-flex h-7 w-7 items-center justify-center rounded-md bg-slate-800 text-slate-200 hover:bg-slate-700"
-                aria-label="Expand panel"
-              >
-                +
-              </button>
-            )}
+            {!toolPanelCollapsed && <div className="h-7 w-7" aria-hidden="true" />}
           </div>
+
+          {!toolPanelCollapsed && (
+            <div className="border-b border-slate-700 bg-slate-900/90 p-2">
+              <div className="flex gap-2">
+                <button type="button" onClick={handleRunSimulation} className="flex-1 rounded-md bg-emerald-500 px-2 py-2 text-[10px] font-bold text-slate-950 hover:bg-emerald-400">
+                  {isPreviewPlaying ? 'Running simulation' : 'Run simulation'}
+                </button>
+                {currentUser.role === 'student' && (
+                  <>
+                    <button type="button" onClick={handleSubmitToQueue} className="flex-1 rounded-md bg-violet-500 px-2 py-2 text-[10px] font-bold text-white hover:bg-violet-400">
+                      Submit to teacher
+                    </button>
+                    <button type="button" onClick={() => setIsSimulatorOpen(true)} className="rounded-md bg-slate-700 px-2 py-2 text-[10px] font-bold text-white hover:bg-slate-600" title="Open saved code">
+                      Library
+                    </button>
+                  </>
+                )}
+                {currentUser.role === 'teacher' && (
+                  <>
+                    <button type="button" onClick={() => setIsSimulatorOpen(true)} className="flex-1 rounded-md bg-blue-500 px-2 py-2 text-[10px] font-bold text-white hover:bg-blue-400">
+                      Open queue
+                    </button>
+                    <button type="button" onClick={handleRunCode} className="rounded-md bg-amber-500 px-2 py-2 text-[10px] font-bold text-slate-950 hover:bg-amber-400" title="Run code on connected robot">
+                      {isRunning ? 'Stop robot' : 'Robot run'}
+                    </button>
+                  </>
+                )}
+              </div>
+              <div className="mt-2 flex items-center justify-between text-[10px] text-slate-400">
+                <span>{currentUser.role === 'teacher' ? 'Teacher workspace' : 'Student workspace'}</span>
+                <div className="flex items-center gap-2">
+                  <button type="button" onClick={handleSaveCodeToAccount} className="text-slate-300 hover:text-white">Save</button>
+                  <button type="button" onClick={handleLogout} className="text-slate-300 hover:text-white">Logout</button>
+                  <button type="button" onClick={() => setShowConfigEditor(true)} className="text-slate-300 hover:text-white">Settings</button>
+                </div>
+              </div>
+            </div>
+          )}
 
           {toolPanelCollapsed ? (
             <div className="flex flex-1 flex-col items-center gap-2 overflow-hidden py-2">
@@ -2462,31 +2471,67 @@ export default function App() {
                 ))}
               </div>
 
-              <div className="flex-1 overflow-auto p-3">
-                {mainTab === 'blocks' && (
-                  <div className="space-y-3 text-slate-200">
+              <div className="min-h-0 flex-1 overflow-auto p-3">
+                <div className={`${mainTab === 'blocks' ? '' : 'hidden'} space-y-3 text-slate-200`}>
                     <div className="rounded-xl border border-slate-700 bg-slate-900 p-3">
                       <p className="text-[10px] uppercase tracking-[0.18em] text-slate-400">Workspace</p>
                       <div className="mt-3 flex gap-2">
-                        <button type="button" onClick={handleRunCode} className="flex-1 rounded-md bg-emerald-600 px-2 py-2 text-xs font-semibold text-white hover:bg-emerald-500">Run</button>
+                        <button type="button" onClick={handleRunSimulation} className="flex-1 rounded-md bg-emerald-600 px-2 py-2 text-xs font-semibold text-white hover:bg-emerald-500">Run simulation</button>
+                        {currentUser.role === 'teacher' && (
+                          <button
+                            type="button"
+                            onClick={handleRunCode}
+                            disabled={!isRobotConnected && !isRunning}
+                            title={isRobotConnected ? 'Send this program to the connected G1' : 'Connect the G1 SDK before sending commands'}
+                            className="flex-1 rounded-md bg-amber-500 px-2 py-2 text-xs font-semibold text-slate-950 hover:bg-amber-400 disabled:cursor-not-allowed disabled:opacity-50"
+                          >
+                            {isRunning ? 'Stop robot' : 'Send to robot'}
+                          </button>
+                        )}
                         <button type="button" onClick={handleClear} className="flex-1 rounded-md bg-slate-700 px-2 py-2 text-xs font-semibold text-slate-200 hover:bg-slate-600">Clear</button>
                       </div>
+                      {currentUser.role === 'teacher' && (
+                        <p className="mt-2 text-[10px] text-slate-400" role="status" aria-live="polite">
+                          {isRunning ? 'Sending/running program on the G1…' : isRobotConnected ? 'G1 connected and ready for a program.' : 'Connect the G1 SDK before sending a physical run.'}
+                        </p>
+                      )}
                     </div>
+                    <div ref={blocklyDiv} className="h-[min(680px,calc(100vh-16rem))] min-h-[420px] overflow-hidden rounded-xl border border-slate-700 bg-slate-950" />
+                    {blockSyncError && (
+                      <p role="alert" className="rounded-lg border border-amber-500/40 bg-amber-950/40 p-2 text-xs text-amber-200">
+                        {blockSyncError}
+                      </p>
+                    )}
                     <div className="rounded-xl border border-slate-700 bg-slate-900 p-3">
                       <p className="text-[10px] uppercase tracking-[0.18em] text-slate-400">Generated code</p>
                       <pre className="mt-2 max-h-64 overflow-auto whitespace-pre-wrap break-words font-mono text-[11px] leading-6 text-slate-200">
                         {generatedCode || '# Python code will appear here'}
                       </pre>
                     </div>
-                  </div>
-                )}
+                </div>
 
                 {mainTab === 'planner' && (
                   <div className="space-y-3 text-slate-200">
+                    <p className="rounded-lg border border-amber-500/30 bg-amber-950/40 p-2 text-[10px] text-amber-200">
+                      Physical paths use timed walking primitives. Without robot localization feedback, waypoint stops are approximate.
+                    </p>
                     <div className="flex gap-2">
-                      <button type="button" onClick={addPlannerWaypoint} className="flex-1 rounded-md bg-blue-600 px-2 py-2 text-[10px] font-semibold text-white hover:bg-blue-500">Add waypoint</button>
+                      <button
+                        type="button"
+                        aria-label="Place waypoint"
+                        aria-pressed={isWaypointPlacementEnabled}
+                        onClick={() => setIsWaypointPlacementEnabled((enabled) => !enabled)}
+                        className={`flex-1 rounded-md px-2 py-2 text-[10px] font-semibold text-white ${isWaypointPlacementEnabled ? 'bg-cyan-600 hover:bg-cyan-500' : 'bg-blue-600 hover:bg-blue-500'}`}
+                      >
+                        {isWaypointPlacementEnabled ? 'Click grid to place' : 'Place waypoint'}
+                      </button>
                       <button type="button" onClick={compilePlannerPath} className="flex-1 rounded-md bg-emerald-600 px-2 py-2 text-[10px] font-semibold text-white hover:bg-emerald-500">Compile</button>
                     </div>
+                    {isWaypointPlacementEnabled && (
+                      <p className="rounded-lg border border-cyan-500/30 bg-cyan-950/50 p-2 text-xs text-cyan-200">
+                        Click an open spot on the grid to place a waypoint, or click again to cancel.
+                      </p>
+                    )}
                     {plannerWaypoints.length === 0 ? (
                       <p className="rounded-lg border border-dashed border-slate-600 bg-slate-900 p-3 text-xs text-slate-400">No waypoints yet.</p>
                     ) : (
@@ -2496,6 +2541,11 @@ export default function App() {
                             <span className="text-[10px] font-semibold uppercase tracking-wide text-slate-300">Waypoint {index + 1}</span>
                             <button type="button" onClick={() => removePlannerWaypoint(point.id)} className="text-[10px] text-red-400">Delete</button>
                           </div>
+                          {index > 0 && (
+                            <p data-testid="waypoint-distance" className="mb-2 text-[10px] font-semibold text-cyan-300">
+                              {Math.hypot(point.x - plannerWaypoints[index - 1].x, point.y - plannerWaypoints[index - 1].y).toFixed(2)} m from waypoint {index}
+                            </p>
+                          )}
                           <div className="grid grid-cols-2 gap-2 text-[10px] text-slate-300">
                             <label>
                               X
@@ -2508,6 +2558,65 @@ export default function App() {
                           </div>
                         </div>
                       ))
+                    )}
+                    {plannerWaypoints.length > 1 && (
+                      <p data-testid="waypoint-total-distance" className="rounded-lg border border-slate-700 bg-slate-900 p-2 text-xs font-semibold text-slate-200">
+                        {plannerWaypoints.slice(1).reduce((total, point, index) => (
+                          total + Math.hypot(
+                            point.x - plannerWaypoints[index].x,
+                            point.y - plannerWaypoints[index].y,
+                          )
+                        ), 0).toFixed(2)} m total
+                      </p>
+                    )}
+                  </div>
+                )}
+
+                {mainTab === 'prompt' && (
+                  <div className="space-y-3 text-slate-200">
+                    <div className="rounded-xl border border-cyan-400/30 bg-cyan-500/10 p-3">
+                      <p className="text-[10px] uppercase tracking-[0.18em] text-cyan-200">Text to motion</p>
+                      <p className="mt-2 text-xs leading-5 text-slate-300">Describe a short safe movement sequence. The generated commands sync to Blocks, IDE, and the live G1 simulation.</p>
+                    </div>
+                    <textarea
+                      value={motionPrompt}
+                      onChange={(event) => setMotionPrompt(event.target.value)}
+                      className="h-28 w-full resize-none rounded-xl border border-slate-700 bg-slate-900 p-3 text-sm leading-6 text-slate-100 outline-none focus:border-cyan-400"
+                      placeholder="Example: walk forward 3 steps, turn left, wave"
+                    />
+                    <div className="flex flex-wrap gap-2">
+                      {[
+                        'Walk forward 3 steps, turn left 90 degrees, then wave',
+                        'Walk backward 2 steps and turn right 90 degrees',
+                        'Repeat a square path 2 times',
+                      ].map((example) => (
+                        <button key={example} type="button" onClick={() => setMotionPrompt(example)} className="rounded-md bg-slate-800 px-2 py-1.5 text-left text-[10px] text-slate-300 hover:bg-slate-700">
+                          {example}
+                        </button>
+                      ))}
+                    </div>
+                    <div className="grid grid-cols-2 gap-2">
+                      <button type="button" onClick={() => generateMotionFromPrompt(false)} className="rounded-md bg-slate-700 px-3 py-2 text-xs font-semibold text-white hover:bg-slate-600">
+                        Local generate
+                      </button>
+                      <button type="button" onClick={() => generateMotionFromPrompt(true)} disabled={motionPromptStatus === 'loading'} className="rounded-md bg-cyan-500 px-3 py-2 text-xs font-semibold text-slate-950 hover:bg-cyan-400 disabled:opacity-60">
+                        {motionPromptStatus === 'loading' ? 'Generating...' : 'Generate with HF'}
+                      </button>
+                    </div>
+                    <p className="text-[10px] text-slate-400">
+                      {motionPromptStatus === 'hf' ? motionPromptResult?.source : motionPromptStatus === 'fallback' ? 'HF unavailable; local compiler used.' : 'Both paths sync to Blocks, IDE, and 3D.'}
+                    </p>
+                    {motionPromptResult && (
+                      <div className="space-y-2 rounded-xl border border-slate-700 bg-slate-900 p-3">
+                        <p className="text-xs font-semibold text-cyan-200">{motionPromptResult.summary}</p>
+                        {motionPromptResult.steps.map((step, index) => (
+                          <div key={`${step.code}-${index}`} className="flex items-center justify-between gap-2 rounded-md bg-slate-800 px-2 py-1.5 text-[10px]">
+                            <span className="text-slate-200">{index + 1}. {step.label}</span>
+                            <code className="text-cyan-300">{step.code}</code>
+                          </div>
+                        ))}
+                        {motionPromptResult.unknown.map((message) => <p key={message} className="text-xs text-amber-300">{message}</p>)}
+                      </div>
                     )}
                   </div>
                 )}
@@ -2529,10 +2638,10 @@ export default function App() {
                     <div className="rounded-xl border border-slate-700 bg-slate-900 p-3">
                       <p className="text-[10px] uppercase tracking-[0.18em] text-slate-400">Quick actions</p>
                       <div className="mt-2 space-y-2 text-xs text-slate-200">
-                        <button type="button" onClick={() => insertRobotCommand('robot.stand();')} className="block w-full rounded-md bg-slate-800 px-2 py-1.5 text-left hover:bg-slate-700">Stand</button>
-                        <button type="button" onClick={() => insertRobotCommandWithValue('walkForward', 3, 'steps')} className="block w-full rounded-md bg-slate-800 px-2 py-1.5 text-left hover:bg-slate-700">Walk Forward (steps)</button>
-                        <button type="button" onClick={() => insertRobotCommandWithValue('wait', 1, 'seconds')} className="block w-full rounded-md bg-slate-800 px-2 py-1.5 text-left hover:bg-slate-700">Wait (seconds)</button>
-                        <button type="button" onClick={() => insertRobotCommand('robot.raiseBothArms();')} className="block w-full rounded-md bg-slate-800 px-2 py-1.5 text-left hover:bg-slate-700">Raise Both Arms</button>
+                        <button type="button" onClick={() => insertRobotCommand('robot.stand()')} className="block w-full rounded-md bg-slate-800 px-2 py-1.5 text-left hover:bg-slate-700">Stand</button>
+                        <button type="button" onClick={() => insertRobotCommand('robot.walk(3)')} className="block w-full rounded-md bg-slate-800 px-2 py-1.5 text-left hover:bg-slate-700">Walk Forward (3 steps)</button>
+                        <button type="button" onClick={() => insertRobotCommand('robot.turn("left", 90)')} className="block w-full rounded-md bg-slate-800 px-2 py-1.5 text-left hover:bg-slate-700">Turn Left (90°)</button>
+                        <button type="button" onClick={() => insertRobotCommand('robot.raisebotharms("mid")')} className="block w-full rounded-md bg-slate-800 px-2 py-1.5 text-left hover:bg-slate-700">Raise Both Arms</button>
                       </div>
                     </div>
                   </div>
@@ -2541,50 +2650,48 @@ export default function App() {
                 {mainTab === 'ide' && (
                   <div className="space-y-3 text-slate-200">
                     <div className="rounded-xl border border-slate-700 bg-slate-900 p-3">
-                      <p className="text-[10px] uppercase tracking-[0.18em] text-slate-400">Quick commands</p>
-                      <div className="mt-2 space-y-2 text-xs">
-                        {quickRobotCommands.slice(0, 8).map((command) => (
-                          <button
-                            key={command.label || command.snippet || 'quick-command'}
-                            type="button"
-                            onClick={() => { if (command.action) command.action(); else if (command.snippet) insertRobotCommand(command.snippet); }}
-                            className="block w-full rounded-md bg-slate-800 px-2 py-1.5 text-left text-slate-200 hover:bg-slate-700"
-                          >
-                            {command.label || command.snippet}
-                          </button>
-                        ))}
+                      <p className="text-[10px] uppercase tracking-[0.18em] text-slate-400">G1 command reference</p>
+                      <div className="mt-2 max-h-56 space-y-2 overflow-y-auto text-[10px]">
+                        {G1_COMMANDS.map((command) => {
+                          const args = command.args.map((argument) => argument.kind === 'choice'
+                            ? `"${argument.value}"`
+                            : String(argument.value));
+                          return (
+                            <div key={command.method} className="rounded-md bg-slate-800 px-2 py-1.5">
+                              <code className="text-cyan-300">{`robot.${command.method}(${args.join(', ')})`}</code>
+                              <p className="mt-1 text-slate-400">{command.description}</p>
+                              {command.adapters.sdk
+                                ? <p className="mt-1 text-emerald-300">Supported by the G1 SDK adapter; WebRTC support is unverified.</p>
+                                : <p className="mt-1 text-amber-300">Simulation only; no physical adapter has a verified mapping.</p>}
+                            </div>
+                          );
+                        })}
+                        <div className="rounded-md bg-slate-800 px-2 py-1.5">
+                          <code className="text-cyan-300">for _ in range(3):</code>
+                          <code className="block pl-3 text-cyan-300">robot.walk(2)</code>
+                          <p className="mt-1 text-slate-400">Repeat an indented group of commands.</p>
+                        </div>
                       </div>
                     </div>
                     <textarea
                       value={generatedCode || ''}
                       onChange={(event) => {
-                        const result = sanitizeRobotCode(event.target.value);
-                        const nextCode = result.code || event.target.value;
-                        setGeneratedCode(nextCode);
-                        setSafetyNotice(result.changed ? 'One or more values were adjusted to the safe range.' : '');
-                        syncBlocksFromGeneratedCode(nextCode);
+                        const nextCode = event.target.value;
+                        applyGeneratedCode(nextCode, { syncBlocks: true });
                       }}
+                      onBlur={() => syncBlocksFromGeneratedCode(generatedCodeRef.current)}
                       spellCheck={false}
                       className="h-64 w-full resize-none rounded-xl border border-slate-700 bg-slate-900 p-3 font-mono text-[11px] leading-6 text-slate-100 outline-none"
                     />
+                    {blockSyncError && <p role="alert" className="text-xs text-amber-300">{blockSyncError}</p>}
+                    {safetyNotice && <p className="text-[10px] text-amber-300">{safetyNotice}</p>}
+                    <p className="text-[10px] text-slate-400">Blocks, IDE, planner, prompt, and vision edits share this program. Use only commands from the reference.</p>
                   </div>
                 )}
               </div>
 
-              <div className="border-t border-slate-700 bg-slate-900 p-2">
-                <label className="flex items-center justify-between gap-2 text-[10px] uppercase tracking-[0.18em] text-slate-400">
-                  <span>Panel width</span>
-                  <span>{toolPanelWidth}px</span>
-                </label>
-                <input
-                  type="range"
-                  min="280"
-                  max="560"
-                  step="20"
-                  value={toolPanelWidth}
-                  onChange={(event) => setToolPanelWidth(Number(event.target.value))}
-                  className="mt-2 w-full accent-blue-500"
-                />
+              <div className="border-t border-slate-700 bg-slate-900 p-2 text-center text-[10px] uppercase tracking-[0.14em] text-slate-500">
+                Drag the header to move. Drag any edge to resize.
               </div>
             </>
           )}
