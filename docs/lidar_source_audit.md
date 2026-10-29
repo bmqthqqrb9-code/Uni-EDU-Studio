@@ -40,14 +40,16 @@ None of these sources justifies running a second locomotion publisher.
   it is a complete Jetson control/navigation stack rather than a calibration
   library. Its motion arbitration and navigation stack are not imported because
   Uni-EDU must retain one robot-motion owner.
-- RealSense and Unitree camera discovery currently reports ROS image topics,
-  freshness, and CameraInfo intrinsics; Uni-EDU does not yet relay those camera
-  frames into its browser. The MID-360 driver/provider is the only deployed
-  sensor execution path in the current installer.
+- RealSense and Unitree camera discovery reports ROS image topics, freshness,
+  and CameraInfo intrinsics. A teacher-selected RGB ROS image can be relayed to
+  the browser through the authenticated, bounded, transient camera endpoint;
+  depth streaming and camera-driven autonomy are excluded. The MID-360
+  driver/provider remains the only deployed LiDAR execution path.
 - A matching live ROS transform is a model-based check, not an independent
-  LiDAR-camera/IMU extrinsic calibration. Physical mount confirmation and
-  exact-robot acceptance remain required; do not treat sensor status as proof
-  of calibration or safety.
+  LiDAR-camera/IMU extrinsic calibration. Model-derived sensor distances can be
+  reported without physical-mount confirmation, but remain provisional until
+  exact-robot acceptance; do not treat sensor status as proof of physical
+  calibration or safety.
 - This audit does not select or install a SLAM/Nav2 stack or a G1 locomotion
   bridge. Those remain deployment choices requiring ROS-distro, license,
   hardware-layout, and commissioning review.

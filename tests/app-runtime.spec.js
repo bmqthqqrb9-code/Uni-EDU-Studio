@@ -558,6 +558,7 @@ test('student queue does not expose teacher sensor diagnostics or call sensor AP
 });
 
 test('teacher sensor diagnostics label model-derived distance readings as provisional', async ({ page }) => {
+  let sensorDiscoveryRequests = 0;
   await page.addInitScript(() => {
     localStorage.setItem('edu-classroom-session', JSON.stringify({
       token: 'teacher-sensor-diagnostics-token',
@@ -637,6 +638,7 @@ test('teacher sensor diagnostics label model-derived distance readings as provis
   };
   await page.route('**/api/**', async (route) => {
     const url = new URL(route.request().url());
+    if (url.pathname === '/api/sensors/discover') sensorDiscoveryRequests += 1;
     await route.fulfill({
       status: 200,
       contentType: 'application/json',
@@ -665,6 +667,22 @@ test('teacher sensor diagnostics label model-derived distance readings as provis
   await expect(page.getByText(/forward · \/camera\/depth\/points · timestamp_skew/)).toBeVisible();
   await expect(page.getByText(/Unverified model mount candidate/)).toBeVisible();
   await expect(page.getByRole('button', { name: 'Restart managed LiDAR driver' })).toBeVisible();
+
+  await page.getByRole('button', { name: 'Settings', exact: true }).click();
+  const duetToggle = page.getByRole('checkbox', { name: 'Enable DUET version two' });
+  await duetToggle.check();
+  await expect(duetToggle).toBeChecked();
+  await page.getByRole('button', { name: 'Close', exact: true }).click();
+  await expect(page.getByText('/lidar/front · fresh · frame front_lidar · 42 ms old')).toBeVisible();
+  await expect(page.getByText('/lidar/rear · unavailable · frame rear_lidar · 1800 ms old · PointCloud2 sample is stale.')).toBeVisible();
+
+  await page.getByRole('button', { name: 'Settings', exact: true }).click();
+  await duetToggle.uncheck();
+  await expect(duetToggle).not.toBeChecked();
+  await page.getByRole('button', { name: 'Close', exact: true }).click();
+  await expect(page.getByText('/lidar/front · fresh · frame front_lidar · 42 ms old')).toBeVisible();
+  await expect(page.getByText('/lidar/rear · unavailable · frame rear_lidar · 1800 ms old · PointCloud2 sample is stale.')).toBeVisible();
+  expect(sensorDiscoveryRequests).toBe(1);
 });
 
 test('student IDE multiline commands render as Blocks and generate code', async ({ page }) => {
