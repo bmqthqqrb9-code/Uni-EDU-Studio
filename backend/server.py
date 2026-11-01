@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import ast
 import base64
 import json
 import math
@@ -33,11 +34,13 @@ try:
         DuetProgramValidationError,
         connect_controller as connect_duet_controller,
         abort_commissioning as abort_duet_commissioning,
+        commissioning_evidence as duet_commissioning_evidence,
         commissioning_status as duet_commissioning_status,
         controller_owns_motion as duet_controller_owns_motion,
         controller_status as duet_controller_status,
         disconnect_controller as disconnect_duet_controller,
         execute_program as execute_duet_program,
+        parse_duet_program,
         review_commissioning_step as review_duet_commissioning_step,
         run_commissioning_step as run_duet_commissioning_step,
         start_commissioning as start_duet_commissioning,
@@ -76,11 +79,13 @@ except ImportError:
         DuetProgramValidationError,
         connect_controller as connect_duet_controller,
         abort_commissioning as abort_duet_commissioning,
+        commissioning_evidence as duet_commissioning_evidence,
         commissioning_status as duet_commissioning_status,
         controller_owns_motion as duet_controller_owns_motion,
         controller_status as duet_controller_status,
         disconnect_controller as disconnect_duet_controller,
         execute_program as execute_duet_program,
+        parse_duet_program,
         review_commissioning_step as review_duet_commissioning_step,
         run_commissioning_step as run_duet_commissioning_step,
         start_commissioning as start_duet_commissioning,
@@ -159,10 +164,16 @@ class DuetProgramRequest(BaseModel):
     code: str
 
 
+class DuetMotionSaveRequest(BaseModel):
+    name: str
+    code: str
+
+
 class DuetCommissioningReviewRequest(BaseModel):
     step_index: int
     passed: bool
     observed: bool
+    observed_result: str
     notes: str = ""
 
 
@@ -972,6 +983,19 @@ def init_db():
         )
         """
     )
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS duet_motions (
+            motion_id TEXT NOT NULL,
+            username TEXT NOT NULL,
+            name TEXT NOT NULL,
+            code TEXT NOT NULL,
+            created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            PRIMARY KEY (username, motion_id),
+            UNIQUE (username, name)
+        )
+        """
+    )
     project_columns = {
         row["name"] for row in conn.execute("PRAGMA table_info(projects)").fetchall()
     }
@@ -1268,6 +1292,155 @@ def save_project_for_user(username: str, payload: dict):
     conn.commit()
     conn.close()
     return get_project_for_user(username, name)
+
+
+def _validate_duet_motion_name(name: str) -> str:
+    if not isinstance(name, str):
+        raise HTTPException(status_code=400, detail="Motion name must be text.")
+    normalized = name.strip()
+    if (
+        not normalized
+        or len(normalized) > 40
+        or any(ord(character) < 32 or ord(character) == 127 for character in normalized)
+    ):
+        raise HTTPException(
+            status_code=400,
+            detail="Motion names must contain 1 to 40 printable characters.",
+        )
+    return normalized
+
+
+def list_duet_motions_for_user(username: str) -> list[dict]:
+    conn = get_db_connection()
+    rows = conn.execute(
+        """
+        SELECT motion_id, name, code, created_at
+        FROM duet_motions
+        WHERE username = ?
+        ORDER BY name COLLATE NOCASE, motion_id
+        """,
+        (username,),
+    ).fetchall()
+    conn.close()
+    return [
+        {
+            "id": row["motion_id"],
+            "name": row["name"],
+            "code": row["code"],
+            "created_at": row["created_at"],
+        }
+        for row in rows
+    ]
+
+
+def save_duet_motion_for_user(username: str, name: str, code: str) -> dict:
+    normalized_name = _validate_duet_motion_name(name)
+    if not isinstance(code, str) or len(code) > 20_000:
+        raise HTTPException(
+            status_code=400,
+            detail="DUET motion code must be text no longer than 20,000 characters.",
+        )
+    try:
+        commands = parse_duet_program(code)
+    except DuetProgramValidationError as error:
+        raise HTTPException(status_code=400, detail=str(error)) from error
+    if not commands:
+        raise HTTPException(status_code=400, detail="Add a supported DUET command before saving.")
+
+    conn = get_db_connection()
+    existing_names = {
+        row["name"].casefold()
+        for row in conn.execute(
+            "SELECT name FROM duet_motions WHERE username = ?",
+            (username,),
+        ).fetchall()
+    }
+    if normalized_name.casefold() in existing_names:
+        conn.close()
+        raise HTTPException(status_code=409, detail=f"A DUET motion named {normalized_name!r} already exists.")
+    if len(existing_names) >= 50:
+        conn.close()
+        raise HTTPException(status_code=409, detail="The DUET motion library is limited to 50 items.")
+
+    ascii_name = normalized_name.encode("ascii", "ignore").decode("ascii").lower()
+    slug = re.sub(r"[^a-z0-9]+", "_", ascii_name).strip("_")[:30]
+    if not slug or not slug[0].isalpha():
+        slug = f"motion_{slug}" if slug else "motion"
+    motion_id = f"{slug}_{uuid.uuid4().hex[:8]}"
+    conn.execute(
+        "INSERT INTO duet_motions (motion_id, username, name, code) VALUES (?, ?, ?, ?)",
+        (motion_id, username, normalized_name, code.strip()),
+    )
+    conn.commit()
+    row = conn.execute(
+        """
+        SELECT motion_id, name, code, created_at
+        FROM duet_motions
+        WHERE username = ? AND motion_id = ?
+        """,
+        (username, motion_id),
+    ).fetchone()
+    conn.close()
+    return {
+        "id": row["motion_id"],
+        "name": row["name"],
+        "code": row["code"],
+        "created_at": row["created_at"],
+    }
+
+
+def expand_duet_motion_calls(code: str, username: str) -> str:
+    if not isinstance(code, str) or len(code) > 20_000:
+        raise DuetProgramValidationError("DUET program must be text no longer than 20,000 characters.")
+    try:
+        tree = ast.parse(code or "", mode="exec")
+    except SyntaxError:
+        return code
+
+    class MotionExpander(ast.NodeTransformer):
+        def visit_Expr(self, node):
+            call = node.value
+            if not (
+                isinstance(call, ast.Call)
+                and isinstance(call.func, ast.Attribute)
+                and isinstance(call.func.value, ast.Name)
+                and call.func.value.id == "duet"
+                and call.func.attr == "saved_motion"
+            ):
+                return self.generic_visit(node)
+            if (
+                len(call.args) != 1
+                or call.keywords
+                or not isinstance(call.args[0], ast.Constant)
+                or not isinstance(call.args[0].value, str)
+                or not re.fullmatch(r"[a-z][a-z0-9_]{0,48}", call.args[0].value)
+            ):
+                raise DuetProgramValidationError(
+                    f"Saved motion call on line {node.lineno} requires one valid motion ID."
+                )
+            motion_id = call.args[0].value
+            conn = get_db_connection()
+            motion = conn.execute(
+                "SELECT code FROM duet_motions WHERE username = ? AND motion_id = ?",
+                (username, motion_id),
+            ).fetchone()
+            conn.close()
+            if not motion:
+                raise DuetProgramValidationError(
+                    f"Saved DUET motion {motion_id!r} is not available to this teacher."
+                )
+            try:
+                saved_tree = ast.parse(motion["code"], mode="exec")
+            except SyntaxError as error:
+                raise DuetProgramValidationError("Saved DUET motion contains invalid syntax.") from error
+            return self.visit(saved_tree).body
+
+    expanded = MotionExpander().visit(tree)
+    ast.fix_missing_locations(expanded)
+    expanded_code = ast.unparse(expanded)
+    if len(expanded_code) > 20_000:
+        raise DuetProgramValidationError("Expanded DUET program exceeds 20,000 characters.")
+    return expanded_code
 
 
 def save_unique_project_for_user(
@@ -1891,7 +2064,8 @@ def run_next(request: QueueRunRequest, user: dict = Depends(auth_required)):
                 with _MOTION_START_LOCK:
                     if active_navigation_operation() or active_lidar_scan() or robot_status().get("running"):
                         raise HTTPException(status_code=409, detail="Another robot operation currently owns motion.")
-                    result = execute_duet_program(item["code"])
+                    expanded_code = expand_duet_motion_calls(item["code"], user["username"])
+                    result = execute_duet_program(expanded_code)
             else:
                 with _MOTION_START_LOCK:
                     ensure_sdk_motion_available()
@@ -2310,13 +2484,28 @@ def run_duet_code(request: DuetProgramRequest, user: dict = Depends(auth_require
             )
         if robot_status().get("running"):
             raise HTTPException(status_code=409, detail="An SDK robot program is already running.")
-        return execute_duet_program(request.code)
+        expanded_code = expand_duet_motion_calls(request.code, user["username"])
+        return execute_duet_program(expanded_code)
     except DuetProgramValidationError as error:
         raise HTTPException(status_code=400, detail=str(error)) from error
     except DuetControllerError as error:
         raise HTTPException(status_code=503, detail=str(error)) from error
     finally:
         _MOTION_START_LOCK.release()
+
+
+@app.get("/api/duet/motions")
+def get_duet_motions(user: dict = Depends(auth_required)):
+    if user["role"] != "teacher":
+        raise HTTPException(status_code=403, detail="Teacher role required")
+    return {"motions": list_duet_motions_for_user(user["username"])}
+
+
+@app.post("/api/duet/motions")
+def create_duet_motion(request: DuetMotionSaveRequest, user: dict = Depends(auth_required)):
+    if user["role"] != "teacher":
+        raise HTTPException(status_code=403, detail="Teacher role required")
+    return {"motion": save_duet_motion_for_user(user["username"], request.name, request.code)}
 
 
 @app.post("/api/duet/stop")
@@ -2335,6 +2524,16 @@ def get_duet_commissioning(user: dict = Depends(auth_required)):
         raise HTTPException(status_code=403, detail="Teacher role required")
     try:
         return duet_commissioning_status()
+    except DuetControllerError as error:
+        raise HTTPException(status_code=503, detail=str(error)) from error
+
+
+@app.get("/api/duet/commissioning/evidence")
+def get_duet_commissioning_evidence(user: dict = Depends(auth_required)):
+    if user["role"] != "teacher":
+        raise HTTPException(status_code=403, detail="Teacher role required")
+    try:
+        return duet_commissioning_evidence()
     except DuetControllerError as error:
         raise HTTPException(status_code=503, detail=str(error)) from error
 
@@ -2396,7 +2595,8 @@ def review_duet_commissioning_route(
             request.passed,
             request.observed,
             user["username"],
-            request.notes,
+            request.observed_result,
+            notes=request.notes,
         )
     except DuetProgramValidationError as error:
         raise HTTPException(status_code=400, detail=str(error)) from error

@@ -181,6 +181,15 @@ export const DUET_COMMANDS = Object.freeze([
       [{ name: 'POSE', label: 'pose', kind: 'input' }],
     ),
     command('reset_arms', 'Reset arms to carry', 'Return both arms to the approved default/carry target.', []),
+    command('saved_motion', 'Run saved motion %1', 'Run one teacher-approved saved DUET motion.', [
+      {
+        name: 'MOTION_ID',
+        label: 'saved motion',
+        kind: 'choice',
+        value: '',
+        choices: [['No saved motions available', '']],
+      },
+    ], 'Run saved motion'),
     armGesture('reach_and_return', 'Reach and return', DUET_ARM_COMMANDS.reach_and_return),
     armGesture('receive_and_hold', 'Receive and hold', DUET_ARM_COMMANDS.receive_and_hold),
     armGesture('hold_and_return', 'Hold and return', DUET_ARM_COMMANDS.hold_and_return),
@@ -254,6 +263,22 @@ function formatValue(value, argument) {
 }
 
 function normalizeCommand(method, rawArgs, lineNumber) {
+  if (method === 'saved_motion') {
+    const args = splitArguments(rawArgs, lineNumber);
+    if (args.length !== 1) {
+      throw new Error(`duet.saved_motion expects one motion ID on line ${lineNumber}.`);
+    }
+    const motionId = args[0].replace(/^(['"])(.*)\1$/, '$2').toLowerCase();
+    if (!/^[a-z][a-z0-9_]{0,48}$/.test(motionId)) {
+      throw new Error(`Saved DUET motion ID on line ${lineNumber} is invalid.`);
+    }
+    return {
+      type: 'command',
+      method,
+      values: [motionId],
+      code: `duet.saved_motion(${JSON.stringify(motionId)})`,
+    };
+  }
   if (method === 'hold_pose' || method === 'hold_pose_until_reset') {
     const args = splitArguments(rawArgs, lineNumber);
     const expectedCount = method === 'hold_pose' ? 2 : 1;
@@ -580,17 +605,27 @@ export function formatDuetProgram(nodes, indent = 0) {
   )).join('\n');
 }
 
-export function getDuetBlocklyCommandBlocks() {
+export function getDuetBlocklyCommandBlocks(savedMotions = []) {
   return [
     ...DUET_COMMANDS.map((definition) => ({
     type: definition.type,
-    category: definition.category || (definition.method === 'wait' || definition.method === 'stop' || definition.method === 'reset_arms'
+    category: definition.category || (definition.method === 'saved_motion'
+      ? 'Saved motions'
+      : definition.method === 'wait' || definition.method === 'stop' || definition.method === 'reset_arms'
       ? 'Control'
       : definition.armPoses
         ? 'Arm gestures'
         : definition.poseInput ? 'Arm poses' : 'Locomotion'),
     message0: definition.message,
-    args0: definition.args.map((argument) => argument.kind === 'number'
+    args0: definition.method === 'saved_motion'
+      ? [{
+        type: 'field_dropdown',
+        name: 'MOTION_ID',
+        options: savedMotions.length
+          ? savedMotions.map(({ id, name }) => [name, id])
+          : [['No saved motions available', '']],
+      }]
+      : definition.args.map((argument) => argument.kind === 'number'
       ? {
         type: 'field_number',
         name: argument.name,
@@ -646,8 +681,9 @@ export function getDuetCommand(method) {
   return COMMAND_BY_METHOD.get(method) || null;
 }
 
-export function getDuetCommandExamples() {
+export function getDuetCommandExamples(savedMotions = []) {
   const commandExamples = DUET_COMMANDS.flatMap((definition) => {
+    if (definition.method === 'saved_motion') return [];
     if (definition.poseInput) {
       return getDuetArmPoseNames().map((poseName) => {
         const poseCode = `duet.pose(${JSON.stringify(poseName)})`;
@@ -671,6 +707,11 @@ export function getDuetCommandExamples() {
   });
   return [
     ...commandExamples,
+    ...savedMotions.map(({ id, name }) => ({
+      key: `saved_motion_${id}`,
+      label: `Saved motion: ${name}`,
+      code: `duet.saved_motion(${JSON.stringify(id)})`,
+    })),
     {
       key: 'front_distance_condition',
       label: 'Front distance condition example',
@@ -748,14 +789,61 @@ export function compileDuetMotionPrompt(prompt = '') {
         ? 'Specify a numeric duration in seconds.'
       : null;
   const duration = durationError ? 1 : durationValue;
+  const concurrentMatch = normalized.match(
+    /\b(?:walk|move)\s+(forward|backward)\b.*?\bwhile\b.*?\bwave\s+(left|right)\b/,
+  );
+  let concurrentHandled = false;
+  let concurrentRejected = false;
+  if (concurrentMatch) {
+    if (durationError) {
+      unknown.push(durationError);
+      concurrentRejected = true;
+    } else if (duration > 2.5) {
+      unknown.push('Concurrent DUET locomotion is limited to 2.5 seconds so the arm can finish its bounded transition.');
+      concurrentRejected = true;
+    } else {
+      const [, direction, side] = concurrentMatch;
+      const armDuration = Math.max(1, Number((duration + 0.5).toFixed(1)));
+      const level = /\b(high|up)\b/.test(normalized) ? 'high' : /\b(low|down)\b/.test(normalized) ? 'low' : 'mid';
+      const movementMethod = direction === 'backward' ? 'backward' : 'forward';
+      steps.push({
+        label: `Move ${direction} while waving ${side}`,
+        code: `with duet.concurrent():\n    duet.${movementMethod}(${duration})\n    duet.wave_${side}("${level}", ${armDuration})`,
+        detail: 'One bounded DUET locomotion action paired with a longer catalog arm gesture.',
+      });
+      concurrentHandled = true;
+    }
+  }
+  const arcMatches = [
+    ...normalized.matchAll(/\barc\s+(forward|backward)[ -](left|right)\b/g),
+    ...normalized.matchAll(/\b(forward|backward)[ -](left|right)\s+arc\b/g),
+  ].sort((left, right) => left.index - right.index);
+  arcMatches.forEach((match) => {
+    if (concurrentHandled || concurrentRejected) return;
+    if (durationError) {
+      unknown.push(durationError);
+      return;
+    }
+    const direction = match[1] || match[2];
+    const side = match[2] || match[3];
+    const method = `arc_${direction}_${side}`;
+    steps.push({
+      label: `${direction} ${side} arc`,
+      code: `duet.${method}(${duration})`,
+      detail: `${duration} seconds using the approved DUET arc preset`,
+    });
+  });
   const movementMatches = [
     ...normalized.matchAll(/\b(walk|move)\s+(forward|backward)\b/g),
-    ...normalized.matchAll(/\b(sidestep|step)\s+(left|right)\b/g),
+    ...normalized.matchAll(/\b(strafe|sidestep|step)\s+(left|right)\b/g),
     ...normalized.matchAll(/\b(turn)\s+(left|right)\b/g),
   ].sort((left, right) => left.index - right.index);
 
   movementMatches.forEach((match) => {
     const [, action, direction] = match;
+    if (concurrentHandled || concurrentRejected || arcMatches.some(({ index }) => (
+      index <= match.index && match.index < index + match[0].length
+    ))) return;
     if (durationError) {
       unknown.push(durationError);
       return;
@@ -769,13 +857,12 @@ export function compileDuetMotionPrompt(prompt = '') {
         unknown.push('Step- or distance-based movement is not equivalent to DUET velocity-and-time commands; specify a duration in seconds.');
         return;
       }
-      const vx = direction === 'backward' ? -0.1 : 0.15;
       steps.push({
         label: direction === 'backward' ? 'Move backward' : 'Move forward',
-        code: `duet.move(${vx}, 0, 0, ${duration})`,
+        code: `duet.${direction}(${duration})`,
         detail: `${duration} seconds at a conservative velocity`,
       });
-    } else if (action === 'sidestep' || action === 'step') {
+    } else if (action === 'strafe' || action === 'sidestep' || action === 'step') {
       if (/\bdegrees?\b|\bangle\b/.test(normalized)) {
         unknown.push('Angle-based movement is not supported; use forward, backward, left, or right velocity commands.');
         return;
@@ -811,14 +898,17 @@ export function compileDuetMotionPrompt(prompt = '') {
     };
   }
 
-  const supportedArmGestureMatches = [
+  const supportedArmGestureMatches = concurrentHandled || concurrentRejected ? [] : [
     ...normalized.matchAll(/\bwave\s+(left|right)\b/g),
     ...normalized.matchAll(/\braise\s+(?:both\s+arms?|left\s+arm|right\s+arm)\b/g),
   ].sort((left, right) => left.index - right.index);
+  const armDurationError = duration < 1 || duration > 3
+    ? 'DUET arm gestures and pose macros must last between 1 and 3 seconds.'
+    : null;
 
   supportedArmGestureMatches.forEach((match) => {
-    if (durationError) {
-      unknown.push(durationError);
+    if (durationError || armDurationError) {
+      unknown.push(durationError || armDurationError);
       return;
     }
     const phrase = match[0].toLowerCase();
@@ -831,6 +921,7 @@ export function compileDuetMotionPrompt(prompt = '') {
         code: `duet.${method}("${level}", ${duration})`,
         detail: `${duration} seconds at a safe bounded arm-wave level`,
       });
+
     } else if (phrase.includes('both')) {
       steps.push({
         label: 'Raise both arms',
@@ -848,6 +939,56 @@ export function compileDuetMotionPrompt(prompt = '') {
     }
   });
 
+  const fixedGestureAliases = [
+    { pattern: /\b(?:carry|neutral arms?)\b/, method: 'arm_carry', label: 'Carry arms' },
+    { pattern: /\breach forward\b/, method: 'arm_reach', label: 'Reach forward' },
+    { pattern: /\bclap\b/, method: 'gesture_clap', label: 'Clap' },
+    { pattern: /\b(?:hug|give a hug)\b/, method: 'gesture_hug', label: 'Hug' },
+    { pattern: /\b(?:kiss|blow a kiss)\b/, method: 'gesture_kiss_both', label: 'Two-hand kiss' },
+    { pattern: /\b(?:heart|make a heart)\b/, method: 'gesture_heart_both', label: 'Heart' },
+    { pattern: /\b(?:hands up|raise both hands)\b/, method: 'gesture_hands_up', label: 'Hands up' },
+    { pattern: /\bx[\s-]?ray\b/, method: 'gesture_xray', label: 'X-ray pose' },
+    { pattern: /\breach and return\b/, method: 'reach_and_return', label: 'Reach and return' },
+    { pattern: /\breceive and hold\b/, method: 'receive_and_hold', label: 'Receive and hold' },
+    { pattern: /\bhold and return\b/, method: 'hold_and_return', label: 'Hold and return' },
+    { pattern: /\breceive hold and return\b/, method: 'receive_hold_return', label: 'Receive, hold, and return' },
+  ];
+  fixedGestureAliases.forEach(({ pattern, method, label }) => {
+    if (
+      concurrentHandled
+      || concurrentRejected
+      || !pattern.test(normalized)
+      || supportedArmGestureMatches.some(({ 0: phrase }) => pattern.test(phrase))
+    ) return;
+    if (durationError || armDurationError) {
+      unknown.push(durationError || armDurationError);
+      return;
+    }
+    steps.push({
+      label,
+      code: `duet.${method}(${duration})`,
+      detail: `Run the approved ${label.toLowerCase()} arm macro`,
+    });
+  });
+  if (
+    !concurrentHandled
+    && !concurrentRejected
+    && /\bhigh five\b/.test(normalized)
+    && !supportedArmGestureMatches.length
+  ) {
+    if (durationError || armDurationError) {
+      unknown.push(durationError || armDurationError);
+    } else {
+      const side = /\bright\b/.test(normalized) ? 'right' : 'left';
+      const method = `gesture_high_five_${side}`;
+      steps.push({
+        label: `${side === 'left' ? 'Left' : 'Right'} high five`,
+        code: `duet.${method}(${duration})`,
+        detail: `Run the approved ${side} high-five arm macro`,
+      });
+    }
+  }
+
   if (!heldPoseMatch && !supportedArmGestureMatches.length && /\b(wave|raise|lift)\b/.test(normalized)) {
     unknown.push('Arm gestures are only supported as safe bounded left/right and both-arm presets that use the validated DUET arm gate.');
   }
@@ -857,7 +998,17 @@ export function compileDuetMotionPrompt(prompt = '') {
   if (!steps.length) {
     unknown.push('Try: “move forward for 1 second, then turn left for 1 second”.');
   }
-  const code = steps.map((step) => step.code).join('\n');
+  let code = steps.map((step) => step.code).join('\n');
+  const repeatMatch = normalized.match(/\brepeat\b.*?\b(\d+)\s+times?\b/);
+  if (repeatMatch) {
+    const repetitions = Number(repeatMatch[1]);
+    if (!Number.isInteger(repetitions) || repetitions < 1 || repetitions > 20) {
+      unknown.push('DUET prompt repetitions must be between 1 and 20.');
+      code = '';
+    } else if (code) {
+      code = `for _ in range(${repetitions}):\n${code.split('\n').map((line) => `    ${line}`).join('\n')}`;
+    }
+  }
   if (code) parseDuetProgram(code);
   return {
     code,

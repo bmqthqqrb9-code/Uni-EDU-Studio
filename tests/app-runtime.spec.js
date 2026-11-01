@@ -125,6 +125,53 @@ test('teacher can create and delete student accounts from the classroom panel', 
   await expect(page.getByRole('button', { name: 'Delete account classroom_24' })).toHaveCount(0);
 });
 
+test('teacher can hide locked sidebar panels and restore them from settings', async ({ page }) => {
+  await page.addInitScript(() => {
+    localStorage.setItem('edu-classroom-session', JSON.stringify({
+      token: 'teacher-sidebar-panels-token',
+      user: { role: 'teacher', username: 'teacher-sidebar-panels-test' },
+    }));
+  });
+  await page.route('**/api/**', async (route) => {
+    await route.fulfill({
+      status: 200,
+      contentType: 'application/json',
+      body: JSON.stringify({}),
+    });
+  });
+
+  await page.goto('/');
+  await expect(page.locator('canvas')).toBeVisible();
+  await page.getByRole('button', { name: 'Open app settings' }).click();
+  for (const panelName of ['Path Planner', 'Prompt to Motion', 'Vision to Motion']) {
+    await page.getByRole('checkbox', { name: `Lock ${panelName} open in sidebar` }).check();
+  }
+  await page.getByRole('checkbox', { name: 'Lock Prompt to Motion open in sidebar' }).uncheck();
+  await page.getByRole('button', { name: 'Close', exact: true }).click();
+
+  for (const panelId of ['planner', 'camera']) {
+    await expect(page.getByTestId(`sidebar-panel-${panelId}`)).toHaveCount(0);
+  }
+  await expect(page.getByTestId('sidebar-panel-prompt')).toHaveCount(0);
+  await expect(page.getByRole('button', { name: 'Path Planner', exact: true })).toHaveCount(0);
+  await expect(page.getByRole('button', { name: 'Prompt to Motion', exact: true })).toBeVisible();
+  await expect(page.getByRole('button', { name: 'Vision to Motion', exact: true })).toHaveCount(0);
+  await expect(page.getByRole('button', { name: 'Blocks', exact: true })).toBeVisible();
+  await expect(page.getByRole('button', { name: 'IDE', exact: true })).toBeVisible();
+
+  const [blocksTabBounds, ideTabBounds, promptTabBounds] = await Promise.all([
+    page.getByRole('button', { name: 'Blocks', exact: true }).boundingBox(),
+    page.getByRole('button', { name: 'IDE', exact: true }).boundingBox(),
+    page.getByRole('button', { name: 'Prompt to Motion', exact: true }).boundingBox(),
+  ]);
+  expect(Math.abs(blocksTabBounds.width - ideTabBounds.width)).toBeLessThan(2);
+  expect(Math.abs(blocksTabBounds.width - promptTabBounds.width)).toBeLessThan(2);
+
+  expect(await page.evaluate(() => (
+    localStorage.getItem('edu-locked-sidebar-panels:teacher-sidebar-panels-test')
+  ))).toBe(JSON.stringify(['planner', 'camera']));
+});
+
 test('teacher queue review overlays the workspace and shows the complete submitted project', async ({ page }) => {
   const runRequests = [];
   const queuedItem = {
@@ -195,6 +242,83 @@ test('teacher queue review overlays the workspace and shows the complete submitt
   await dialog.getByRole('button', { name: 'Close request review' }).click();
   await expect(page.getByRole('dialog')).toHaveCount(0);
   expect(runRequests).toEqual([]);
+});
+
+test('teacher can save a completed queued DUET program as a named command', async ({ page }) => {
+  const savedMotions = [];
+  let queuedItem = {
+    id: 'queued-duet-motion',
+    name: 'student-wave',
+    student: 'student1',
+    status: 'queued',
+    controller_version: 'duet',
+    code: 'duet.wave_left("mid", 1)',
+    planner_request: null,
+    project_snapshot: {},
+  };
+  await page.addInitScript(() => {
+    localStorage.setItem('edu-classroom-session', JSON.stringify({
+      token: 'teacher-duet-save-token',
+      user: { role: 'teacher', username: 'teacher' },
+    }));
+  });
+  await page.route('**/api/**', async (route) => {
+    const request = route.request();
+    const path = new URL(request.url()).pathname;
+    if (path === '/api/classroom/run-next' && request.method() === 'POST') {
+      queuedItem = { ...queuedItem, status: 'completed' };
+      await route.fulfill({
+        status: 200,
+        contentType: 'application/json',
+        body: JSON.stringify({ status: 'completed', item: queuedItem, process: { status: 'completed' } }),
+      });
+      return;
+    }
+    if (path === '/api/duet/motions' && request.method() === 'POST') {
+      const requestBody = request.postDataJSON();
+      savedMotions.push(requestBody);
+      await route.fulfill({
+        status: 201,
+        contentType: 'application/json',
+        body: JSON.stringify({
+          motion: { id: 'teacher-wave-a1b2c3d4', name: requestBody.name, code: requestBody.code },
+        }),
+      });
+      return;
+    }
+    const responses = {
+      '/api/classroom/codes': { codes: [] },
+      '/api/classroom/queue': { items: [queuedItem] },
+      '/api/classroom/users': { users: [{ username: 'teacher', role: 'teacher' }] },
+      '/api/classroom/status': { status: 'idle' },
+      '/api/classroom/projects/all': { projects: [] },
+      '/api/classroom/project': { project: { name: 'default', sceneObjects: [], plannerWaypoints: [], generatedCode: '' } },
+      '/api/planner/settings': { active_mode: 'manual' },
+      '/api/robot/status': { sdkAvailable: false, running: false },
+    };
+    await route.fulfill({
+      status: 200,
+      contentType: 'application/json',
+      body: JSON.stringify(responses[path] || {}),
+    });
+  });
+
+  await page.goto('/');
+  await page.getByRole('button', { name: 'IDE', exact: true }).click();
+  await page.getByRole('button', { name: 'Open queue' }).click();
+  await page.getByRole('button', { name: 'Review request' }).click();
+  const dialog = page.getByRole('dialog');
+  await dialog.getByRole('button', { name: 'Approve & run queued request' }).click();
+  await expect(dialog.getByText('Request completed. Physical movement is not independently verified.')).toBeVisible();
+  await dialog.getByLabel('I reviewed the completed motion and it matched the intended result.').check();
+  await dialog.getByLabel('Name the successful DUET motion').fill('Teacher wave');
+  await dialog.getByRole('button', { name: 'Save command' }).click();
+  await expect.poll(() => savedMotions).toEqual([{
+    name: 'Teacher wave',
+    code: 'duet.wave_left("mid", 1)',
+  }]);
+  await dialog.getByRole('button', { name: 'Close request review' }).click();
+  await expect(page.locator('textarea').last()).toHaveValue('duet.saved_motion("teacher-wave-a1b2c3d4")');
 });
 
 test('student can open a shared mode-2 project as a private copy with its original route visible', async ({ page }) => {
@@ -398,7 +522,9 @@ test('device camera preview remains local and stops when leaving Vision to Motio
 
   await page.goto('/');
   await page.getByRole('button', { name: 'Vision to Motion' }).click();
-  await expect(page.getByText('Camera-to-motion pose inference is not implemented.', { exact: false })).toBeVisible();
+  const legacyCameraNotice = page.getByText(/Camera-to-motion pose inference is not implemented/);
+  await legacyCameraNotice.scrollIntoViewIfNeeded();
+  await expect(legacyCameraNotice).toBeVisible();
   await page.getByRole('button', { name: 'Start preview' }).click();
   await expect(page.getByRole('button', { name: 'Stop preview' })).toBeVisible();
   expect(await page.evaluate(() => window.cameraPreviewTestState.requestCount)).toBe(1);
@@ -683,6 +809,167 @@ test('teacher sensor diagnostics label model-derived distance readings as provis
   await expect(page.getByText('/lidar/front · fresh · frame front_lidar · 42 ms old')).toBeVisible();
   await expect(page.getByText('/lidar/rear · unavailable · frame rear_lidar · 1800 ms old · PointCloud2 sample is stale.')).toBeVisible();
   expect(sensorDiscoveryRequests).toBe(1);
+});
+
+test('3D camera keypad is draggable and has no shrink control', async ({ page }) => {
+  await page.addInitScript(() => {
+    localStorage.setItem('edu-classroom-session', JSON.stringify({
+      token: 'test-token',
+      user: { role: 'student', username: 'student-camera-controls-test' },
+    }));
+  });
+  await page.goto('/');
+  const canvas = page.locator('canvas[aria-label^="3D simulation."]');
+  await expect(canvas).toBeVisible();
+  await expect(page.getByRole('button', { name: 'Pan view up' })).toBeVisible();
+  await expect(page.getByRole('button', { name: 'Pan view left' })).toBeVisible();
+  await expect(page.getByRole('button', { name: 'Pan view down' })).toBeVisible();
+  await expect(page.getByRole('button', { name: 'Pan view right' })).toBeVisible();
+  await expect(page.getByRole('button', { name: 'Shrink camera controls' })).toHaveCount(0);
+  await expect(page.getByRole('button', { name: 'Enlarge camera controls' })).toHaveCount(0);
+
+  const moveHandle = page.getByRole('button', { name: 'Move camera controls' });
+  const beforeMove = await page.getByRole('group', { name: '3D camera navigation' }).boundingBox();
+  const handleBounds = await moveHandle.boundingBox();
+  await page.mouse.move(handleBounds.x + handleBounds.width / 2, handleBounds.y + handleBounds.height / 2);
+  await page.mouse.down();
+  await page.mouse.move(handleBounds.x + handleBounds.width / 2 + 60, handleBounds.y + handleBounds.height / 2 + 30);
+  await page.mouse.up();
+  const afterMove = await page.getByRole('group', { name: '3D camera navigation' }).boundingBox();
+  expect(afterMove.x).toBeGreaterThan(beforeMove.x + 30);
+  expect(afterMove.y).toBeGreaterThan(beforeMove.y + 10);
+  const movedHandle = await moveHandle.boundingBox();
+  await page.mouse.move(movedHandle.x + movedHandle.width / 2, movedHandle.y + movedHandle.height / 2);
+  await page.mouse.down();
+  await page.mouse.move(movedHandle.x + movedHandle.width / 2 - 60, movedHandle.y + movedHandle.height / 2 - 30);
+  await page.mouse.up();
+
+  await canvas.focus();
+  await expect(canvas).toBeFocused();
+  await page.keyboard.press('ArrowUp');
+});
+
+test('3D camera navigation controls remain reachable on a mobile viewport', async ({ page }) => {
+  await page.setViewportSize({ width: 390, height: 844 });
+  await page.addInitScript(() => {
+    localStorage.setItem('edu-classroom-session', JSON.stringify({
+      token: 'test-token',
+      user: { role: 'student', username: 'student-mobile-camera-test' },
+    }));
+  });
+  await page.goto('/');
+  await page.getByRole('button', { name: 'Collapse workspace panel' }).click();
+  await expect(page.getByRole('group', { name: '3D camera navigation' })).toBeVisible();
+  await page.getByRole('button', { name: 'Hide camera controls' }).click();
+  await expect(page.getByRole('button', { name: 'Pan view right' })).toBeHidden();
+  await expect(page.getByRole('button', { name: 'Show camera controls' })).toBeVisible();
+  await page.getByRole('button', { name: 'Show camera controls' }).click();
+  await expect(page.getByRole('button', { name: 'Pan view right' })).toBeVisible();
+  await page.getByRole('button', { name: 'Pan view right' }).click();
+
+  await page.setViewportSize({ width: 320, height: 360 });
+  const sceneBounds = await page.locator('.scene-shell').boundingBox();
+  for (const locator of [
+    page.getByRole('group', { name: '3D camera navigation' }),
+    page.getByRole('group', { name: 'Motion playback controls' }),
+  ]) {
+    const bounds = await locator.boundingBox();
+    expect(bounds.x).toBeGreaterThanOrEqual(sceneBounds.x);
+    expect(bounds.y).toBeGreaterThanOrEqual(sceneBounds.y);
+    expect(bounds.x + bounds.width).toBeLessThanOrEqual(sceneBounds.x + sceneBounds.width);
+    expect(bounds.y + bounds.height).toBeLessThanOrEqual(sceneBounds.y + sceneBounds.height);
+  }
+  await page.getByRole('button', { name: 'Expand workspace panel' }).click();
+  const workspacePanel = page.getByRole('button', { name: 'Collapse workspace panel' }).locator('xpath=../..');
+  await expect.poll(async () => {
+    const bounds = await workspacePanel.boundingBox();
+    return {
+      insideScene: bounds.x >= sceneBounds.x
+        && bounds.y >= sceneBounds.y
+        && bounds.x + bounds.width <= sceneBounds.x + sceneBounds.width
+        && bounds.y + bounds.height <= sceneBounds.y + sceneBounds.height,
+      insideViewport: bounds.x >= 0 && bounds.y >= 0 && bounds.x + bounds.width <= 320 && bounds.y + bounds.height <= 360,
+    };
+  }).toEqual({ insideScene: true, insideViewport: true });
+});
+
+test('Blockly supports undo and redo buttons and keyboard shortcuts', async ({ page }) => {
+  await page.addInitScript(() => {
+    localStorage.setItem('edu-classroom-session', JSON.stringify({
+      token: 'test-token',
+      user: { role: 'student', username: 'student-blockly-history-test' },
+    }));
+  });
+  await page.goto('/');
+  await expect(page.getByRole('button', { name: 'Undo blocks' })).toBeVisible();
+  await page.evaluate(() => {
+    const workspace = window.Blockly.getMainWorkspace();
+    const block = workspace.newBlock('g1_command_walk');
+    block.initSvg();
+    block.render();
+  });
+  await expect.poll(() => page.evaluate(() => (
+    window.Blockly.getMainWorkspace().getAllBlocks().length
+  ))).toBe(1);
+
+  await page.evaluate(() => document.activeElement?.blur());
+  await page.keyboard.press('Control+z');
+  await expect.poll(() => page.evaluate(() => (
+    window.Blockly.getMainWorkspace().getAllBlocks().length
+  ))).toBe(0);
+  await page.keyboard.press('Control+y');
+  await expect.poll(() => page.evaluate(() => (
+    window.Blockly.getMainWorkspace().getAllBlocks().length
+  ))).toBe(1);
+
+  await page.getByRole('button', { name: 'Undo blocks' }).click();
+  await expect.poll(() => page.evaluate(() => (
+    window.Blockly.getMainWorkspace().getAllBlocks().length
+  ))).toBe(0);
+  await page.getByRole('button', { name: 'Redo blocks' }).click();
+  await expect.poll(() => page.evaluate(() => (
+    window.Blockly.getMainWorkspace().getAllBlocks().length
+  ))).toBe(1);
+});
+
+test('Blockly workspace survives collapsing and reopening its side panel', async ({ page }) => {
+  await page.addInitScript(() => {
+    localStorage.setItem('edu-classroom-session', JSON.stringify({
+      token: 'test-token',
+      user: { role: 'student', username: 'student-blockly-panel-test' },
+    }));
+  });
+
+  await page.goto('/');
+  await expect(page.locator('canvas')).toBeVisible();
+  await page.getByRole('button', { name: 'IDE', exact: true }).click();
+  await page.locator('textarea').first().fill(
+    'robot.walk(2)\nrobot.stand()\nrobot.arm_action("hands up")\nrobot.hold_arm("hands up", 3)',
+  );
+  await page.getByRole('button', { name: 'Blocks', exact: true }).click();
+  await expect(page.locator('.blocklyText').filter({ hasText: 'Walk forward' }).first()).toBeVisible();
+  await expect.poll(() => page.evaluate(() => (
+    window.Blockly.getMainWorkspace().getAllBlocks().length
+  ))).toBe(4);
+  await page.evaluate(() => {
+    window.originalBlocklySvg = document.querySelector('.blocklySvg');
+  });
+  const workspacePanel = page.getByRole('button', { name: 'Collapse workspace panel' })
+    .locator('xpath=../..');
+  const expandedPanelBounds = await workspacePanel.boundingBox();
+
+  await page.getByRole('button', { name: 'Collapse workspace panel' }).click();
+  await expect(page.locator('.blocklySvg')).toBeHidden();
+  await page.getByRole('button', { name: 'Expand workspace panel' }).click();
+  await expect(page.locator('.blocklySvg')).toBeVisible();
+  await expect.poll(async () => {
+    const bounds = await workspacePanel.boundingBox();
+    return { width: bounds.width, height: bounds.height };
+  }).toEqual({ width: expandedPanelBounds.width, height: expandedPanelBounds.height });
+  await expect.poll(() => page.evaluate(() => (
+    window.originalBlocklySvg === document.querySelector('.blocklySvg')
+      && window.Blockly.getMainWorkspace().getAllBlocks().length === 4
+  ))).toBe(true);
 });
 
 test('student IDE multiline commands render as Blocks and generate code', async ({ page }) => {
@@ -1852,4 +2139,198 @@ test('students can add, move, delete, and compile planner waypoints', async ({ p
   await expect(page.getByText('Waypoint 2', { exact: true })).toHaveCount(0);
   await expect(page.getByText('Waypoint 1', { exact: true })).toBeVisible();
   await expect(page.locator('[data-testid="waypoint-total-distance"]')).toHaveCount(0);
+});
+
+test('teacher DUET commissioning supports retry, review, failure, and copyable evidence without legacy runs', async ({ page }) => {
+  const requests = [];
+  const abortRequests = [];
+  const steps = [
+    { id: 'base-custom-vector', title: 'Custom bounded base vector', expected: 'Brief bounded motion then zero velocity.', code: 'duet.move(0.05, 0.05, 0.1, 0.5)', status: 'pending', attempts: [] },
+    { id: 'program-stop-command', title: 'DUET program stop command', expected: 'The executor reports stopped.', code: 'duet.stop()', status: 'pending', attempts: [] },
+  ];
+  let report = { status: 'not_started', current_step: null, steps: [], commissioning_enabled: true };
+  const evidence = {
+    report: { status: 'failed', report_id: 'commissioning-e2e', steps: [] },
+    events: [{ event: 'step_reviewed', passed: false }],
+    event_log: '{"event":"step_reviewed","passed":false}\n',
+  };
+
+  await page.addInitScript(() => {
+    localStorage.setItem('edu-classroom-session', JSON.stringify({
+      token: 'teacher-duet-commissioning-token',
+      user: { role: 'teacher', username: 'teacher' },
+    }));
+    window.__copiedCommissioningEvidence = null;
+    Object.defineProperty(navigator, 'clipboard', {
+      configurable: true,
+      value: {
+        writeText: async (text) => {
+          window.__copiedCommissioningEvidence = text;
+        },
+      },
+    });
+  });
+  page.on('dialog', (dialog) => dialog.accept());
+  await page.route('**/api/**', async (route) => {
+    const request = route.request();
+    const url = new URL(request.url());
+    const path = url.pathname;
+    requests.push({ path, method: request.method(), body: request.postDataJSON() });
+    let body = {};
+
+    if (path === '/api/classroom/codes') body = { codes: [] };
+    else if (path === '/api/classroom/queue') body = { items: [] };
+    else if (path === '/api/classroom/users') body = { users: [{ username: 'teacher', role: 'teacher' }] };
+    else if (path === '/api/classroom/status') body = { status: 'idle' };
+    else if (path === '/api/classroom/projects/all') body = { projects: [] };
+    else if (path === '/api/classroom/project') body = { project: { name: 'default', sceneObjects: [], plannerWaypoints: [], generatedCode: '' } };
+    else if (path === '/api/robot/status') body = { sdkAvailable: false, running: false };
+    else if (path === '/api/duet/commissioning' && request.method() === 'GET') body = report;
+    else if (path === '/api/duet/commissioning/evidence') body = evidence;
+    else if (path === '/api/duet/connect') {
+      body = { status: 'connected', ready: true, connected: true, motionOwner: 'duet', capabilities: ['base_velocity', 'arm_targets'] };
+    } else if (path === '/api/duet/commissioning/start') {
+      report = {
+        report_id: 'commissioning-e2e',
+        status: 'in_progress',
+        current_step: 0,
+        commissioning_enabled: true,
+        steps: steps.map((step) => ({ ...step, attempts: [...step.attempts] })),
+      };
+      body = report;
+    } else if (path === '/api/duet/commissioning/step') {
+      const { step_index: stepIndex } = request.postDataJSON();
+      const step = report.steps[stepIndex];
+      step.attempts.push({ attempt: step.attempts.length + 1 });
+      step.status = 'awaiting_review';
+      step.result = { status: 'completed', commandsExecuted: 1, armTelemetry: [] };
+      body = report;
+    } else if (path === '/api/duet/commissioning/review') {
+      const review = request.postDataJSON();
+      const step = report.steps[review.step_index];
+      step.review = review;
+      if (review.passed) {
+        step.status = 'passed';
+        report.current_step += 1;
+      } else {
+        step.status = 'failed';
+        report.status = 'failed';
+      }
+      body = report;
+    } else if (path === '/api/duet/commissioning/abort') {
+      abortRequests.push(path);
+      report.status = 'aborted';
+      body = report;
+    }
+
+    await route.fulfill({ status: 200, contentType: 'application/json', body: JSON.stringify(body) });
+  });
+
+  await page.goto('/');
+  await page.getByRole('button', { name: 'Open queue' }).click();
+  const robotSettings = page.getByTestId('teacher-robot-settings');
+  await page.getByRole('button', { name: 'Settings', exact: true }).nth(1).click();
+  await page.getByRole('checkbox', { name: 'Enable DUET version two' }).check();
+  await page.getByRole('button', { name: 'Close', exact: true }).click();
+  await expect(robotSettings.getByText('Teacher-only DUET commissioning')).toBeVisible();
+  await robotSettings.getByRole('button', { name: 'Connect', exact: true }).click();
+  await robotSettings.getByRole('button', { name: 'Start full test sequence' }).click();
+  await robotSettings.getByRole('button', { name: 'Run test 1' }).click();
+  await robotSettings.getByRole('button', { name: 'Run again' }).click();
+
+  const observedResult = robotSettings.getByLabel('DUET commissioning observed result');
+  await observedResult.fill('Observed the test response and confirmed the expected direction.');
+  const nextButton = robotSettings.getByRole('button', { name: 'Next', exact: true });
+  await expect(nextButton).toBeDisabled();
+  await robotSettings.getByLabel('I physically observed the expected robot response for this test.').check();
+  await expect(nextButton).toBeEnabled();
+  await nextButton.click();
+
+  await robotSettings.getByRole('button', { name: 'Run test 2' }).click();
+  await robotSettings.getByLabel('DUET commissioning observed result').fill('Observed a discrepancy; stopping this commissioning run.');
+  await robotSettings.getByRole('button', { name: 'Fail and stop sequence' }).click();
+  await expect(robotSettings.getByText('failed', { exact: true })).toBeVisible();
+  await robotSettings.getByRole('button', { name: 'Copy evidence' }).click();
+  await expect(robotSettings.getByLabel('Selectable DUET commissioning report and event log')).toHaveValue(/commissioning-e2e/);
+  await expect.poll(() => page.evaluate(() => window.__copiedCommissioningEvidence)).toContain('"event_log"');
+
+  await robotSettings.getByRole('button', { name: 'Start a new full test' }).click();
+  await robotSettings.getByRole('button', { name: 'Abort and request STOP' }).click();
+  await expect(robotSettings.getByText('aborted', { exact: true })).toBeVisible();
+  expect(abortRequests).toHaveLength(1);
+
+  const reviewRequests = requests.filter((request) => request.path === '/api/duet/commissioning/review');
+  expect(reviewRequests.map(({ body }) => body.observed_result)).toEqual([
+    'Observed the test response and confirmed the expected direction.',
+    'Observed a discrepancy; stopping this commissioning run.',
+  ]);
+  expect(requests.filter(({ path }) => path === '/api/duet/commissioning/step')).toHaveLength(3);
+  expect(requests.some(({ path }) => path === '/api/run' || path === '/api/duet/run')).toBe(false);
+});
+
+test('DUET commissioning is hidden from students', async ({ page }) => {
+  const commissioningRequests = [];
+  await page.addInitScript(() => {
+    localStorage.setItem('edu-classroom-session', JSON.stringify({
+      token: 'student-duet-commissioning-token',
+      user: { role: 'student', username: 'student1' },
+    }));
+  });
+  await page.route('**/api/**', async (route) => {
+    const path = new URL(route.request().url()).pathname;
+    if (path.startsWith('/api/duet/commissioning')) commissioningRequests.push(path);
+    await route.fulfill({
+      status: 200,
+      contentType: 'application/json',
+      body: JSON.stringify({}),
+    });
+  });
+
+  await page.goto('/');
+  await expect(page.getByText('Teacher-only DUET commissioning')).toHaveCount(0);
+  expect(commissioningRequests).toEqual([]);
+});
+
+test('teacher commissioning controls stay disabled when the backend feature gate is off', async ({ page }) => {
+  await page.addInitScript(() => {
+    localStorage.setItem('edu-classroom-session', JSON.stringify({
+      token: 'teacher-duet-commissioning-disabled-token',
+      user: { role: 'teacher', username: 'teacher' },
+    }));
+  });
+  const startRequests = [];
+  await page.route('**/api/**', async (route) => {
+    const request = route.request();
+    const path = new URL(request.url()).pathname;
+    let body = {};
+    if (path === '/api/classroom/codes') body = { codes: [] };
+    else if (path === '/api/classroom/queue') body = { items: [] };
+    else if (path === '/api/classroom/users') body = { users: [{ username: 'teacher', role: 'teacher' }] };
+    else if (path === '/api/classroom/status') body = { status: 'idle' };
+    else if (path === '/api/classroom/projects/all') body = { projects: [] };
+    else if (path === '/api/classroom/project') body = { project: { name: 'default', sceneObjects: [], plannerWaypoints: [], generatedCode: '' } };
+    else if (path === '/api/robot/status') body = { sdkAvailable: false, running: false };
+    else if (path === '/api/duet/commissioning') {
+      body = { status: 'not_started', steps: [], current_step: null, commissioning_enabled: false };
+    } else if (path === '/api/duet/connect') {
+      body = { status: 'connected', ready: true, connected: true, motionOwner: 'duet' };
+    } else if (path === '/api/duet/commissioning/start') {
+      startRequests.push(path);
+    }
+
+    await route.fulfill({ status: 200, contentType: 'application/json', body: JSON.stringify(body) });
+  });
+
+  await page.goto('/');
+  await page.getByRole('button', { name: 'Open queue' }).click();
+  await page.getByRole('button', { name: 'Settings', exact: true }).nth(1).click();
+  await page.getByRole('checkbox', { name: 'Enable DUET version two' }).check();
+  await page.getByRole('button', { name: 'Close', exact: true }).click();
+  const robotSettings = page.getByTestId('teacher-robot-settings');
+  await robotSettings.getByRole('button', { name: 'Connect', exact: true }).click();
+  await expect(robotSettings.getByText('Guided commissioning is disabled.')).toBeVisible();
+  const startButton = robotSettings.getByRole('button', { name: 'Start full test sequence' });
+  await expect(startButton).toBeDisabled();
+  await startButton.click({ force: true });
+  expect(startRequests).toEqual([]);
 });

@@ -314,6 +314,7 @@ class DuetProgramValidationTests(unittest.TestCase):
             "DUET_PHYSICAL_ENABLED": "true",
             "DUET_EXPECTED_POLICY_ID": "policy-reviewed-on-robot",
             "DUET_ROBOT_ID": "g1-test-unit",
+            "DUET_HARDWARE_ACCEPTANCE_ID": "test-acceptance",
         }, clear=True), patch.object(duet_robot, "_gateway_request", return_value={
             "protocol": duet_robot.DUET_PROTOCOL,
             "robot_model": duet_robot.DUET_ROBOT_MODEL,
@@ -410,23 +411,111 @@ class DuetCommissioningTests(unittest.TestCase):
     def test_commissioning_plan_covers_all_pose_and_gesture_mappings(self):
         steps = duet_robot._commissioning_steps()
         step_ids = {step["id"] for step in steps}
+        step_code = "\n".join(step.get("code") or "" for step in steps)
 
         for pose in duet_robot.DUET_ARM_POSES:
             self.assertIn(f"pose-{pose}", step_ids)
+            self.assertIn(f'duet.pose("{pose}")', step_code)
         for command in duet_robot.DUET_ARM_COMMANDS:
             self.assertIn(f"command-{command}", step_ids)
+            self.assertIn(f"duet.{command}(", step_code)
         for gesture in duet_robot.DUET_ARM_GESTURES:
             self.assertIn(f"gesture-{gesture}", step_ids)
+            self.assertIn(f"duet.{gesture}(", step_code)
         for movement in duet_robot.DUET_MOVEMENT_PRESETS:
             self.assertIn(f"base-{movement}", step_ids)
+            self.assertIn(f"duet.{movement}(", step_code)
+        for command in ("move", "wait", "stop", "hold_pose", "hold_pose_until_reset", "reset_arms"):
+            self.assertIn(f"duet.{command}(", step_code)
+        self.assertIn("base-custom-vector", step_ids)
+        self.assertIn("program-stop-command", step_ids)
+        self.assertIn("explicit-stop", step_ids)
+        self.assertIn("concurrent-base-arm", step_ids)
+        self.assertIn("move-and-arm", step_ids)
+        for mappings in (
+            duet_robot.DUET_ARM_CATALOG["legacyMappings"],
+            duet_robot.DUET_ARM_CATALOG["legacyCommandMappings"],
+        ):
+            for mapped_commands in mappings.values():
+                for command in mapped_commands:
+                    if command == "reset_arms":
+                        self.assertIn("hold-until-reset", step_ids)
+                    elif command.startswith("gesture_"):
+                        self.assertIn(f"gesture-{command}", step_ids)
+                    else:
+                        self.assertIn(f"command-{command}", step_ids)
         for step in steps:
             if step["code"]:
                 with self.subTest(step=step["id"]):
                     self.assertTrue(duet_robot.parse_duet_program(step["code"]))
         self.assertIn("velocity-lease-expiry", step_ids)
-        self.assertIn("explicit-stop", step_ids)
-        self.assertIn("concurrent-base-arm", step_ids)
-        self.assertIn("move-and-arm", step_ids)
+
+    def test_program_stop_commissioning_step_accepts_the_stopped_result(self):
+        step = next(
+            step for step in duet_robot._commissioning_steps()
+            if step["id"] == "program-stop-command"
+        )
+        with patch.object(duet_robot, "_commissioning_state", None), patch.object(
+            duet_robot, "_commissioning_steps", return_value=[step]
+        ), patch.dict(os.environ, {
+            "DUET_CONTROL_DIR": self.temp_dir.name,
+            "DUET_EXPECTED_POLICY_ID": "sha256:commission-policy",
+            "DUET_PHYSICAL_ENABLED": "true",
+            "DUET_COMMISSIONING_ENABLED": "true",
+            "DUET_ROBOT_ID": "g1-test-unit",
+        }, clear=True), patch.object(
+            duet_robot, "_gateway_request", return_value=self._controller_status()
+        ), patch.object(
+            duet_robot, "execute_program", return_value={
+                "status": "stopped",
+                "commandsExecuted": 1,
+                "armTelemetry": [],
+                "physicalMovementVerified": False,
+            }
+        ) as execute:
+            duet_robot.start_commissioning("teacher")
+            report = duet_robot.run_commissioning_step(0)
+
+        self.assertEqual(report["steps"][0]["status"], "awaiting_review")
+        self.assertEqual(report["steps"][0]["result"]["status"], "stopped")
+        execute.assert_called_once_with("duet.stop()", commissioning=True)
+
+    def test_gateway_stop_commissioning_step_records_inactive_motion(self):
+        step = {
+            "id": "explicit-stop",
+            "title": "Explicit stop and arm reset",
+            "category": "stop",
+            "code": None,
+            "expected": "STOP clears velocity and arm leases.",
+            "status": "pending",
+            "attempts": [],
+        }
+        report = {
+            "report_id": "gateway-stop-test",
+            "status": "in_progress",
+            "current_step": 0,
+            "steps": [step],
+        }
+        moving_status = self._controller_status()
+        moving_status["motion_active"] = True
+        stopped_status = self._controller_status()
+        with patch.object(duet_robot, "_commissioning_state", report), patch.dict(
+            os.environ, {
+                "DUET_CONTROL_DIR": self.temp_dir.name,
+                "DUET_PHYSICAL_ENABLED": "true",
+                "DUET_COMMISSIONING_ENABLED": "true",
+                "DUET_EXPECTED_POLICY_ID": "sha256:commission-policy",
+            }
+        ), patch.object(
+            duet_robot, "_gateway_request", return_value=moving_status
+        ), patch.object(
+            duet_robot, "_stop_gateway_command", return_value=stopped_status
+        ) as stop:
+            result = duet_robot.run_commissioning_step(0)
+
+        self.assertEqual(result["steps"][0]["status"], "awaiting_review")
+        self.assertFalse(result["steps"][0]["result"]["motion_active_after_stop"])
+        stop.assert_called_once_with()
 
     def test_commissioning_requires_physical_and_supervised_gates_and_feedback(self):
         with patch.dict(os.environ, {
@@ -480,28 +569,75 @@ class DuetCommissioningTests(unittest.TestCase):
         }, clear=True), patch.object(
             duet_robot, "_gateway_request", return_value=self._controller_status()
         ), patch.object(
-            duet_robot, "execute_program", return_value={
+            duet_robot, "execute_program", side_effect=[{
                 "status": "completed",
                 "commandsExecuted": 1,
                 "armTelemetry": [],
-            }
+            }, {
+                "status": "completed",
+                "commandsExecuted": 1,
+                "armTelemetry": [],
+            }]
         ) as execute:
             report = duet_robot.start_commissioning("teacher")
             self.assertEqual(report["status"], "in_progress")
             self.assertEqual(report["current_step"], 0)
             report = duet_robot.run_commissioning_step(0)
             self.assertEqual(report["steps"][0]["status"], "awaiting_review")
-            execute.assert_called_once_with(step["code"], commissioning=True)
+            report = duet_robot.run_commissioning_step(0)
+            self.assertEqual(len(report["steps"][0]["attempts"]), 2)
+            execute.assert_has_calls([
+                call(step["code"], commissioning=True),
+                call(step["code"], commissioning=True),
+            ])
             with self.assertRaisesRegex(duet_robot.DuetControllerError, "confirms observing"):
-                duet_robot.review_commissioning_step(0, True, False, "teacher")
-            report = duet_robot.review_commissioning_step(0, True, True, "teacher", "Verified")
+                duet_robot.review_commissioning_step(0, True, False, "teacher", "Verified")
+            with self.assertRaisesRegex(duet_robot.DuetControllerError, "observed result"):
+                duet_robot.review_commissioning_step(0, False, False, "teacher", " ")
+            report = duet_robot.review_commissioning_step(
+                0, True, True, "teacher", "Observed both expected controller completion responses.", "Verified"
+            )
             self.assertEqual(report["status"], "passed")
             self.assertTrue(report["teacher_reviewed"])
             self.assertTrue(report["acceptance_id"])
-            self.assertEqual(
-                duet_robot._require_hardware_acceptance(),
-                "sha256:commission-policy",
-            )
+            with self.assertRaisesRegex(duet_robot.DuetControllerError, "separately supervised hardware acceptance"):
+                duet_robot._require_hardware_acceptance()
+            with patch.dict(os.environ, {"DUET_HARDWARE_ACCEPTANCE_ID": report["acceptance_id"]}), patch.object(
+                duet_robot, "_gateway_request", return_value=self._controller_status()
+            ):
+                self.assertEqual(
+                    duet_robot._require_hardware_acceptance(),
+                    "sha256:commission-policy",
+                )
+
+    def test_arm_commissioning_fails_closed_without_measured_feedback(self):
+        step = {
+            "id": "pose-feedback-check",
+            "title": "Arm feedback check",
+            "category": "pose",
+            "code": 'duet.hold_pose(duet.pose("carry"), 1)',
+            "expected": "Measured arm joints are reported.",
+        }
+        with patch.object(duet_robot, "_commissioning_state", None), patch.object(
+            duet_robot, "_commissioning_steps", return_value=[step]
+        ), patch.dict(os.environ, {
+            "DUET_CONTROL_DIR": self.temp_dir.name,
+            "DUET_EXPECTED_POLICY_ID": "sha256:commission-policy",
+            "DUET_PHYSICAL_ENABLED": "true",
+            "DUET_COMMISSIONING_ENABLED": "true",
+            "DUET_ROBOT_ID": "g1-test-unit",
+        }, clear=True), patch.object(
+            duet_robot, "_gateway_request", return_value=self._controller_status()
+        ), patch.object(
+            duet_robot, "execute_program", return_value={"status": "completed", "armTelemetry": []}
+        ), patch.object(duet_robot, "_stop_gateway_command", return_value=self._controller_status()):
+            duet_robot.start_commissioning("teacher")
+            with self.assertRaisesRegex(duet_robot.DuetControllerError, "no measured arm feedback"):
+                duet_robot.run_commissioning_step(0)
+            report = duet_robot.commissioning_status()
+
+        self.assertEqual(report["status"], "failed")
+        self.assertEqual(report["steps"][0]["status"], "failed")
 
     def test_arm_feedback_mismatch_cannot_be_teacher_passed(self):
         report = {
@@ -517,7 +653,66 @@ class DuetCommissioningTests(unittest.TestCase):
         }
         with patch.object(duet_robot, "_commissioning_state", report):
             with self.assertRaisesRegex(duet_robot.DuetControllerError, "exceeded 0.25 rad"):
-                duet_robot.review_commissioning_step(0, True, True, "teacher")
+                duet_robot.review_commissioning_step(0, True, True, "teacher", "Measured mismatch.")
+
+    def test_failed_review_requests_stop_and_records_observed_result(self):
+        report = {
+            "report_id": "failed-review",
+            "status": "in_progress",
+            "current_step": 0,
+            "teacher": "teacher",
+            "steps": [{
+                "id": "test-step",
+                "status": "awaiting_review",
+                "feedback_within_tolerance": True,
+            }],
+        }
+        with patch.object(duet_robot, "_commissioning_state", report), patch.dict(
+            os.environ, {"DUET_CONTROL_DIR": self.temp_dir.name}
+        ), patch.object(
+            duet_robot, "stop_controller", return_value={"status": "stopped"}
+        ) as stop:
+            result = duet_robot.review_commissioning_step(
+                0, False, False, "teacher", "Unexpected motion observed."
+            )
+
+        self.assertEqual(result["status"], "failed")
+        self.assertEqual(result["steps"][0]["review"]["observed_result"], "Unexpected motion observed.")
+        stop.assert_called_once_with()
+
+    def test_abort_requests_stop_and_persists_report(self):
+        report = {
+            "report_id": "aborted-run",
+            "status": "in_progress",
+            "steps": [],
+        }
+        with patch.object(duet_robot, "_commissioning_state", report), patch.dict(
+            os.environ, {"DUET_CONTROL_DIR": self.temp_dir.name}
+        ), patch.object(
+            duet_robot, "stop_controller", return_value={"status": "stopped"}
+        ) as stop:
+            result = duet_robot.abort_commissioning("teacher")
+            persisted = json.loads(duet_robot._commissioning_report_path().read_text(encoding="utf-8"))
+
+        self.assertEqual(result["status"], "aborted")
+        self.assertEqual(persisted["aborted_by"], "teacher")
+        stop.assert_called_once_with()
+
+    def test_commissioning_evidence_includes_validated_append_only_events(self):
+        event = {"event": "started", "report_id": "commissioning-1"}
+        with patch.dict(os.environ, {"DUET_CONTROL_DIR": self.temp_dir.name}), patch.object(
+            duet_robot, "_commissioning_state", None
+        ):
+            duet_robot._commissioning_report_path().write_text(
+                json.dumps({"report_id": "commissioning-1", "status": "passed"}),
+                encoding="utf-8",
+            )
+            duet_robot._commissioning_log_path().write_text(json.dumps(event) + "\n", encoding="utf-8")
+            evidence = duet_robot.commissioning_evidence()
+
+        self.assertEqual(evidence["report"]["report_id"], "commissioning-1")
+        self.assertEqual(evidence["events"], [event])
+        self.assertEqual(evidence["event_log"], json.dumps(event) + "\n")
 
 
 class DuetOwnershipTests(unittest.TestCase):

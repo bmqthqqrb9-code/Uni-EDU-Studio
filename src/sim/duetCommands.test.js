@@ -31,6 +31,7 @@ test('DUET command catalog contains no legacy robot commands', () => {
     'hold_pose',
     'hold_pose_until_reset',
     'reset_arms',
+    'saved_motion',
     'reach_and_return',
     'receive_and_hold',
     'hold_and_return',
@@ -101,6 +102,30 @@ test('DUET command catalog contains no legacy robot commands', () => {
   assert.ok(DUET_COMMANDS.filter(({ armPoses }) => armPoses).every(({ args }) => (
     args.every((argument) => argument.kind !== 'choice')
   )));
+});
+
+test('named DUET motions compile as one validated call and populate the toolbox', () => {
+  const savedMotions = [{
+    id: 'class_wave_1234abcd',
+    name: 'Class wave',
+  }];
+  const parsed = parseDuetProgram('duet.saved_motion("class_wave_1234abcd")');
+  assert.equal(parsed[0].method, 'saved_motion');
+  assert.equal(parsed[0].values[0], savedMotions[0].id);
+  assert.equal(parsed[0].code, 'duet.saved_motion("class_wave_1234abcd")');
+
+  const savedMotionBlock = getDuetBlocklyCommandBlocks(savedMotions)
+    .find(({ type }) => type === 'duet_command_saved_motion');
+  assert.deepEqual(savedMotionBlock.args0[0].options, [['Class wave', 'class_wave_1234abcd']]);
+  assert.deepEqual(
+    getDuetCommandExamples(savedMotions).find(({ key }) => key === 'saved_motion_class_wave_1234abcd'),
+    {
+      key: 'saved_motion_class_wave_1234abcd',
+      label: 'Saved motion: Class wave',
+      code: 'duet.saved_motion("class_wave_1234abcd")',
+    },
+  );
+  assert.throws(() => parseDuetProgram('duet.saved_motion("__import__")'), /ID.*invalid/);
 });
 
 test('DUET preset commands have one bounded duration and parse as DUET-only syntax', () => {
@@ -415,7 +440,7 @@ test('DUET parser bounds loop depth and expanded command count', () => {
 
 test('DUET prompt compiler preserves supported duration and accepts safe bounded arm gestures', () => {
   const supported = compileDuetMotionPrompt('walk forward for 2 seconds');
-  assert.equal(supported.code, 'duet.move(0.15, 0, 0, 2)');
+  assert.equal(supported.code, 'duet.forward(2)');
   assert.deepEqual(supported.unknown, []);
 
   const waveResult = compileDuetMotionPrompt('wave left for 1 second');
@@ -426,15 +451,28 @@ test('DUET prompt compiler preserves supported duration and accepts safe bounded
   assert.equal(raiseResult.code, 'duet.raise_both_arms("high", 2)');
   assert.deepEqual(raiseResult.unknown, []);
 
+  const clapResult = compileDuetMotionPrompt('clap for 2 seconds');
+  assert.equal(clapResult.code, 'duet.gesture_clap(2)');
+  assert.deepEqual(clapResult.unknown, []);
+
+  const highFiveResult = compileDuetMotionPrompt('give a right high five for 2 seconds');
+  assert.equal(highFiveResult.code, 'duet.gesture_high_five_right(2)');
+  assert.deepEqual(highFiveResult.unknown, []);
+
   for (const prompt of [
     'walk forward 3 steps',
     'turn left 90 degrees',
     'walk forward for 10 seconds',
     'wave left for 2 minutes',
+    'high five for 0.5 seconds',
     'raise both arms to 45 degrees',
   ]) {
     const result = compileDuetMotionPrompt(prompt);
-    if (prompt === 'wave left for 2 minutes' || prompt === 'raise both arms to 45 degrees') {
+    if (
+      prompt === 'wave left for 2 minutes'
+      || prompt === 'high five for 0.5 seconds'
+      || prompt === 'raise both arms to 45 degrees'
+    ) {
       assert.ok(result.code === '' || result.unknown.length > 0, prompt);
       continue;
     }

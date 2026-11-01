@@ -49,6 +49,27 @@ When the robot is ready:
 - watch the simulation first if needed
 - run the student code only when safe
 
+## DUET v2 supervised commissioning
+
+DUET v2 commissioning is a separate teacher-only workflow and never uses the legacy SDK executor. Do not run it unless a qualified operator has prepared the exact G1 EDU 23-DOF robot, the deployed policy, a clear work area, and a reachable emergency stop. Hardware acceptance has not been performed by this workspace.
+
+On the robot host, build and start the modified DUET controller in its required Velocity state. For the backend commissioning controls, set `DUET_PHYSICAL_ENABLED=true`, `DUET_COMMISSIONING_ENABLED=true`, the matching private `DUET_CONTROL_DIR`, the exact policy hash in `DUET_EXPECTED_POLICY_ID`, and the configured robot label in `DUET_ROBOT_ID`. The controller requires `DUET_GATEWAY_ENABLED=true`. Do not set `DUET_HARDWARE_ACCEPTANCE_ID` as part of commissioning.
+
+In the DUET V2 connection panel, use **Start full test sequence**. Review the expected result before each bounded step, including the `duet.stop()` program command and the separate direct controller STOP/reset test. You may use **Run again** while a result is awaiting review; this creates another logged attempt without discarding the prior attempt. Record what actually occurred, then select **Next** only when the physical result and measured feedback are acceptable. Fail or abort immediately on unexpected behavior. At the end, use **Copy evidence** to preserve the full report and append-only event log.
+
+A passed software commissioning report is not supervised hardware acceptance and does not unlock normal DUET runs. Only after a qualified operator separately records acceptance on the exact G1 and deployed policy may `DUET_HARDWARE_ACCEPTANCE_ID` be configured to the report ID. Keep physical motion disabled if any acceptance item is outstanding. A STOP acknowledgement does not prove physical immobility; stop the DUET controller process before using the legacy SDK.
+
+## DUET prompt and vision motion
+
+When DUET v2 is selected, **Prompt to Motion** and **Vision to Motion** both offer two modes:
+
+- **DUET library** compiles prompts or observed poses into approved DUET commands and presets only. Unsupported requests are reported instead of being translated into arbitrary joint targets.
+- **Follow and save** creates a bounded command series. Vision currently maps visible arm poses and waves to approved arm commands; it does not infer base movement or reproduce human joint angles. Vision retargeting is approximate.
+
+Vision processing runs in the browser. The MediaPipe Tasks Vision runtime is licensed under Apache-2.0 and is fetched from jsDelivr; the Pose Landmarker Lite model is fetched from Google's MediaPipe model storage. The browser needs network access to those asset hosts. Camera and uploaded-video frames are not sent to Uni-EDU-Studio or saved by this feature.
+
+Review the generated program before running it. Teacher-submitted classroom requests use the regular review queue; only a successfully completed DUET run enables the option to confirm physical review and save a reusable teacher-owned command. The backend validates saved command code, and saved commands appear as a single `duet.saved_motion(...)` call in Blockly and the IDE. Saving does not bypass teacher authorization, controller readiness, hardware acceptance, or the DUET gateway.
+
 ## 7. Keep the robot safe
 Use these classroom rules:
 - only one robot run at a time

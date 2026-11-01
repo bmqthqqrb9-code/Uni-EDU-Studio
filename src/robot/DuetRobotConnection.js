@@ -20,6 +20,17 @@ export class DuetRobotConnection {
     return this.request('/api/duet/status', { cache: 'no-store' });
   }
 
+  async motions() {
+    return this.request('/api/duet/motions', { cache: 'no-store' });
+  }
+
+  async saveMotion(name, code) {
+    return this.request('/api/duet/motions', {
+      method: 'POST',
+      body: JSON.stringify({ name, code }),
+    });
+  }
+
   async run(code) {
     if (!parseDuetProgram(code).length) {
       throw new Error('DUET program contains no commands.');
@@ -38,6 +49,10 @@ export class DuetRobotConnection {
     return this.request('/api/duet/commissioning', { cache: 'no-store' });
   }
 
+  async commissioningEvidence() {
+    return this.request('/api/duet/commissioning/evidence', { cache: 'no-store' });
+  }
+
   async startCommissioning() {
     return this.request('/api/duet/commissioning/start', { method: 'POST' });
   }
@@ -49,13 +64,14 @@ export class DuetRobotConnection {
     });
   }
 
-  async reviewCommissioningStep(stepIndex, { passed, observed, notes = '' }) {
+  async reviewCommissioningStep(stepIndex, { passed, observed, observedResult, notes = '' }) {
     return this.request('/api/duet/commissioning/review', {
       method: 'POST',
       body: JSON.stringify({
         step_index: stepIndex,
         passed,
         observed,
+        observed_result: observedResult,
         notes,
       }),
     });

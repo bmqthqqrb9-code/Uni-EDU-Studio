@@ -1,7 +1,11 @@
 import { useEffect, useRef, useState } from 'react';
 import * as THREE from 'three';
 import { STLLoader } from 'three/examples/jsm/loaders/STLLoader.js';
-import { ChevronDown, ChevronUp, Pause, Play, RotateCcw } from 'lucide-react';
+import {
+  ArrowDown, ArrowLeft, ArrowRight, ArrowUp, ChevronDown, ChevronLeft,
+  ChevronRight, ChevronUp, Grip, Minus, Pause, Play,
+  Plus, RotateCcw,
+} from 'lucide-react';
 import { buildG1SimulationFrames, G1_EDU_23_ENV } from '../sim/g1Edu23Env';
 import { simulateDuetG1Edu23Program } from '../sim/duetG1Edu23Env';
 import { getSceneObjectScale } from '../sim/sceneObjects';
@@ -118,6 +122,44 @@ function disposeObstacleMeshes(group) {
     if (Array.isArray(object.material)) object.material.forEach((entry) => entry.dispose());
     else object.material?.dispose();
   });
+}
+
+function moveCameraTarget(view, horizontal, forward) {
+  const right = new THREE.Vector3(Math.cos(view.yaw), 0, -Math.sin(view.yaw));
+  const forwardDirection = new THREE.Vector3(Math.sin(view.yaw), 0, Math.cos(view.yaw));
+  view.focusOffset.addScaledVector(right, horizontal);
+  view.focusOffset.addScaledVector(forwardDirection, forward);
+  view.target.addScaledVector(right, horizontal);
+  view.target.addScaledVector(forwardDirection, forward);
+}
+
+function updateCameraPosition(camera, view) {
+  if (!camera) return;
+  camera.position.set(
+    view.target.x + Math.sin(view.yaw) * Math.cos(view.pitch) * view.distance,
+    view.target.y + Math.sin(view.pitch) * view.distance,
+    view.target.z + Math.cos(view.yaw) * Math.cos(view.pitch) * view.distance,
+  );
+  camera.lookAt(view.target);
+}
+
+function getCameraPanKey(key) {
+  switch (key.toLowerCase()) {
+    case 'arrowleft':
+    case 'a':
+      return [-1, 0];
+    case 'arrowright':
+    case 'd':
+      return [1, 0];
+    case 'arrowup':
+    case 'w':
+      return [0, 1];
+    case 'arrowdown':
+    case 's':
+      return [0, -1];
+    default:
+      return null;
+  }
 }
 
 function addSegment(parent, start, end, width, color) {
@@ -539,6 +581,96 @@ export default function G1Simulation3D({ code, simulatorState, controllerVersion
   const playbackToggleCallbackRef = useRef(onPlaybackToggle);
   const [isPlaybackBarOpen, setIsPlaybackBarOpen] = useState(true);
   const [renderError, setRenderError] = useState('');
+  const [cameraPadPosition, setCameraPadPosition] = useState(null);
+  const cameraPadPositionRef = useRef(cameraPadPosition);
+  const [isCameraPadCollapsed, setIsCameraPadCollapsed] = useState(false);
+  const cameraPadDragRef = useRef(null);
+  const cameraPadRef = useRef(null);
+
+  useEffect(() => {
+    cameraPadPositionRef.current = cameraPadPosition;
+  }, [cameraPadPosition]);
+
+  const beginCameraPadDrag = (event) => {
+    if (event.button !== 0) return;
+    event.preventDefault();
+    const bounds = cameraPadRef.current?.getBoundingClientRect();
+    if (!bounds) return;
+    cameraPadDragRef.current = {
+      pointerId: event.pointerId,
+      offsetX: event.clientX - bounds.left,
+      offsetY: event.clientY - bounds.top,
+    };
+    event.currentTarget.setPointerCapture?.(event.pointerId);
+  };
+
+  const moveCameraPad = (event) => {
+    const drag = cameraPadDragRef.current;
+    if (!drag || drag.pointerId !== event.pointerId) return;
+    const bounds = cameraPadRef.current?.getBoundingClientRect();
+    const mountBounds = mountRef.current?.getBoundingClientRect();
+    if (!bounds || !mountBounds) return;
+    setCameraPadPosition({
+      left: THREE.MathUtils.clamp(
+        event.clientX - drag.offsetX - mountBounds.left,
+        8,
+        Math.max(8, mountBounds.width - bounds.width - 8),
+      ),
+      top: THREE.MathUtils.clamp(
+        event.clientY - drag.offsetY - mountBounds.top,
+        8,
+        Math.max(8, mountBounds.height - bounds.height - 8),
+      ),
+    });
+  };
+
+  useEffect(() => {
+    const mount = mountRef.current;
+    if (!mount) return undefined;
+    const keepCameraPadInView = () => {
+      const padBounds = cameraPadRef.current?.getBoundingClientRect();
+      if (!padBounds || !cameraPadPositionRef.current) return;
+      setCameraPadPosition((position) => {
+        if (!position) return position;
+        return {
+          left: THREE.MathUtils.clamp(position.left, 8, Math.max(8, mount.clientWidth - padBounds.width - 8)),
+          top: THREE.MathUtils.clamp(position.top, 8, Math.max(8, mount.clientHeight - padBounds.height - 8)),
+        };
+      });
+    };
+    const observer = new ResizeObserver(keepCameraPadInView);
+    observer.observe(mount);
+    return () => observer.disconnect();
+  }, []);
+
+  const endCameraPadDrag = (event) => {
+    if (cameraPadDragRef.current?.pointerId === event.pointerId) {
+      cameraPadDragRef.current = null;
+    }
+  };
+
+  const panView = (horizontal, forward) => {
+    const view = viewRef.current;
+    const step = view.distance * 0.12;
+    moveCameraTarget(view, horizontal * step, forward * step);
+    updateCameraPosition(cameraRef.current, view);
+  };
+
+  const zoomView = (factor) => {
+    const view = viewRef.current;
+    view.distance = THREE.MathUtils.clamp(view.distance * factor, 2.5, 30);
+    updateCameraPosition(cameraRef.current, view);
+  };
+
+  const resetView = () => {
+    const view = viewRef.current;
+    view.yaw = 0.55;
+    view.pitch = 0.62;
+    view.distance = 7;
+    view.focusOffset.set(0, 0, 0);
+    view.target.set(0, 1.05, 0);
+    updateCameraPosition(cameraRef.current, view);
+  };
 
   useEffect(() => {
     isPlayingRef.current = isPlaying;
@@ -642,6 +774,11 @@ export default function G1Simulation3D({ code, simulatorState, controllerVersion
     renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
     renderer.domElement.style.touchAction = 'none';
     renderer.domElement.style.cursor = waypointPlacementEnabledRef.current ? 'crosshair' : '';
+    renderer.domElement.tabIndex = 0;
+    renderer.domElement.setAttribute(
+      'aria-label',
+      '3D simulation. Use arrow keys or W A S D to pan, Q and E to rotate, plus and minus to zoom.',
+    );
     renderer.shadowMap.enabled = true;
     renderer.shadowMap.type = THREE.PCFSoftShadowMap;
     mount.appendChild(renderer.domElement);
@@ -738,19 +875,14 @@ export default function G1Simulation3D({ code, simulatorState, controllerVersion
     observer.observe(mount);
 
     const updateCamera = () => {
-      const view = viewRef.current;
-      camera.position.set(
-        view.target.x + Math.sin(view.yaw) * Math.cos(view.pitch) * view.distance,
-        view.target.y + Math.sin(view.pitch) * view.distance,
-        view.target.z + Math.cos(view.yaw) * Math.cos(view.pitch) * view.distance,
-      );
-      camera.lookAt(view.target);
+      updateCameraPosition(camera, viewRef.current);
     };
     updateCamera();
 
     const raycaster = new THREE.Raycaster();
     const pointer = new THREE.Vector2();
     const groundPlane = new THREE.Plane(new THREE.Vector3(0, 1, 0), 0);
+    let lastPointerClick = null;
     const readPointer = (event) => {
       const rect = renderer.domElement.getBoundingClientRect();
       pointer.x = ((event.clientX - rect.left) / rect.width) * 2 - 1;
@@ -763,10 +895,18 @@ export default function G1Simulation3D({ code, simulatorState, controllerVersion
         if (object.material?.emissive) object.material.emissive.set(isDragging ? 0x22d3ee : 0x000000);
       });
     };
-
     const onPointerDown = (event) => {
       readPointer(event);
-      if (waypointPlacementEnabledRef.current) {
+      const now = performance.now();
+      const isDoubleClickDrag = event.pointerType === 'mouse'
+        && event.button === 0
+        && lastPointerClick
+        && now - lastPointerClick.time < 350
+        && Math.hypot(event.clientX - lastPointerClick.x, event.clientY - lastPointerClick.y) < 24;
+      if (isDoubleClickDrag) lastPointerClick = null;
+      const mousePan = event.pointerType === 'mouse'
+        && (event.button === 1 || event.button === 2 || event.shiftKey || isDoubleClickDrag);
+      if (waypointPlacementEnabledRef.current && !mousePan) {
         const worldPosition = raycaster.ray.intersectPlane(groundPlane, new THREE.Vector3());
         const halfGrid = gridSize / 2;
         if (
@@ -782,7 +922,7 @@ export default function G1Simulation3D({ code, simulatorState, controllerVersion
         event.preventDefault();
         return;
       }
-      const waypointHit = raycaster.intersectObjects(waypointGroup.children, true)
+      const waypointHit = mousePan ? null : raycaster.intersectObjects(waypointGroup.children, true)
         .find((hit) => hit.object.userData.waypointId !== undefined);
       if (waypointHit) {
         const waypointId = waypointHit.object.userData.waypointId;
@@ -793,7 +933,7 @@ export default function G1Simulation3D({ code, simulatorState, controllerVersion
         event.preventDefault();
         return;
       }
-      const obstacleHit = raycaster.intersectObjects(obstacleGroup.children, true)
+      const obstacleHit = mousePan ? null : raycaster.intersectObjects(obstacleGroup.children, true)
         .find((hit) => hit.object.userData.obstacleId !== undefined);
       if (obstacleHit) {
         const obstacleId = obstacleHit.object.userData.obstacleId;
@@ -805,8 +945,14 @@ export default function G1Simulation3D({ code, simulatorState, controllerVersion
         return;
       }
       const view = viewRef.current;
-      view.pointers.set(event.pointerId, { x: event.clientX, y: event.clientY });
+      view.pointers.set(event.pointerId, {
+        x: event.clientX,
+        y: event.clientY,
+        mode: mousePan ? 'pan' : 'rotate',
+        moved: false,
+      });
       renderer.domElement.setPointerCapture?.(event.pointerId);
+      if (mousePan) event.preventDefault();
       if (view.pointers.size === 2) {
         const points = [...view.pointers.values()];
         view.pinchDistance = Math.hypot(points[1].x - points[0].x, points[1].y - points[0].y);
@@ -839,7 +985,12 @@ export default function G1Simulation3D({ code, simulatorState, controllerVersion
       const view = viewRef.current;
       if (!view.pointers.has(event.pointerId)) return;
       const previous = view.pointers.get(event.pointerId);
-      view.pointers.set(event.pointerId, { x: event.clientX, y: event.clientY });
+      view.pointers.set(event.pointerId, {
+        ...previous,
+        x: event.clientX,
+        y: event.clientY,
+        moved: previous.moved || Math.hypot(event.clientX - previous.x, event.clientY - previous.y) > 3,
+      });
 
       if (view.pointers.size >= 2) {
         const points = [...view.pointers.values()];
@@ -867,8 +1018,13 @@ export default function G1Simulation3D({ code, simulatorState, controllerVersion
       } else {
         const deltaX = event.clientX - previous.x;
         const deltaY = event.clientY - previous.y;
-        view.yaw -= deltaX * 0.008;
-        view.pitch = Math.max(0.2, Math.min(1.35, view.pitch - deltaY * 0.006));
+        if (previous.mode === 'pan') {
+          const panScale = view.distance / (renderer.domElement.clientHeight || 1) * 0.9;
+          moveCameraTarget(view, -deltaX * panScale, deltaY * panScale);
+        } else {
+          view.yaw -= deltaX * 0.008;
+          view.pitch = Math.max(0.2, Math.min(1.35, view.pitch - deltaY * 0.006));
+        }
       }
       updateCamera();
     };
@@ -885,23 +1041,53 @@ export default function G1Simulation3D({ code, simulatorState, controllerVersion
         return;
       }
       const view = viewRef.current;
+      const pointerState = view.pointers.get(event.pointerId);
       view.pointers.delete(event.pointerId);
+      if (event.pointerType === 'mouse' && event.button === 0 && pointerState && !pointerState.moved) {
+        lastPointerClick = { time: performance.now(), x: event.clientX, y: event.clientY };
+      }
       if (view.pointers.size < 2) {
         view.pinchDistance = 0;
         view.pinchMidpoint = null;
       }
     };
     const onWheel = (event) => {
+      event.preventDefault();
       const zoomFactor = Math.exp(event.deltaY * 0.0012);
       viewRef.current.distance = Math.max(2.5, Math.min(30, viewRef.current.distance * zoomFactor));
       updateCamera();
     };
+    const onKeyDown = (event) => {
+      const pan = getCameraPanKey(event.key);
+      const view = viewRef.current;
+      if (pan) {
+        event.preventDefault();
+        const step = view.distance * 0.12;
+        moveCameraTarget(view, pan[0] * step, pan[1] * step);
+        updateCamera();
+        return;
+      }
+      if (event.key.toLowerCase() === 'q' || event.key.toLowerCase() === 'e') {
+        event.preventDefault();
+        view.yaw += event.key.toLowerCase() === 'q' ? -0.12 : 0.12;
+        updateCamera();
+        return;
+      }
+      if (event.key === '+' || event.key === '=' || event.key === '-') {
+        event.preventDefault();
+        view.distance = THREE.MathUtils.clamp(view.distance * (event.key === '-' ? 1.12 : 0.89), 2.5, 30);
+        updateCamera();
+      }
+    };
+    const onContextMenu = (event) => event.preventDefault();
     renderer.domElement.addEventListener('pointerdown', onPointerDown);
     renderer.domElement.addEventListener('pointermove', onPointerMove);
     renderer.domElement.addEventListener('pointerup', onPointerUp);
     renderer.domElement.addEventListener('pointercancel', onPointerUp);
     renderer.domElement.addEventListener('pointerleave', onPointerUp);
-    renderer.domElement.addEventListener('wheel', onWheel, { passive: true });
+    renderer.domElement.addEventListener('wheel', onWheel, { passive: false });
+    renderer.domElement.addEventListener('keydown', onKeyDown);
+    renderer.domElement.addEventListener('contextmenu', onContextMenu);
 
     const clock = new THREE.Clock();
     const onWebGLContextLost = (event) => {
@@ -985,6 +1171,8 @@ export default function G1Simulation3D({ code, simulatorState, controllerVersion
       renderer.domElement.removeEventListener('pointercancel', onPointerUp);
       renderer.domElement.removeEventListener('pointerleave', onPointerUp);
       renderer.domElement.removeEventListener('wheel', onWheel);
+      renderer.domElement.removeEventListener('keydown', onKeyDown);
+      renderer.domElement.removeEventListener('contextmenu', onContextMenu);
       renderer.domElement.removeEventListener('webglcontextlost', onWebGLContextLost);
       renderer.dispose();
       mount.removeChild(renderer.domElement);
@@ -996,7 +1184,7 @@ export default function G1Simulation3D({ code, simulatorState, controllerVersion
       plannerLineRef.current = null;
       obstacleGroupRef.current = null;
     };
-  }, [gridSize]);
+  }, [gridSize, obstacles]);
 
   useEffect(() => {
     syncWaypointMarkers(waypointGroupRef.current, plannerLineRef.current, waypoints);
@@ -1012,10 +1200,90 @@ export default function G1Simulation3D({ code, simulatorState, controllerVersion
           </div>
         </div>
       )}
-      <div className="pointer-events-none absolute left-4 top-4 rounded-lg border border-cyan-300/20 bg-slate-950/55 px-3 py-2 text-[10px] uppercase tracking-[0.16em] text-cyan-100 backdrop-blur-sm">
-        Live G1 23-DoF simulation
+      <div className="pointer-events-none absolute left-3 top-3 max-w-[calc(100%-5.5rem)] rounded-lg border border-cyan-300/20 bg-slate-950/65 px-3 py-2 text-cyan-100 backdrop-blur-sm sm:left-4 sm:top-4">
+        <p className="text-[10px] uppercase tracking-[0.16em]">Live G1 23-DoF simulation</p>
       </div>
-      <div className={`absolute bottom-4 left-4 right-4 z-30 transition-transform ${isPlaybackBarOpen ? '' : 'translate-y-[calc(100%-2.5rem)]'}`}>
+      <div
+        ref={cameraPadRef}
+        role={isCameraPadCollapsed ? undefined : 'group'}
+        aria-label={isCameraPadCollapsed ? undefined : '3D camera navigation'}
+        className={`absolute z-20 max-h-[calc(100dvh-16px)] overflow-y-auto overscroll-contain rounded-xl border border-white/10 bg-slate-950/80 shadow-xl backdrop-blur-md ${isCameraPadCollapsed ? 'p-1' : 'p-2'}`}
+        style={cameraPadPosition
+          ? { left: cameraPadPosition.left, top: cameraPadPosition.top }
+          : { left: 12, top: '50%', transform: 'translateY(-50%)' }}
+        onPointerMove={moveCameraPad}
+        onPointerUp={endCameraPadDrag}
+        onPointerCancel={endCameraPadDrag}
+      >
+        {isCameraPadCollapsed ? (
+          <button
+            type="button"
+            aria-label="Show camera controls"
+            title="Show camera controls"
+            onClick={() => setIsCameraPadCollapsed(false)}
+            className="flex h-9 w-9 items-center justify-center rounded-md bg-cyan-700 text-white hover:bg-cyan-600"
+          >
+            <ChevronRight size={18} />
+          </button>
+        ) : (
+          <>
+            <div className="mb-1 flex items-center justify-between gap-2">
+              <button
+                type="button"
+                aria-label="Move camera controls"
+                title="Drag to move camera controls"
+                onPointerDown={beginCameraPadDrag}
+                className="flex min-h-8 flex-1 touch-none items-center gap-1 rounded-md px-1 text-[9px] font-semibold uppercase tracking-wide text-slate-300 hover:bg-white/10"
+              >
+                <Grip size={14} />
+                Camera
+              </button>
+              <button
+                type="button"
+                aria-label="Hide camera controls"
+                title="Hide camera controls"
+                onClick={() => setIsCameraPadCollapsed(true)}
+                className="flex h-8 w-8 items-center justify-center rounded-md bg-slate-800 text-slate-200 hover:bg-cyan-800"
+              >
+                <ChevronLeft size={16} />
+              </button>
+            </div>
+            <div className="grid grid-cols-3 gap-1">
+          <span />
+          <button type="button" aria-label="Pan view up" title="Pan view up" onClick={() => panView(0, 1)} className="flex h-10 w-10 items-center justify-center rounded-md bg-slate-800 text-slate-100 hover:bg-cyan-800 active:bg-cyan-700">
+            <ArrowUp size={17} />
+          </button>
+          <span />
+          <button type="button" aria-label="Pan view left" title="Pan view left" onClick={() => panView(-1, 0)} className="flex h-10 w-10 items-center justify-center rounded-md bg-slate-800 text-slate-100 hover:bg-cyan-800 active:bg-cyan-700">
+            <ArrowLeft size={17} />
+          </button>
+          <button type="button" aria-label="Pan view down" title="Pan view down" onClick={() => panView(0, -1)} className="flex h-10 w-10 items-center justify-center rounded-md bg-slate-800 text-slate-100 hover:bg-cyan-800 active:bg-cyan-700">
+            <ArrowDown size={17} />
+          </button>
+          <button type="button" aria-label="Pan view right" title="Pan view right" onClick={() => panView(1, 0)} className="flex h-10 w-10 items-center justify-center rounded-md bg-slate-800 text-slate-100 hover:bg-cyan-800 active:bg-cyan-700">
+            <ArrowRight size={17} />
+          </button>
+        </div>
+        <div className="mt-1 flex justify-center gap-1">
+          <button type="button" aria-label="Zoom out" title="Zoom out" onClick={() => zoomView(1.12)} className="flex h-10 w-10 items-center justify-center rounded-md bg-slate-800 text-slate-100 hover:bg-cyan-800 active:bg-cyan-700">
+            <Minus size={17} />
+          </button>
+          <button type="button" aria-label="Zoom in" title="Zoom in" onClick={() => zoomView(0.89)} className="flex h-10 w-10 items-center justify-center rounded-md bg-slate-800 text-slate-100 hover:bg-cyan-800 active:bg-cyan-700">
+            <Plus size={17} />
+          </button>
+          <button type="button" aria-label="Reset camera view" title="Reset camera view" onClick={resetView} className="flex h-10 w-10 items-center justify-center rounded-md bg-slate-800 text-slate-100 hover:bg-cyan-800 active:bg-cyan-700">
+            <RotateCcw size={16} />
+          </button>
+        </div>
+          </>
+        )}
+      </div>
+      <div
+        role="group"
+        aria-label="Motion playback controls"
+        className={`absolute left-2 right-2 z-30 overflow-y-auto transition-transform sm:left-4 sm:right-4 ${isPlaybackBarOpen ? '' : 'translate-y-[calc(100%-2.5rem)]'}`}
+        style={{ bottom: 'max(8px, env(safe-area-inset-bottom))', maxHeight: 'calc(100% - 16px)' }}
+      >
         <div className="overflow-hidden rounded-xl border border-cyan-200/20 bg-slate-950/80 shadow-2xl backdrop-blur-md">
           <div className="flex items-center gap-2 border-b border-white/10 px-3 py-2">
             <button type="button" onClick={() => setIsPlaybackBarOpen((value) => !value)} className="rounded-md p-1 text-slate-300 hover:bg-white/10" aria-label={isPlaybackBarOpen ? 'Collapse playback controls' : 'Expand playback controls'}>
@@ -1025,7 +1293,7 @@ export default function G1Simulation3D({ code, simulatorState, controllerVersion
             <span className="ml-auto text-[10px] text-slate-400">{Math.round(playbackProgress * 100)}%</span>
           </div>
           {isPlaybackBarOpen && (
-            <div className="space-y-2 px-3 py-2">
+            <div className="space-y-2 overflow-y-auto px-3 py-2" style={{ maxHeight: 'calc(100% - 48px)' }}>
               <div className="flex items-center gap-3">
                 <button type="button" onClick={() => onPlaybackToggle?.(!isPlaying)} className="rounded-md bg-cyan-400 p-2 text-slate-950 hover:bg-cyan-300" aria-label={isPlaying ? 'Pause simulation' : 'Play simulation'}>
                   {isPlaying ? <Pause size={15} fill="currentColor" /> : <Play size={15} fill="currentColor" />}

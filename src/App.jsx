@@ -39,6 +39,7 @@ import {
   validateDuetArmMotion,
 } from './sim/duetArmMotions.js';
 import { simulateDuetG1Edu23Program } from './sim/duetG1Edu23Env.js';
+import { analyzeDuetVideo, captureDuetLiveMotion } from './sim/duetVisionMotion.js';
 import { createRobotConnection } from './robot/RobotConnection';
 import { DuetRobotConnection } from './robot/DuetRobotConnection.js';
 
@@ -846,7 +847,9 @@ export default function App() {
   const fileInputRef = useRef(null);
   const compiledPlannerCodeRef = useRef(null);
   const applyGeneratedCodeRef = useRef(null);
+  const syncBlocksFromGeneratedCodeRef = useRef(null);
   const processedAutonomousOperationRef = useRef(null);
+  const sceneShellRef = useRef(null);
   
   const [lang, setLang] = useState('en');
   const [robotConfig, setRobotConfig] = useState(DEFAULT_ROBOT_CONFIG_EN);
@@ -874,10 +877,73 @@ export default function App() {
   const [toolPanelRect, setToolPanelRect] = useState({ top: 12, right: 16, width: 520, height: 760 });
   const [toolPanelCollapsed, setToolPanelCollapsed] = useState(false);
   const toolPanelInteractionRef = useRef(null);
+  const [lockedSidebarPanels, setLockedSidebarPanels] = useState(() => {
+    try {
+      const savedSession = JSON.parse(localStorage.getItem('edu-classroom-session') || 'null');
+      if (savedSession?.user?.role !== 'teacher') return [];
+      const savedPanels = JSON.parse(localStorage.getItem(`edu-locked-sidebar-panels:${savedSession.user.username}`) || '[]');
+      return Array.isArray(savedPanels)
+        ? savedPanels.filter((id) => ['planner', 'prompt', 'camera'].includes(id))
+        : [];
+    } catch (error) {
+      console.warn('Unable to initialize locked sidebar panels.', error);
+      return [];
+    }
+  });
+  const [lockedSidebarPanelsError, setLockedSidebarPanelsError] = useState('');
+  useEffect(() => {
+    const keepToolPanelInViewport = () => {
+      const sceneBounds = sceneShellRef.current?.getBoundingClientRect();
+      if (!sceneBounds) return;
+      setToolPanelRect((rect) => {
+        const width = Math.min(rect.width, Math.max(48, sceneBounds.width - 16));
+        const height = Math.min(rect.height, Math.max(48, sceneBounds.height - 16));
+        const visibleWidth = toolPanelCollapsed ? 48 : width;
+        const visibleHeight = toolPanelCollapsed ? 48 : height;
+        const nextRect = {
+          ...rect,
+          width,
+          height,
+          right: Math.min(Math.max(8, rect.right), Math.max(8, sceneBounds.width - visibleWidth - 8)),
+          top: Math.min(Math.max(8, rect.top), Math.max(8, sceneBounds.height - visibleHeight - 8)),
+        };
+        return nextRect.width === rect.width
+          && nextRect.height === rect.height
+          && nextRect.right === rect.right
+          && nextRect.top === rect.top
+          ? rect
+          : nextRect;
+      });
+    };
+
+    const sceneShell = sceneShellRef.current;
+    if (!sceneShell) return undefined;
+    const observer = new ResizeObserver(keepToolPanelInViewport);
+    observer.observe(sceneShell);
+    window.addEventListener('resize', keepToolPanelInViewport);
+    keepToolPanelInViewport();
+    return () => {
+      observer.disconnect();
+      window.removeEventListener('resize', keepToolPanelInViewport);
+    };
+  }, [toolPanelCollapsed]);
   const [isSimulatorOpen, setIsSimulatorOpen] = useState(false);
   const [motionPrompt, setMotionPrompt] = useState('Walk forward 3 steps, turn left 90 degrees, then wave');
   const [motionPromptResult, setMotionPromptResult] = useState(null);
   const [motionPromptStatus, setMotionPromptStatus] = useState('local');
+  const [duetMotionMode, setDuetMotionMode] = useState('library');
+  const [savedDuetMotions, setSavedDuetMotions] = useState([]);
+  const [duetMotionSaveName, setDuetMotionSaveName] = useState('');
+  const [duetMotionSaveError, setDuetMotionSaveError] = useState('');
+  const [duetMotionSaveBusy, setDuetMotionSaveBusy] = useState(false);
+  const [duetMotionReviewConfirmed, setDuetMotionReviewConfirmed] = useState(false);
+  const [lastSuccessfulDuetCode, setLastSuccessfulDuetCode] = useState('');
+  const [visionMotionStatus, setVisionMotionStatus] = useState('');
+  const [visionMotionPrompt, setVisionMotionPrompt] = useState('');
+  const [isVisionMotionAnalyzing, setIsVisionMotionAnalyzing] = useState(false);
+  const [visionMotionProgress, setVisionMotionProgress] = useState(0);
+  const [motionVideoUrl, setMotionVideoUrl] = useState('');
+  const motionVideoRef = useRef(null);
   const [simulatorMode, setSimulatorMode] = useState('kid-preview');
   const [simulatorSidebarTab, setSimulatorSidebarTab] = useState('add-object');
   const [sceneObjects, setSceneObjects] = useState([]);
@@ -981,7 +1047,11 @@ export default function App() {
   const [isDuetCommissioningBusy, setIsDuetCommissioningBusy] = useState(false);
   const [isDuetCommissioningAborting, setIsDuetCommissioningAborting] = useState(false);
   const [duetCommissioningObserved, setDuetCommissioningObserved] = useState(false);
+  const [duetCommissioningObservedResult, setDuetCommissioningObservedResult] = useState('');
   const [duetCommissioningNotes, setDuetCommissioningNotes] = useState('');
+  const [duetCommissioningEvidence, setDuetCommissioningEvidence] = useState(null);
+  const [duetCommissioningCopyStatus, setDuetCommissioningCopyStatus] = useState('');
+  const duetCommissioningEvidenceRef = useRef(null);
   const [isLidarTesting, setIsLidarTesting] = useState(false);
   const [sensorDiagnostics, setSensorDiagnostics] = useState(null);
   const [isSensorDiscovering, setIsSensorDiscovering] = useState(false);
@@ -1017,6 +1087,25 @@ export default function App() {
   }, [controllerVersion, duetArmMotionsKey]);
 
   useEffect(() => {
+    if (!motionVideoUrl) return undefined;
+    return () => URL.revokeObjectURL(motionVideoUrl);
+  }, [motionVideoUrl]);
+
+  useEffect(() => {
+    if (
+      controllerVersion === 'duet'
+      && motionPrompt === 'Walk forward 3 steps, turn left 90 degrees, then wave'
+    ) {
+      setMotionPrompt('Move forward for 1 second, then wave left for 1 second');
+    } else if (
+      controllerVersion === 'legacy'
+      && motionPrompt === 'Move forward for 1 second, then wave left for 1 second'
+    ) {
+      setMotionPrompt('Walk forward 3 steps, turn left 90 degrees, then wave');
+    }
+  }, [controllerVersion, motionPrompt]);
+
+  useEffect(() => {
     generatedCodeRef.current = generatedCode;
     codeByVersionRef.current[controllerVersion] = generatedCode;
   }, [generatedCode, controllerVersion]);
@@ -1027,6 +1116,47 @@ export default function App() {
     { id: 'prompt', label: 'Prompt to Motion' },
     { id: 'camera', label: 'Vision to Motion' },
   ];
+  const configurableSidebarPanels = overlayTabs.filter(({ id }) => (
+    ['planner', 'prompt', 'camera'].includes(id)
+  ));
+  const unlockedOverlayTabs = overlayTabs.filter(({ id }) => !lockedSidebarPanels.includes(id));
+  const sidebarPanelIsLocked = (id) => lockedSidebarPanels.includes(id);
+
+  useEffect(() => {
+    if (currentUser.role !== 'teacher') {
+      setLockedSidebarPanels([]);
+      return;
+    }
+    try {
+      const savedPanels = JSON.parse(localStorage.getItem(`edu-locked-sidebar-panels:${currentUser.username}`) || '[]');
+      const validPanelIds = ['planner', 'prompt', 'camera'];
+      const nextPanels = Array.isArray(savedPanels)
+        ? savedPanels.filter((id) => validPanelIds.includes(id))
+        : [];
+      setLockedSidebarPanels(nextPanels);
+      setMainTab((tab) => nextPanels.includes(tab) ? 'blocks' : tab);
+      setLockedSidebarPanelsError('');
+    } catch (error) {
+      console.warn('Unable to load locked sidebar panels.', error);
+      setLockedSidebarPanels([]);
+      setLockedSidebarPanelsError('Saved sidebar panel settings could not be loaded.');
+    }
+  }, [currentUser.role, currentUser.username]);
+
+  const handleSidebarPanelLockChange = (panelId, isLocked) => {
+    const nextPanels = isLocked
+      ? [...new Set([...lockedSidebarPanels, panelId])]
+      : lockedSidebarPanels.filter((id) => id !== panelId);
+    try {
+      localStorage.setItem(`edu-locked-sidebar-panels:${currentUser.username}`, JSON.stringify(nextPanels));
+      setLockedSidebarPanels(nextPanels);
+      setLockedSidebarPanelsError('');
+      if (isLocked && mainTab === panelId) setMainTab('blocks');
+    } catch (error) {
+      console.error('Unable to save locked sidebar panels.', error);
+      setLockedSidebarPanelsError('Sidebar panel settings could not be saved.');
+    }
+  };
 
   const apiFetch = useCallback(async (url, options = {}) => {
     const headers = {
@@ -1059,6 +1189,24 @@ export default function App() {
 
   useEffect(() => {
     if (controllerVersion !== 'duet' || session?.user?.role !== 'teacher') {
+      setSavedDuetMotions([]);
+      return undefined;
+    }
+    let active = true;
+    apiFetch('/api/duet/motions', { cache: 'no-store' })
+      .then(({ motions }) => {
+        if (active) setSavedDuetMotions(Array.isArray(motions) ? motions : []);
+      })
+      .catch((error) => {
+        if (active) setDuetMotionSaveError(`Could not load saved DUET commands: ${error.message}`);
+      });
+    return () => {
+      active = false;
+    };
+  }, [apiFetch, controllerVersion, session?.user?.role]);
+
+  useEffect(() => {
+    if (controllerVersion !== 'duet' || session?.user?.role !== 'teacher') {
       setDuetCommissioning(null);
       return undefined;
     }
@@ -1074,6 +1222,38 @@ export default function App() {
       active = false;
     };
   }, [controllerVersion, session?.user?.role, duetRobotConnection]);
+
+  useEffect(() => {
+    if (
+      controllerVersion !== 'duet'
+      || session?.user?.role !== 'teacher'
+      || !['passed', 'failed', 'aborted'].includes(duetCommissioning?.status)
+    ) {
+      setDuetCommissioningEvidence(null);
+      setDuetCommissioningCopyStatus('');
+      return undefined;
+    }
+    let active = true;
+    duetRobotConnection.commissioningEvidence()
+      .then((evidence) => {
+        if (active) setDuetCommissioningEvidence(evidence);
+      })
+      .catch((error) => {
+        if (active) {
+          setDuetCommissioningCopyStatus(`Full evidence could not be loaded: ${error.message}`);
+        }
+      });
+    return () => {
+      active = false;
+    };
+  }, [
+    controllerVersion,
+    session?.user?.role,
+    duetCommissioning?.report_id,
+    duetCommissioning?.updated_at,
+    duetCommissioning?.status,
+    duetRobotConnection,
+  ]);
 
   const refreshClassroomData = useCallback(async () => {
     if (!session?.token) return;
@@ -1639,6 +1819,10 @@ export default function App() {
       return;
     }
     setIsQueueReviewRunning(true);
+    if (queueReviewItem.controller_version === 'duet') {
+      setLastSuccessfulDuetCode('');
+      setDuetMotionReviewConfirmed(false);
+    }
     setQueueReviewError('');
     setQueueReviewStatus('Teacher approved • starting the queued request…');
     try {
@@ -1646,6 +1830,16 @@ export default function App() {
         method: 'POST',
         body: JSON.stringify({ item_id: queueReviewItem.id }),
       });
+      if (
+        queueReviewItem.controller_version === 'duet'
+        && result.status === 'completed'
+        && typeof queueReviewItem.code === 'string'
+        && queueReviewItem.code.trim()
+        && !queueReviewItem.code.includes('duet.saved_motion(')
+      ) {
+        setLastSuccessfulDuetCode(queueReviewItem.code);
+        setDuetMotionReviewConfirmed(false);
+      }
       setQueueReviewStatus(result.status === 'completed'
         ? result.process?.saved_project_error
           ? `Request completed, but its project could not be saved • ${result.process.saved_project_error}`
@@ -1876,6 +2070,7 @@ export default function App() {
       const report = await duetRobotConnection.startCommissioning();
       setDuetCommissioning(report);
       setDuetCommissioningObserved(false);
+      setDuetCommissioningObservedResult('');
       setDuetCommissioningNotes('');
       setRobotConnectionStatus(
         `DUET commissioning started • ${report.steps.length} supervised test steps • report ${report.report_id}`,
@@ -1883,16 +2078,16 @@ export default function App() {
     } catch (error) {
       setRobotConnectionStatus(`Could not start DUET commissioning: ${error.message}`);
     } finally {
-      setIsDuetCommissioningAborting(false);
+      setIsDuetCommissioningBusy(false);
     }
   };
 
-  const handleRunDuetCommissioningStep = async () => {
+  const handleRunDuetCommissioningStep = async (retry = false) => {
     const stepIndex = duetCommissioning?.current_step;
     const step = duetCommissioning?.steps?.[stepIndex];
     if (!step || !isRobotConnected || currentUser.role !== 'teacher') return;
     const confirmed = window.confirm(
-      `Run test ${stepIndex + 1} of ${duetCommissioning.steps.length}: ${step.title}\n\n${step.expected}\n\nCommand:\n${step.code || 'Gateway lease/STOP test'}\n\nProceed only while the robot and area are clear and you can reach the emergency stop.`,
+      `${retry ? 'Run this test again' : `Run test ${stepIndex + 1} of ${duetCommissioning.steps.length}`}: ${step.title}\n\n${step.expected}\n\nCommand:\n${step.code || 'Gateway lease/STOP test'}\n\nProceed only while the robot and area are clear and you can reach the emergency stop.`,
     );
     if (!confirmed) return;
     setIsDuetCommissioningBusy(true);
@@ -1901,6 +2096,7 @@ export default function App() {
       const report = await duetRobotConnection.runCommissioningStep(stepIndex);
       setDuetCommissioning(report);
       setDuetCommissioningObserved(false);
+      setDuetCommissioningObservedResult('');
       setDuetCommissioningNotes('');
       setRobotConnectionStatus(`Step ${stepIndex + 1} completed at the controller; physically review the robot and logged joint feedback before continuing.`);
     } catch (error) {
@@ -1923,18 +2119,24 @@ export default function App() {
       setRobotConnectionStatus('Confirm that you physically observed the expected result before passing this step.');
       return;
     }
+    if (!duetCommissioningObservedResult.trim()) {
+      setRobotConnectionStatus('Record what actually occurred before reviewing this test step.');
+      return;
+    }
     setIsDuetCommissioningBusy(true);
     try {
       const report = await duetRobotConnection.reviewCommissioningStep(stepIndex, {
         passed,
         observed: duetCommissioningObserved,
+        observedResult: duetCommissioningObservedResult,
         notes: duetCommissioningNotes,
       });
       setDuetCommissioning(report);
       setDuetCommissioningObserved(false);
+      setDuetCommissioningObservedResult('');
       setDuetCommissioningNotes('');
       setRobotConnectionStatus(report.status === 'passed'
-        ? `DUET commissioning passed and teacher-reviewed • acceptance ${report.acceptance_id}. Normal DUET execution is now unlocked while the physical master switch remains enabled.`
+        ? `DUET commissioning passed and teacher-reviewed • report ${report.acceptance_id}. Normal DUET runs remain locked until a qualified operator records separate hardware acceptance.`
         : passed
           ? `Step passed • ${report.current_step} of ${report.steps.length} reviewed.`
           : `Commissioning failed at step ${stepIndex + 1}; controller STOP/reset was requested. Review the report before restarting.`);
@@ -1948,6 +2150,7 @@ export default function App() {
   const handleAbortDuetCommissioning = async () => {
     if (!window.confirm('Abort DUET commissioning and request controller STOP plus arm reset?')) return;
     setIsDuetCommissioningAborting(true);
+    setIsDuetCommissioningBusy(true);
     try {
       const report = await duetRobotConnection.abortCommissioning();
       setDuetCommissioning(report);
@@ -1956,6 +2159,29 @@ export default function App() {
       setRobotConnectionStatus(`Could not abort DUET commissioning safely: ${error.message}`);
     } finally {
       setIsDuetCommissioningBusy(false);
+      setIsDuetCommissioningAborting(false);
+    }
+  };
+
+  const handleCopyDuetCommissioningEvidence = async () => {
+    if (!duetCommissioningEvidence) return;
+    const text = JSON.stringify({
+      report: duetCommissioningEvidence.report,
+      event_log: duetCommissioningEvidence.event_log,
+    }, null, 2);
+    try {
+      if (navigator.clipboard?.writeText) {
+        await navigator.clipboard.writeText(text);
+      } else if (duetCommissioningEvidenceRef.current) {
+        duetCommissioningEvidenceRef.current.focus();
+        duetCommissioningEvidenceRef.current.select();
+        if (!document.execCommand('copy')) throw new Error('Clipboard access is unavailable.');
+      } else {
+        throw new Error('Clipboard access is unavailable.');
+      }
+      setDuetCommissioningCopyStatus('Full report and event log copied.');
+    } catch (error) {
+      setDuetCommissioningCopyStatus(`Could not copy evidence: ${error.message}. Select the text below and copy it manually.`);
     }
   };
 
@@ -2961,7 +3187,7 @@ export default function App() {
     const cats = UI_TEXT[language].toolbox;
     const isDuetVersion = controllerVersion === 'duet';
     const commandBlocks = isDuetVersion
-      ? getDuetBlocklyCommandBlocks()
+      ? getDuetBlocklyCommandBlocks(savedDuetMotions)
       : getG1BlocklyCommandBlocks(G1_EXECUTABLE_COMMANDS);
     const categories = [...new Set(commandBlocks.map((definition) => definition.category))];
     const commandCategoriesXml = categories.map((category) => {
@@ -3006,7 +3232,7 @@ export default function App() {
       </category>
     </xml>
     `;
-  }, [controllerVersion]);
+  }, [controllerVersion, savedDuetMotions]);
 
   const registerBlocks = useCallback((robotCategories) => {
     if (!Blockly || !pythonGenerator) return;
@@ -3043,7 +3269,7 @@ export default function App() {
       ...ROBOT_IDE_COMMAND_BLOCKS,
       ...getG1BlocklyCommandBlocks(G1_COMMANDS),
       ...getG1BlocklyConditionBlocks(),
-      ...getDuetBlocklyCommandBlocks(),
+      ...getDuetBlocklyCommandBlocks(savedDuetMotions),
     ];
     const definitions = [...allBlocks, ...commandBlocks].map((blockDef) => {
       const definition = { ...blockDef };
@@ -3108,7 +3334,7 @@ export default function App() {
         return code;
       };
     });
-  }, [lang, controllerVersion]);
+  }, [lang, controllerVersion, savedDuetMotions]);
 
   useEffect(() => {
     if (!isBlocklyLoaded || !blocklyDiv.current) return;
@@ -3141,7 +3367,11 @@ export default function App() {
 
       const scheduleResize = () => {
         requestAnimationFrame(() => {
-          if (workspaceRef.current) Blockly.svgResize(workspaceRef.current);
+          const container = blocklyDiv.current;
+          if (!workspaceRef.current || !container) return;
+          const { width, height } = container.getBoundingClientRect();
+          if (width <= 0 || height <= 0) return;
+          Blockly.svgResize(workspaceRef.current);
         });
       };
 
@@ -3168,13 +3398,13 @@ export default function App() {
       };
       workspaceRef.current.addChangeListener(updateCode);
       scheduleResize();
-      syncBlocksFromGeneratedCode(generatedCodeRef.current);
+      syncBlocksFromGeneratedCodeRef.current?.(generatedCodeRef.current);
     });
     
     return () => {
       cancelAnimationFrame(initFrame);
     };
-  }, [isBlocklyLoaded, registerBlocks, generateToolboxXML, robotConfig, lang]);
+  }, [isBlocklyLoaded, registerBlocks, generateToolboxXML, robotConfig, lang, controllerVersion]);
 
   useEffect(() => () => resizeObserverRef.current?.disconnect(), []);
 
@@ -3269,8 +3499,31 @@ export default function App() {
   };
 
   const downloadPython = () => { const a = document.createElement("a"); a.href = URL.createObjectURL(new Blob([generatedCode], {type: "text/x-python;charset=utf-8"})); a.download = "task.py"; a.click(); };
-  const handleUndo = () => workspaceRef.current?.undo(false);
-  const handleRedo = () => workspaceRef.current?.undo(true);
+  const handleUndo = useCallback(() => workspaceRef.current?.undo(false), []);
+  const handleRedo = useCallback(() => workspaceRef.current?.undo(true), []);
+
+  useEffect(() => {
+    const handleWorkspaceHistoryShortcut = (event) => {
+      if ((!event.ctrlKey && !event.metaKey) || mainTab !== 'blocks') return;
+      const target = event.target;
+      if (
+        target instanceof HTMLElement
+        && (target.isContentEditable || target.matches('input, textarea, select'))
+      ) return;
+
+      const key = event.key.toLowerCase();
+      if ((key === 'z' && event.shiftKey) || key === 'y') {
+        event.preventDefault();
+        handleRedo();
+      } else if (key === 'z') {
+        event.preventDefault();
+        handleUndo();
+      }
+    };
+
+    window.addEventListener('keydown', handleWorkspaceHistoryShortcut);
+    return () => window.removeEventListener('keydown', handleWorkspaceHistoryShortcut);
+  }, [handleRedo, handleUndo, mainTab]);
   
   const handleClear = () => {
     if (window.confirm(t.confirmClear)) {
@@ -3505,12 +3758,24 @@ export default function App() {
         }
         if (controllerVersion === 'duet') parseDuetProgram(generatedCode);
         else parseG1Program(generatedCode);
+        const submittedCode = generatedCode;
         if (!window.confirm(
           `Teacher approval required: send this exact ${controllerVersion === 'duet' ? 'DUET v2' : 'legacy SDK'} program to the robot?\n\n${generatedCode}`,
         )) return;
+        if (controllerVersion === 'duet') {
+          setLastSuccessfulDuetCode('');
+          setDuetMotionReviewConfirmed(false);
+        }
         setIsRunning(true);
-        const result = await activeRobotConnection.run(generatedCode);
+        const result = await activeRobotConnection.run(submittedCode);
         let keepDuetRunLock = false;
+        if (
+          controllerVersion === 'duet'
+          && result.status === 'completed'
+          && !submittedCode.includes('duet.saved_motion(')
+        ) {
+          setLastSuccessfulDuetCode(submittedCode);
+        }
         if (controllerVersion === 'duet' && result.status === 'accepted') {
           duetProgramActiveRef.current = true;
           setIsDuetProgramActive(true);
@@ -3774,15 +4039,16 @@ export default function App() {
       Blockly.Events.enable();
     }
   }, [controllerVersion]);
+  syncBlocksFromGeneratedCodeRef.current = syncBlocksFromGeneratedCode;
 
   useEffect(() => {
-    if (mainTab !== 'blocks' || !workspaceRef.current) return;
+    if (mainTab !== 'blocks' || toolPanelCollapsed || !workspaceRef.current) return;
     let fitFrame = 0;
     const frame = requestAnimationFrame(() => {
-      if (!workspaceRef.current) return;
+      if (!workspaceRef.current || toolPanelCollapsed) return;
       Blockly.svgResize(workspaceRef.current);
       fitFrame = requestAnimationFrame(() => {
-        if (!workspaceRef.current) return;
+        if (!workspaceRef.current || toolPanelCollapsed) return;
         syncBlocksFromGeneratedCode(generatedCodeRef.current);
         Blockly.svgResize(workspaceRef.current);
       });
@@ -3791,7 +4057,7 @@ export default function App() {
       cancelAnimationFrame(frame);
       cancelAnimationFrame(fitFrame);
     };
-  }, [mainTab, syncBlocksFromGeneratedCode]);
+  }, [mainTab, syncBlocksFromGeneratedCode, toolPanelCollapsed]);
 
   const derivePlannerWaypointsFromCode = useCallback((code = '') => {
     if (!code || !code.trim()) return [];
@@ -3891,18 +4157,49 @@ export default function App() {
   }, [applyGeneratedCode]);
 
   const applyMotionPromptResult = (promptText, source) => {
-    const result = controllerVersion === 'duet'
+    let result = controllerVersion === 'duet'
       ? compileDuetMotionPrompt(promptText)
       : compileMotionPrompt(promptText);
-    setMotionPromptResult({ ...result, source });
-    if (result.code) updateGeneratedCode(result.code);
+    if (
+      controllerVersion === 'duet'
+      && duetMotionMode === 'follow'
+      && result.code
+      && /duet\.(?:arm_|wave_|raise_|gesture_|hold_pose)/.test(result.code)
+      && !/(?:duet\.(?:reset_arms|stop)\(\))\s*$/.test(result.code)
+    ) {
+      const code = `${result.code}\nduet.reset_arms()`;
+      parseDuetProgram(code);
+      result = {
+        ...result,
+        code,
+        steps: [...result.steps, {
+          label: 'Return arms to carry',
+          code: 'duet.reset_arms()',
+          detail: 'End the reusable sequence in the approved carry pose.',
+        }],
+      };
+    }
+    const adjustedResult = controllerVersion === 'duet' && duetMotionMode === 'follow'
+      ? {
+        ...result,
+        summary: result.code
+          ? `${result.summary} Review and run this series, then save it as one named DUET command.`
+          : result.summary,
+      }
+      : result;
+    setMotionPromptResult({ ...adjustedResult, source });
+    if (adjustedResult.code) updateGeneratedCode(adjustedResult.code);
   };
 
   const generateMotionFromPrompt = async (useHuggingFace = false) => {
     if (generatedCode.trim() && !window.confirm('Generating this motion will replace the current Blocks and IDE code. Continue?')) return;
-    setMotionPromptStatus(useHuggingFace ? 'loading' : 'local');
-    if (!useHuggingFace) {
-      applyMotionPromptResult(motionPrompt, 'Local safe compiler');
+    const useRemoteGenerator = useHuggingFace && controllerVersion !== 'duet';
+    setMotionPromptStatus(useRemoteGenerator ? 'loading' : 'local');
+    if (!useRemoteGenerator) {
+      applyMotionPromptResult(
+        motionPrompt,
+        controllerVersion === 'duet' ? 'Local DUET command compiler' : 'Local safe compiler',
+      );
       return;
     }
 
@@ -3914,9 +4211,76 @@ export default function App() {
       setMotionPrompt(response.text);
       applyMotionPromptResult(response.text, `Hugging Face: ${response.model}`);
       setMotionPromptStatus('hf');
-    } catch {
+    } catch (error) {
       applyMotionPromptResult(motionPrompt, 'Local fallback');
       setMotionPromptStatus('fallback');
+      setVisionMotionStatus(`Remote prompt generation failed; the local safe compiler was used. ${error.message}`);
+    }
+  };
+
+  const installVisionMotionDraft = (result, source) => {
+    const parsed = parseDuetProgram(result.code);
+    updateGeneratedCode(formatDuetProgram(parsed));
+    setMotionPromptResult({
+      code: result.code,
+      steps: result.code.split('\n').map((code, index) => ({
+        code,
+        label: `Observed DUET action ${index + 1}`,
+      })),
+      unknown: [],
+      source,
+      summary: `${result.summary} ${duetMotionMode === 'follow'
+        ? 'Review and run this series, then save it as one named DUET command.'
+        : 'Edit or run the approved catalog commands as needed.'}`,
+    });
+    setVisionMotionStatus(result.summary);
+    setLastSuccessfulDuetCode('');
+    setDuetMotionReviewConfirmed(false);
+  };
+
+  const analyzeVisionMotion = async (useUploadedVideo) => {
+    if (session?.user?.role !== 'teacher') {
+      setVisionMotionStatus('A teacher must launch vision motion analysis.');
+      return;
+    }
+    if (generatedCode.trim() && !window.confirm('Vision motion generation will replace the current Blocks and IDE code. Continue?')) {
+      return;
+    }
+    setIsVisionMotionAnalyzing(true);
+    setVisionMotionProgress(0);
+    setVisionMotionStatus('Loading local pose estimation and analyzing arm movement…');
+    try {
+      const progress = (value) => setVisionMotionProgress(value);
+      const result = useUploadedVideo
+        ? await analyzeDuetVideo(motionVideoRef.current, progress)
+        : await captureDuetLiveMotion(
+          cameraInputSource === 'device'
+            ? deviceCameraVideoRef.current
+            : robotCameraCanvasRef.current,
+          5,
+          progress,
+        );
+      const instruction = visionMotionPrompt.trim()
+        ? compileDuetMotionPrompt(visionMotionPrompt)
+        : null;
+      if (instruction?.unknown.length) {
+        throw new Error(instruction.unknown.join(' '));
+      }
+      const poseCode = duetMotionMode === 'follow'
+        ? `${result.code}\nduet.reset_arms()`
+        : result.code;
+      const code = [instruction?.code, poseCode].filter(Boolean).join('\n');
+      parseDuetProgram(code);
+      installVisionMotionDraft({
+        ...result,
+        code,
+        summary: `${result.summary}${instruction?.code ? ' Added the approved prompt instruction.' : ''}`,
+      }, 'Local browser pose estimation');
+    } catch (error) {
+      setVisionMotionStatus(`Vision motion analysis failed: ${error.message}`);
+    } finally {
+      setIsVisionMotionAnalyzing(false);
+      setVisionMotionProgress(0);
     }
   };
 
@@ -3924,6 +4288,144 @@ export default function App() {
     const nextCode = generatedCode ? `${generatedCode.trimEnd()}\n${snippet}\n` : `${snippet}\n`;
     updateGeneratedCode(nextCode);
   };
+
+  const canSaveSuccessfulDuetMotion = () => (
+    currentUser.role === 'teacher'
+    && Boolean(lastSuccessfulDuetCode)
+    && (
+      lastSuccessfulDuetCode === generatedCode
+      || (
+        queueReviewItem?.controller_version === 'duet'
+        && queueReviewItem.status === 'completed'
+        && queueReviewItem.code === lastSuccessfulDuetCode
+      )
+    )
+  );
+
+  const saveSuccessfulDuetMotion = async () => {
+    if (
+      !canSaveSuccessfulDuetMotion()
+      || !duetMotionReviewConfirmed
+    ) {
+      setDuetMotionSaveError('Review a successfully completed DUET run before saving it.');
+      return;
+    }
+    setDuetMotionSaveBusy(true);
+    setDuetMotionSaveError('');
+    try {
+      const response = await apiFetch('/api/duet/motions', {
+        method: 'POST',
+        body: JSON.stringify({ name: duetMotionSaveName, code: lastSuccessfulDuetCode }),
+      });
+      setSavedDuetMotions((motions) => [...motions, response.motion]);
+      setDuetMotionSaveName('');
+      setDuetMotionReviewConfirmed(false);
+      setLastSuccessfulDuetCode('');
+      updateGeneratedCode(`duet.saved_motion(${JSON.stringify(response.motion.id)})`);
+      setVisionMotionStatus(`Saved "${response.motion.name}" as a reusable DUET command.`);
+    } catch (error) {
+      setDuetMotionSaveError(error.message);
+    } finally {
+      setDuetMotionSaveBusy(false);
+    }
+  };
+
+  const renderDuetMotionSaveForm = () => {
+    if (!canSaveSuccessfulDuetMotion()) return null;
+    return (
+      <div className="space-y-2 border-t border-slate-700 pt-2">
+        <label className="flex items-start gap-2 text-[10px] leading-4 text-slate-300">
+          <input
+            type="checkbox"
+            checked={duetMotionReviewConfirmed}
+            onChange={(event) => setDuetMotionReviewConfirmed(event.target.checked)}
+            className="mt-0.5"
+          />
+          I reviewed the completed motion and it matched the intended result.
+        </label>
+        <div className="flex gap-2">
+          <input
+            aria-label="Name the successful DUET motion"
+            value={duetMotionSaveName}
+            onChange={(event) => setDuetMotionSaveName(event.target.value)}
+            maxLength={40}
+            placeholder="Name this command"
+            className="min-w-0 flex-1 rounded-md border border-slate-700 bg-slate-950 px-2 py-1.5 text-xs text-slate-100"
+          />
+          <button
+            type="button"
+            onClick={saveSuccessfulDuetMotion}
+            disabled={!duetMotionReviewConfirmed || !duetMotionSaveName.trim() || duetMotionSaveBusy}
+            className="rounded-md bg-cyan-600 px-2.5 py-1.5 text-[10px] font-semibold text-white disabled:opacity-50"
+          >
+            {duetMotionSaveBusy ? 'Saving…' : 'Save command'}
+          </button>
+        </div>
+        {duetMotionSaveError && <p role="alert" className="text-[10px] text-amber-300">{duetMotionSaveError}</p>}
+      </div>
+    );
+  };
+
+  const insertSavedDuetMotion = (motion) => {
+    insertRobotCommand(`duet.saved_motion(${JSON.stringify(motion.id)})`);
+  };
+
+  const renderDuetMotionLibrary = () => (
+    <section className="space-y-2 rounded-xl border border-cyan-400/20 bg-slate-900 p-3">
+      <div className="flex items-center justify-between gap-2">
+        <p className="text-[10px] font-semibold uppercase tracking-[0.16em] text-cyan-200">Saved DUET commands</p>
+        <span className="text-[10px] text-slate-500">{savedDuetMotions.length}/50</span>
+      </div>
+      {savedDuetMotions.length ? (
+        <ul className="space-y-1.5">
+          {savedDuetMotions.map((motion) => (
+            <li key={motion.id} className="flex items-center justify-between gap-2 rounded-md bg-slate-800 px-2 py-1.5">
+              <span className="min-w-0 truncate text-xs text-slate-200">{motion.name}</span>
+              <button
+                type="button"
+                onClick={() => insertSavedDuetMotion(motion)}
+                className="shrink-0 text-[10px] font-semibold text-cyan-300 hover:text-cyan-200"
+              >
+                Insert command
+              </button>
+            </li>
+          ))}
+        </ul>
+      ) : (
+        <p className="text-[10px] text-slate-400">Run and review a supported motion to save a reusable command.</p>
+      )}
+      {renderDuetMotionSaveForm()}
+    </section>
+  );
+
+  const renderDuetMotionModeSelector = () => (
+    <div className="space-y-2 rounded-xl border border-cyan-400/20 bg-cyan-950/20 p-3">
+      <p className="text-[10px] font-semibold uppercase tracking-[0.16em] text-cyan-200">DUET motion mode</p>
+      <div className="grid grid-cols-2 gap-2">
+        <button
+          type="button"
+          aria-pressed={duetMotionMode === 'library'}
+          onClick={() => setDuetMotionMode('library')}
+          className={`rounded-md px-2 py-2 text-[10px] font-semibold ${duetMotionMode === 'library' ? 'bg-cyan-500 text-slate-950' : 'bg-slate-800 text-slate-200'}`}
+        >
+          DUET library
+        </button>
+        <button
+          type="button"
+          aria-pressed={duetMotionMode === 'follow'}
+          onClick={() => setDuetMotionMode('follow')}
+          className={`rounded-md px-2 py-2 text-[10px] font-semibold ${duetMotionMode === 'follow' ? 'bg-cyan-500 text-slate-950' : 'bg-slate-800 text-slate-200'}`}
+        >
+          Follow and save
+        </button>
+      </div>
+      <p className="text-[10px] leading-4 text-slate-300">
+        {duetMotionMode === 'library'
+          ? 'Generate only approved DUET commands. Review the preview before the normal teacher run.'
+          : 'Create a bounded motion series, review and run it, then save it as one named DUET command.'}
+      </p>
+    </div>
+  );
 
   const saveDuetArmMotion = () => {
     try {
@@ -4358,19 +4860,28 @@ export default function App() {
 
   const updateToolPanelInteraction = (event) => {
     const interaction = toolPanelInteractionRef.current;
-    if (!interaction) return;
+    const sceneBounds = sceneShellRef.current?.getBoundingClientRect();
+    if (!interaction || !sceneBounds) return;
 
     const deltaX = event.clientX - interaction.startX;
     const deltaY = event.clientY - interaction.startY;
     const nextRect = { ...interaction.rect };
-    const minimumWidth = 320;
-    const minimumHeight = 360;
-    const maximumWidth = Math.max(minimumWidth, window.innerWidth - 32);
-    const maximumHeight = Math.max(minimumHeight, window.innerHeight - 110);
+    const minimumWidth = Math.min(320, Math.max(48, sceneBounds.width - 16));
+    const minimumHeight = Math.min(360, Math.max(48, sceneBounds.height - 16));
+    const maximumWidth = Math.max(minimumWidth, sceneBounds.width - 16);
+    const maximumHeight = Math.max(minimumHeight, sceneBounds.height - 16);
+    const panelWidth = toolPanelCollapsed ? 48 : Math.min(nextRect.width, sceneBounds.width - 16);
+    const panelHeight = toolPanelCollapsed ? 48 : Math.min(nextRect.height, sceneBounds.height - 16);
 
     if (interaction.mode === 'move') {
-      nextRect.right = Math.max(8, interaction.rect.right - deltaX);
-      nextRect.top = Math.max(8, interaction.rect.top + deltaY);
+      nextRect.right = Math.min(
+        Math.max(8, interaction.rect.right - deltaX),
+        Math.max(8, sceneBounds.width - panelWidth - 8),
+      );
+      nextRect.top = Math.min(
+        Math.max(8, interaction.rect.top + deltaY),
+        Math.max(8, sceneBounds.height - panelHeight - 8),
+      );
     } else {
       if (interaction.mode.includes('left')) {
         nextRect.width = Math.min(maximumWidth, Math.max(minimumWidth, interaction.rect.width - deltaX));
@@ -4388,6 +4899,16 @@ export default function App() {
       }
     }
 
+    nextRect.width = Math.min(nextRect.width, sceneBounds.width - 16);
+    nextRect.height = Math.min(nextRect.height, sceneBounds.height - 16);
+    nextRect.right = Math.min(
+      Math.max(8, nextRect.right),
+      Math.max(8, sceneBounds.width - nextRect.width - 8),
+    );
+    nextRect.top = Math.min(
+      Math.max(8, nextRect.top),
+      Math.max(8, sceneBounds.height - nextRect.height - 8),
+    );
     setToolPanelRect(nextRect);
   };
 
@@ -4471,7 +4992,7 @@ export default function App() {
   if (!isBlocklyLoaded) return <div className="flex h-screen items-center justify-center bg-gray-50 flex-col gap-4"><Loader2 className="animate-spin text-blue-600" size={48} /><p className="text-gray-500 font-medium">{UI_TEXT.en.loading}</p></div>;
 
   return (
-    <div className="flex flex-col h-screen bg-gray-50 text-gray-800 font-sans relative overflow-hidden">
+    <div className="flex h-dvh flex-col bg-gray-50 text-gray-800 font-sans relative overflow-hidden">
       
       <style>{`
         .blocklyToolboxDiv {
@@ -4570,6 +5091,29 @@ export default function App() {
                   className="h-5 w-5 accent-blue-700"
                 />
               </div>
+            )}
+            {currentUser.role === 'teacher' && (
+              <fieldset className="border-t bg-slate-50 px-5 py-3">
+                <legend className="text-sm font-semibold text-gray-800">Lock sidebar panels open</legend>
+                <p className="mb-2 text-xs text-gray-500">
+                  Pinned panels stay visible; the active unlocked panel uses the remaining sidebar space.
+                </p>
+                <div className="flex flex-wrap gap-x-5 gap-y-2">
+                  {configurableSidebarPanels.map((panel) => (
+                    <label key={panel.id} className="inline-flex items-center gap-2 text-xs text-gray-700">
+                      <input
+                        type="checkbox"
+                        aria-label={`Lock ${panel.label} open in sidebar`}
+                        checked={sidebarPanelIsLocked(panel.id)}
+                        onChange={(event) => handleSidebarPanelLockChange(panel.id, event.target.checked)}
+                        className="h-4 w-4 accent-blue-700"
+                      />
+                      {panel.label}
+                    </label>
+                  ))}
+                </div>
+                {lockedSidebarPanelsError && <p role="alert" className="mt-2 text-xs text-red-600">{lockedSidebarPanelsError}</p>}
+              </fieldset>
             )}
             <div className="p-4 border-t bg-white flex justify-end gap-3"><button onClick={() => setShowConfigEditor(false)} className="px-5 py-2 text-sm text-gray-600 font-medium hover:bg-gray-100 rounded-lg">{t.closeBtn}</button><button onClick={handleApplyConfig} className="flex items-center gap-2 px-6 py-2 text-sm bg-blue-600 text-white rounded-lg font-bold hover:bg-blue-700 shadow-md"><Check size={16} /> {t.applyBtn}</button></div>
           </div>
@@ -4748,12 +5292,17 @@ export default function App() {
                         {duetCommissioning?.status || 'loading'}
                       </span>
                     </div>
+                    {duetCommissioning?.commissioning_enabled !== true && (
+                      <p className="mt-2 rounded-lg border border-amber-300 bg-white p-2 text-[10px] text-amber-950">
+                        Guided commissioning is disabled. Enable both DUET_PHYSICAL_ENABLED and DUET_COMMISSIONING_ENABLED on the backend to expose the teacher test controls.
+                      </p>
+                    )}
                     {duetCommissioning?.status === 'not_started' && (
                       <p className="mt-2 text-[10px] text-slate-700">No commissioning report exists. Physical DUET program execution remains locked until the sequence is completed and teacher-reviewed.</p>
                     )}
                     {duetCommissioning?.status === 'passed' && (
                       <p className="mt-2 rounded-lg border border-green-200 bg-green-50 p-2 text-[10px] text-green-900">
-                        Teacher-reviewed acceptance: {duetCommissioning.acceptance_id}. Normal DUET execution is eligible when the backend physical master switch is enabled. Acceptance is bound to the reported robot model, configured robot label, policy, controller binary, backend implementation, and arm catalog recorded below.
+                        Teacher-reviewed commissioning report: {duetCommissioning.acceptance_id}. This report does not certify supervised hardware acceptance or unlock normal runs. A qualified operator must separately document acceptance on the exact G1 and deployed policy and configure the matching DUET_HARDWARE_ACCEPTANCE_ID.
                       </p>
                     )}
                     {duetCommissioning?.steps?.length > 0 && (
@@ -4778,14 +5327,18 @@ export default function App() {
                         <div className="mt-3 rounded-lg border border-amber-200 bg-white p-2">
                           <p className="text-xs font-semibold text-slate-900">Step {stepIndex + 1} of {duetCommissioning.steps.length}: {step.title}</p>
                           <p className="mt-1 text-[10px] text-slate-700">{step.expected}</p>
-                          {step.status === 'pending' && (
+                          {['pending', 'awaiting_review'].includes(step.status) && (
                             <button
                               type="button"
-                              onClick={handleRunDuetCommissioningStep}
-                              disabled={!isRobotConnected || isDuetCommissioningBusy || isRobotConnecting}
+                              onClick={() => handleRunDuetCommissioningStep(step.status === 'awaiting_review')}
+                              disabled={!isRobotConnected || isDuetCommissioningBusy || isRobotConnecting || duetCommissioning?.commissioning_enabled !== true}
                               className="mt-2 rounded-lg bg-amber-600 px-3 py-1.5 text-xs font-semibold text-white disabled:opacity-50"
                             >
-                              {isDuetCommissioningBusy ? 'Running…' : `Run test ${stepIndex + 1}`}
+                              {isDuetCommissioningBusy
+                                ? 'Running…'
+                                : step.status === 'awaiting_review'
+                                  ? 'Run again'
+                                  : `Run test ${stepIndex + 1}`}
                             </button>
                           )}
                           {step.status === 'running' && (
@@ -4796,6 +5349,22 @@ export default function App() {
                               <pre className="max-h-40 overflow-auto rounded bg-slate-950 p-2 text-[9px] text-green-200">
                                 {JSON.stringify(step.result, null, 2)}
                               </pre>
+                              {step.result?.armTelemetry?.map((measurement, measurementIndex) => (
+                                <div
+                                  key={`${measurement.pose || 'arm'}-${measurementIndex}`}
+                                  className="rounded border border-slate-200 bg-slate-50 p-2 text-[9px] text-slate-700"
+                                >
+                                  <p className="font-semibold">
+                                    {measurement.pose || 'Arm target'} · left max error {Number(measurement.leftMaximumErrorRad).toFixed(3)} rad · right max error {Number(measurement.rightMaximumErrorRad).toFixed(3)} rad
+                                  </p>
+                                  <p className="mt-1 break-words">
+                                    Expected target [L/R, radians]: {JSON.stringify(measurement.target)}
+                                  </p>
+                                  <p className="break-words">
+                                    Measured joints [L/R, radians]: {JSON.stringify(measurement.measured)}
+                                  </p>
+                                </div>
+                              ))}
                               {step.feedback_within_tolerance === false && (
                                 <p className="rounded bg-red-50 p-2 text-[10px] text-red-800">
                                   Measured joints exceeded 0.25 rad error for at least one requested target. Passing is disabled; fail this step and inspect the terminal JSONL log.
@@ -4811,11 +5380,21 @@ export default function App() {
                                 I physically observed the expected robot response for this test.
                               </label>
                               <textarea
-                                aria-label="DUET commissioning review notes"
+                                aria-label="DUET commissioning observed result"
+                                value={duetCommissioningObservedResult}
+                                onChange={(event) => setDuetCommissioningObservedResult(event.target.value)}
+                                maxLength={1000}
+                                required
+                                placeholder="Required: describe what you observed (for example, direction, arm response, stop result, or discrepancy)"
+                                className="w-full rounded border border-slate-300 px-2 py-1.5 text-[10px]"
+                                rows={2}
+                              />
+                              <textarea
+                                aria-label="DUET commissioning additional notes"
                                 value={duetCommissioningNotes}
                                 onChange={(event) => setDuetCommissioningNotes(event.target.value)}
                                 maxLength={1000}
-                                placeholder="Optional notes for the terminal and saved commissioning report"
+                                placeholder="Optional additional notes"
                                 className="w-full rounded border border-slate-300 px-2 py-1.5 text-[10px]"
                                 rows={2}
                               />
@@ -4823,15 +5402,15 @@ export default function App() {
                                 <button
                                   type="button"
                                   onClick={() => handleReviewDuetCommissioningStep(true)}
-                                  disabled={!duetCommissioningObserved || step.feedback_within_tolerance === false || isDuetCommissioningBusy}
+                                  disabled={!duetCommissioningObserved || !duetCommissioningObservedResult.trim() || step.feedback_within_tolerance === false || isDuetCommissioningBusy}
                                   className="flex-1 rounded-lg bg-green-700 px-2 py-1.5 text-xs font-semibold text-white disabled:opacity-50"
                                 >
-                                  Pass and continue
+                                  Next
                                 </button>
                                 <button
                                   type="button"
                                   onClick={() => handleReviewDuetCommissioningStep(false)}
-                                  disabled={isDuetCommissioningAborting}
+                                  disabled={isDuetCommissioningAborting || !duetCommissioningObservedResult.trim() || isDuetCommissioningBusy}
                                   className="flex-1 rounded-lg bg-red-700 px-2 py-1.5 text-xs font-semibold text-white disabled:opacity-50"
                                 >
                                   Fail and stop sequence
@@ -4847,7 +5426,7 @@ export default function App() {
                         <button
                           type="button"
                           onClick={handleStartDuetCommissioning}
-                          disabled={!isRobotConnected || isDuetCommissioningBusy || isRunning || isRobotConnecting}
+                          disabled={!isRobotConnected || isDuetCommissioningBusy || isRunning || isRobotConnecting || duetCommissioning?.commissioning_enabled !== true}
                           className="rounded-lg bg-amber-700 px-3 py-1.5 text-xs font-semibold text-white disabled:opacity-50"
                         >
                           {duetCommissioning?.status === 'not_started' ? 'Start full test sequence' : 'Start a new full test'}
@@ -4870,6 +5449,38 @@ export default function App() {
                         {JSON.stringify(duetCommissioning, null, 2)}
                       </pre>
                     </details>
+                    {['passed', 'failed', 'aborted'].includes(duetCommissioning?.status) && (
+                      <div className="mt-2 rounded-lg border border-slate-200 bg-white p-2">
+                        <div className="flex items-center justify-between gap-2">
+                          <p className="text-[10px] font-semibold text-slate-800">Full report and append-only event log</p>
+                          <button
+                            type="button"
+                            onClick={handleCopyDuetCommissioningEvidence}
+                            disabled={!duetCommissioningEvidence}
+                            className="rounded bg-slate-800 px-2 py-1 text-[10px] font-semibold text-white disabled:opacity-50"
+                          >
+                            Copy evidence
+                          </button>
+                        </div>
+                        <textarea
+                          ref={duetCommissioningEvidenceRef}
+                          aria-label="Selectable DUET commissioning report and event log"
+                          readOnly
+                          value={duetCommissioningEvidence
+                            ? JSON.stringify({
+                              report: duetCommissioningEvidence.report,
+                              event_log: duetCommissioningEvidence.event_log,
+                            }, null, 2)
+                            : 'Loading full commissioning evidence…'}
+                          onFocus={(event) => event.target.select()}
+                          className="mt-2 w-full rounded border border-slate-300 bg-slate-50 p-2 font-mono text-[9px] text-slate-700"
+                          rows={10}
+                        />
+                        <p role="status" aria-live="polite" className="mt-1 text-[9px] text-slate-600">
+                          {duetCommissioningCopyStatus}
+                        </p>
+                      </div>
+                    )}
                     <p className="mt-2 text-[9px] text-slate-600">
                       Logs are written to the backend terminal and {duetCommissioning?.log_path || 'the DUET control directory commissioning.jsonl'}. This sequence cannot certify balance, every environment, future motion, or emergency-stop hardware; acceptance applies only to the reviewed test run.
                     </p>
@@ -5218,6 +5829,7 @@ export default function App() {
                   key={tab.id}
                   type="button"
                   onClick={() => setSimulatorSidebarTab(tab.id)}
+                  aria-label={tab.id === 'settings' ? 'Open simulator settings panel' : tab.label}
                   className={`flex-1 rounded-t-md border-b-2 px-2 py-2 text-[10px] font-semibold uppercase tracking-wide transition ${simulatorSidebarTab === tab.id ? 'border-blue-600 bg-white text-blue-700' : 'border-transparent bg-slate-100 text-slate-500 hover:bg-slate-200'}`}
                 >
                   {tab.label}
@@ -5465,7 +6077,7 @@ export default function App() {
       </div>
       )}
 
-      <div className="relative flex-1 overflow-hidden scene-shell">
+      <div ref={sceneShellRef} className="relative flex-1 overflow-hidden scene-shell">
         <div className="absolute inset-0 bg-[radial-gradient(circle_at_top,_rgba(148,163,184,0.28),_rgba(15,23,42,0.04)_45%,_rgba(15,23,42,0.1))]" />
         <div className="scene-platform absolute left-[-8%] right-[-8%] top-[16%] bottom-[-8%] rounded-[28%]" />
         <G1Simulation3D
@@ -5494,9 +6106,9 @@ export default function App() {
           style={{
             top: toolPanelRect.top,
             right: toolPanelCollapsed ? 16 : toolPanelRect.right,
-            width: toolPanelCollapsed ? 48 : toolPanelRect.width,
-            height: toolPanelCollapsed ? 48 : toolPanelRect.height,
-            maxHeight: 'calc(100% - 24px)',
+            width: toolPanelCollapsed ? 48 : `min(${toolPanelRect.width}px, calc(100% - 16px))`,
+            height: toolPanelCollapsed ? 48 : `min(${toolPanelRect.height}px, calc(100% - 16px))`,
+            maxHeight: 'calc(100% - 16px)',
           }}
           onPointerMove={updateToolPanelInteraction}
           onPointerUp={endToolPanelInteraction}
@@ -5519,6 +6131,7 @@ export default function App() {
               type="button"
               onClick={() => setToolPanelCollapsed((value) => !value)}
               onPointerDown={(event) => event.stopPropagation()}
+              aria-label={toolPanelCollapsed ? 'Expand workspace panel' : 'Collapse workspace panel'}
               className="inline-flex h-7 w-7 items-center justify-center rounded-md bg-slate-800 text-slate-200 hover:bg-slate-700"
             >
               {toolPanelCollapsed ? '»' : '«'}
@@ -5569,15 +6182,15 @@ export default function App() {
                 <div className="flex items-center gap-2">
                   <button type="button" onClick={handleSaveCodeToAccount} className="text-slate-300 hover:text-white">Save</button>
                   <button type="button" onClick={handleLogout} className="text-slate-300 hover:text-white">Logout</button>
-                  <button type="button" onClick={() => setShowConfigEditor(true)} className="text-slate-300 hover:text-white">Settings</button>
+                  <button type="button" onClick={() => setShowConfigEditor(true)} className="text-slate-300 hover:text-white" aria-label="Open app settings">Settings</button>
                 </div>
               </div>
             </div>
           )}
 
-          {toolPanelCollapsed ? (
+          {toolPanelCollapsed && (
             <div className="flex flex-1 flex-col items-center gap-2 overflow-hidden py-2">
-              {overlayTabs.map((tab) => (
+              {unlockedOverlayTabs.map((tab) => (
                 <button
                   key={tab.id}
                   type="button"
@@ -5589,10 +6202,10 @@ export default function App() {
                 </button>
               ))}
             </div>
-          ) : (
-            <>
+          )}
+          <div className={`${toolPanelCollapsed ? 'hidden' : 'flex'} min-h-0 flex-1 flex-col`}>
               <div className="flex gap-2 border-b border-slate-700 bg-slate-900/70 p-2">
-                {overlayTabs.map((tab) => (
+                {unlockedOverlayTabs.map((tab) => (
                   <button
                     key={tab.id}
                     type="button"
@@ -5604,8 +6217,8 @@ export default function App() {
                 ))}
               </div>
 
-              <div className="min-h-0 flex-1 overflow-auto p-3">
-                <div className={`${mainTab === 'blocks' ? '' : 'hidden'} space-y-3 text-slate-200`}>
+              <div className="flex min-h-0 flex-1 flex-col gap-2 overflow-hidden p-3">
+                <div className={`${mainTab === 'blocks' ? 'min-h-0 flex-[2_1_0%] overflow-y-auto' : 'hidden'} space-y-3 text-slate-200`}>
                     <div className="rounded-xl border border-slate-700 bg-slate-900 p-3">
                       <p className="text-[10px] uppercase tracking-[0.18em] text-slate-400">
                         {controllerVersion === 'duet' ? 'Workspace • DUET version two' : 'Workspace'}
@@ -5623,6 +6236,26 @@ export default function App() {
                             {isRunning ? 'Stop robot' : 'Send to robot'}
                           </button>
                         )}
+                        <button
+                          type="button"
+                          onClick={handleUndo}
+                          title="Undo blocks (Ctrl+Z or Cmd+Z)"
+                          aria-label="Undo blocks"
+                          className="flex items-center justify-center gap-1 rounded-md bg-slate-700 px-2 py-2 text-[10px] font-semibold text-slate-200 hover:bg-slate-600"
+                        >
+                          <Undo size={14} />
+                          <span className="hidden sm:inline">Undo</span>
+                        </button>
+                        <button
+                          type="button"
+                          onClick={handleRedo}
+                          title="Redo blocks (Ctrl+Y, Ctrl+Shift+Z, or Cmd+Shift+Z)"
+                          aria-label="Redo blocks"
+                          className="flex items-center justify-center gap-1 rounded-md bg-slate-700 px-2 py-2 text-[10px] font-semibold text-slate-200 hover:bg-slate-600"
+                        >
+                          <Redo size={14} />
+                          <span className="hidden sm:inline">Redo</span>
+                        </button>
                         <button type="button" onClick={handleClear} className="flex-1 rounded-md bg-slate-700 px-2 py-2 text-xs font-semibold text-slate-200 hover:bg-slate-600">Clear</button>
                       </div>
                       {currentUser.role === 'teacher' && (
@@ -5686,6 +6319,11 @@ export default function App() {
                 </div>
 
                 {mainTab === 'planner' && (
+                  <section
+                    data-testid="sidebar-panel-planner"
+                    className="flex min-h-0 flex-[2_1_0%] flex-col overflow-hidden rounded-xl border border-slate-700 bg-slate-950/60"
+                  >
+                    <div className="min-h-0 flex-1 overflow-y-auto overscroll-contain p-2">
                   <div className="space-y-3 text-slate-200">
                     {session?.user?.role === 'teacher' && (
                       <>
@@ -6333,41 +6971,68 @@ export default function App() {
                       </p>
                     )}
                   </div>
+                    </div>
+                  </section>
                 )}
 
                 {mainTab === 'prompt' && (
+                  <section
+                    data-testid="sidebar-panel-prompt"
+                    className="flex min-h-0 flex-[2_1_0%] flex-col overflow-hidden rounded-xl border border-slate-700 bg-slate-950/60"
+                  >
+                    <div className="min-h-0 flex-1 overflow-y-auto overscroll-contain p-2">
                   <div className="space-y-3 text-slate-200">
+                    {controllerVersion === 'duet' && renderDuetMotionModeSelector()}
                     <div className="rounded-xl border border-cyan-400/30 bg-cyan-500/10 p-3">
                       <p className="text-[10px] uppercase tracking-[0.18em] text-cyan-200">Text to motion</p>
-                      <p className="mt-2 text-xs leading-5 text-slate-300">Describe a short safe movement sequence. The generated commands sync to Blocks, IDE, and the live G1 simulation.</p>
+                      <p className="mt-2 text-xs leading-5 text-slate-300">
+                        {controllerVersion === 'duet'
+                          ? 'Describe a bounded movement using the approved DUET locomotion, arm, gesture, and timing library. Unsupported requests stay visible instead of becoming SDK commands.'
+                          : 'Describe a short safe movement sequence. The generated commands sync to Blocks, IDE, and the live G1 simulation.'}
+                      </p>
                     </div>
                     <textarea
                       value={motionPrompt}
                       onChange={(event) => setMotionPrompt(event.target.value)}
                       className="h-28 w-full resize-none rounded-xl border border-slate-700 bg-slate-900 p-3 text-sm leading-6 text-slate-100 outline-none focus:border-cyan-400"
-                      placeholder="Example: walk forward 3 steps, turn left, wave"
+                      placeholder={controllerVersion === 'duet'
+                        ? 'Example: move forward for 1 second, then wave left for 1 second'
+                        : 'Example: walk forward 3 steps, turn left, wave'}
                     />
                     <div className="flex flex-wrap gap-2">
-                      {[
-                        'Walk forward 3 steps, turn left 90 degrees, then wave',
-                        'Walk backward 2 steps and turn right 90 degrees',
-                        'Repeat a square path 2 times',
-                      ].map((example) => (
+                      {(controllerVersion === 'duet'
+                        ? [
+                          'Move forward for 1 second, then turn left for 1 second',
+                          'Strafe left for 1 second, then wave left high for 1 second',
+                          'Raise both arms high for 2 seconds',
+                          'Hold both arms above head for 3 seconds',
+                        ]
+                        : [
+                          'Walk forward 3 steps, turn left 90 degrees, then wave',
+                          'Walk backward 2 steps and turn right 90 degrees',
+                          'Repeat a square path 2 times',
+                        ]).map((example) => (
                         <button key={example} type="button" onClick={() => setMotionPrompt(example)} className="rounded-md bg-slate-800 px-2 py-1.5 text-left text-[10px] text-slate-300 hover:bg-slate-700">
                           {example}
                         </button>
                       ))}
                     </div>
-                    <div className="grid grid-cols-2 gap-2">
+                    <div className={`grid ${controllerVersion === 'duet' ? 'grid-cols-1' : 'grid-cols-2'} gap-2`}>
                       <button type="button" onClick={() => generateMotionFromPrompt(false)} className="rounded-md bg-slate-700 px-3 py-2 text-xs font-semibold text-white hover:bg-slate-600">
-                        Local generate
+                        {controllerVersion === 'duet' && duetMotionMode === 'follow'
+                          ? 'Create DUET follow series'
+                          : controllerVersion === 'duet' ? 'Generate DUET commands' : 'Local generate'}
                       </button>
-                      <button type="button" onClick={() => generateMotionFromPrompt(true)} disabled={motionPromptStatus === 'loading'} className="rounded-md bg-cyan-500 px-3 py-2 text-xs font-semibold text-slate-950 hover:bg-cyan-400 disabled:opacity-60">
-                        {motionPromptStatus === 'loading' ? 'Generating...' : 'Generate with HF'}
-                      </button>
+                      {controllerVersion !== 'duet' && (
+                        <button type="button" onClick={() => generateMotionFromPrompt(true)} disabled={motionPromptStatus === 'loading'} className="rounded-md bg-cyan-500 px-3 py-2 text-xs font-semibold text-slate-950 hover:bg-cyan-400 disabled:opacity-60">
+                          {motionPromptStatus === 'loading' ? 'Generating...' : 'Generate with HF'}
+                        </button>
+                      )}
                     </div>
                     <p className="text-[10px] text-slate-400">
-                      {motionPromptStatus === 'hf' ? motionPromptResult?.source : motionPromptStatus === 'fallback' ? 'HF unavailable; local compiler used.' : 'Both paths sync to Blocks, IDE, and 3D.'}
+                      {controllerVersion === 'duet'
+                        ? 'DUET prompts are compiled locally and validated; video or prompt content is not sent to a text-generation service.'
+                        : motionPromptStatus === 'hf' ? motionPromptResult?.source : motionPromptStatus === 'fallback' ? 'HF unavailable; local compiler used.' : 'Both paths sync to Blocks, IDE, and 3D.'}
                     </p>
                     {motionPromptResult && (
                       <div className="space-y-2 rounded-xl border border-slate-700 bg-slate-900 p-3">
@@ -6381,11 +7046,20 @@ export default function App() {
                         {motionPromptResult.unknown.map((message) => <p key={message} className="text-xs text-amber-300">{message}</p>)}
                       </div>
                     )}
+                    {controllerVersion === 'duet' && renderDuetMotionLibrary()}
                   </div>
+                    </div>
+                  </section>
                 )}
 
                 {mainTab === 'camera' && (
+                  <section
+                    data-testid="sidebar-panel-camera"
+                    className="flex min-h-0 flex-[2_1_0%] flex-col overflow-hidden rounded-xl border border-slate-700 bg-slate-950/60"
+                  >
+                    <div className="min-h-0 flex-1 overflow-y-auto overscroll-contain p-2">
                   <div className="space-y-3 text-slate-200">
+                    {controllerVersion === 'duet' && renderDuetMotionModeSelector()}
                     <div className="rounded-xl border border-slate-700 bg-slate-900 p-3">
                       <p className="text-[10px] uppercase tracking-[0.18em] text-slate-400">Camera preview</p>
                       <label className="mt-2 block text-xs text-slate-300">
@@ -6472,19 +7146,109 @@ export default function App() {
                         </div>
                       ) : null}
                       <p className="mt-3 text-[10px] text-amber-300">
-                        Camera-to-motion pose inference is not implemented. No pose is recognized or derived from these frames.
+                        {controllerVersion === 'duet'
+                          ? 'DUET pose estimation is approximate and maps only to approved arm commands; it does not reproduce human joint angles exactly.'
+                          : 'Camera-to-motion pose inference is not implemented in legacy SDK mode.'}
                       </p>
                     </div>
-                    <div className="rounded-xl border border-amber-200/50 bg-amber-500/10 p-3 text-amber-100">
-                      <p className="text-[10px] font-semibold uppercase tracking-[0.18em] text-amber-300">Example program</p>
-                      <p className="mt-2 text-xs">This inserts a fixed example program; it does not use camera frames. Saving is a separate, explicit action.</p>
-                      <button type="button" onClick={handleRecordMotionCapture} className="mt-3 w-full rounded-md bg-blue-600 px-3 py-2 text-xs font-semibold text-white hover:bg-blue-500">Insert example program</button>
-                    </div>
+                    {controllerVersion === 'duet' ? (
+                      <section className="space-y-3 rounded-xl border border-cyan-400/20 bg-slate-900 p-3">
+                        <div>
+                          <p className="text-[10px] font-semibold uppercase tracking-[0.16em] text-cyan-200">Vision to DUET motion</p>
+                          <p className="mt-1 text-[10px] leading-4 text-slate-400">
+                            Analyze a local video or capture five seconds from the selected camera. Pose inference runs in this browser; frames are not uploaded or saved.
+                          </p>
+                        </div>
+                        <label className="block text-xs text-slate-300">
+                          Optional DUET prompt guidance
+                          <textarea
+                            value={visionMotionPrompt}
+                            onChange={(event) => setVisionMotionPrompt(event.target.value)}
+                            className="mt-1 h-16 w-full resize-none rounded-md border border-slate-700 bg-slate-950 p-2 text-xs text-slate-100"
+                            placeholder="Example: wave left high for 1 second"
+                          />
+                        </label>
+                        <label className="block text-xs text-slate-300">
+                          Upload a local video (30 seconds maximum)
+                          <input
+                            type="file"
+                            accept="video/*"
+                            onChange={(event) => {
+                              const file = event.target.files?.[0];
+                              if (!file) return;
+                              if (!file.type.startsWith('video/') || file.size > 50 * 1024 * 1024) {
+                                setVisionMotionStatus('Choose a video file smaller than 50 MB.');
+                                event.target.value = '';
+                                return;
+                              }
+                              setMotionVideoUrl(URL.createObjectURL(file));
+                              setVisionMotionStatus('Video loaded locally. Analyze it to draft approved DUET commands.');
+                            }}
+                            className="mt-1 block w-full text-[10px] text-slate-300 file:mr-2 file:rounded-md file:border-0 file:bg-slate-700 file:px-2 file:py-1 file:text-[10px] file:font-semibold file:text-white"
+                          />
+                        </label>
+                        {motionVideoUrl && (
+                          <video
+                            ref={motionVideoRef}
+                            src={motionVideoUrl}
+                            controls
+                            playsInline
+                            preload="metadata"
+                            aria-label="Local uploaded motion video"
+                            className="aspect-video w-full rounded-lg bg-black object-contain"
+                          />
+                        )}
+                        {currentUser.role === 'teacher' ? (
+                          <div className="grid grid-cols-2 gap-2">
+                            <button
+                              type="button"
+                              onClick={() => analyzeVisionMotion(true)}
+                              disabled={!motionVideoUrl || isVisionMotionAnalyzing}
+                              className="rounded-md bg-cyan-600 px-2 py-2 text-[10px] font-semibold text-white disabled:opacity-50"
+                            >
+                              Analyze uploaded video
+                            </button>
+                            <button
+                              type="button"
+                              onClick={() => analyzeVisionMotion(false)}
+                              disabled={isVisionMotionAnalyzing || (
+                                cameraInputSource === 'device'
+                                  ? !isDeviceCameraActive
+                                  : !selectedRobotCameraTopic
+                              )}
+                              className="rounded-md bg-blue-600 px-2 py-2 text-[10px] font-semibold text-white disabled:opacity-50"
+                            >
+                              Capture live motion
+                            </button>
+                          </div>
+                        ) : (
+                          <p className="text-[10px] text-amber-300">A teacher must launch vision-to-motion analysis.</p>
+                        )}
+                        {isVisionMotionAnalyzing && (
+                          <progress aria-label="Vision analysis progress" max="1" value={visionMotionProgress} className="w-full" />
+                        )}
+                        {visionMotionStatus && (
+                          <p role="status" aria-live="polite" className="text-[10px] text-slate-300">{visionMotionStatus}</p>
+                        )}
+                        {motionPromptResult?.source === 'Local browser pose estimation' && (
+                          <pre className="max-h-36 overflow-auto whitespace-pre-wrap rounded-md bg-slate-950 p-2 font-mono text-[10px] text-cyan-200">{motionPromptResult.code}</pre>
+                        )}
+                        <p className="text-[10px] leading-4 text-slate-500">
+                          The MediaPipe runtime and pose model are fetched from their published CDNs; camera and video frames remain in the browser. Review and explicitly run the generated DUET program before saving it.
+                        </p>
+                      </section>
+                    ) : (
+                      <div className="rounded-xl border border-amber-200/50 bg-amber-500/10 p-3 text-amber-100">
+                        <p className="text-[10px] font-semibold uppercase tracking-[0.18em] text-amber-300">Example program</p>
+                        <p className="mt-2 text-xs">This inserts a fixed example program; it does not use camera frames. Saving is a separate, explicit action.</p>
+                        <button type="button" onClick={handleRecordMotionCapture} className="mt-3 w-full rounded-md bg-blue-600 px-3 py-2 text-xs font-semibold text-white hover:bg-blue-500">Insert example program</button>
+                      </div>
+                    )}
                     <div className="rounded-xl border border-slate-700 bg-slate-900 p-3">
                       <p className="text-[10px] uppercase tracking-[0.18em] text-slate-400">Quick actions</p>
                       <div className="mt-2 max-h-56 space-y-2 overflow-y-auto text-xs text-slate-200">
                         {(controllerVersion === 'duet'
-                          ? getDuetCommandExamples().map(({ label, code }) => [label, code])
+                          ? getDuetCommandExamples(savedDuetMotions).map(({ label, code }) => [label, code])
                           : [
                             ['Stand / Ready', 'robot.stand()'],
                             ['Walk Forward (3 steps)', 'robot.walk(3)'],
@@ -6502,18 +7266,21 @@ export default function App() {
                         ))}
                       </div>
                     </div>
+                    {controllerVersion === 'duet' && renderDuetMotionLibrary()}
                   </div>
+                    </div>
+                  </section>
                 )}
 
                 {mainTab === 'ide' && (
-                  <div className="space-y-3 text-slate-200">
+                  <div className="min-h-0 flex-[2_1_0%] overflow-y-auto space-y-3 text-slate-200">
                     <div className="rounded-xl border border-slate-700 bg-slate-900 p-3">
                       <p className="text-[10px] uppercase tracking-[0.18em] text-slate-400">
                         {controllerVersion === 'duet' ? 'Executable DUET commands' : 'Executable robot commands'}
                       </p>
                       <div className="mt-2 max-h-56 space-y-2 overflow-y-auto text-[10px]">
                         {(controllerVersion === 'duet'
-                          ? getDuetCommandExamples().map((example) => ({
+                          ? getDuetCommandExamples(savedDuetMotions).map((example) => ({
                             ...example,
                             method: example.key,
                             description: example.label,
@@ -6649,8 +7416,7 @@ export default function App() {
               <div className="border-t border-slate-700 bg-slate-900 p-2 text-center text-[10px] uppercase tracking-[0.14em] text-slate-500">
                 Drag the header to move. Drag any edge to resize.
               </div>
-            </>
-          )}
+          </div>
         </div>
       </div>
       {queueReviewItem && (
@@ -6789,6 +7555,7 @@ export default function App() {
 
               {queueReviewError && <p role="alert" className="text-xs text-red-300">{queueReviewError}</p>}
               {queueReviewStatus && <p role="status" aria-live="polite" className="text-xs text-cyan-200">{queueReviewStatus}</p>}
+              {queueReviewItem?.controller_version === 'duet' && renderDuetMotionSaveForm()}
               {queueReviewSavedProject && (
                 <div className="flex flex-wrap items-center justify-between gap-2 rounded-md border border-emerald-800 bg-emerald-950/40 p-3">
                   <p className="min-w-0 text-xs text-emerald-200">Saved project: {queueReviewSavedProject.name}</p>

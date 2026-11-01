@@ -216,6 +216,13 @@ def _require_commissioning_enabled() -> None:
         )
 
 
+def _commissioning_is_enabled() -> bool:
+    return (
+        os.getenv("DUET_PHYSICAL_ENABLED", "").strip().lower() == "true"
+        and os.getenv("DUET_COMMISSIONING_ENABLED", "").strip().lower() == "true"
+    )
+
+
 def _read_commissioning_report() -> dict:
     report_path = _commissioning_report_path()
     try:
@@ -317,6 +324,10 @@ def _require_hardware_acceptance() -> str:
             "DUET_EXPECTED_POLICY_ID must be the SHA-256 identity of the deployed policy."
         )
     report = _read_commissioning_report()
+    if os.getenv("DUET_HARDWARE_ACCEPTANCE_ID", "").strip() != report.get("acceptance_id"):
+        raise DuetControllerError(
+            "DUET normal runs remain locked until a qualified operator records the separately supervised hardware acceptance ID."
+        )
     steps = report.get("steps")
     if (
         report.get("status") != "passed"
@@ -360,15 +371,21 @@ def _require_hardware_acceptance() -> str:
 def _commissioning_steps() -> list[dict]:
     steps = [
         {
+            "id": "base-custom-vector",
+            "title": "Custom bounded base vector",
+            "category": "base",
+            "code": "duet.move(0.05, 0.05, 0.1, 0.5)",
+            "expected": "The controller applies the bounded forward, lateral, and yaw-rate vector briefly, then confirms zero velocity.",
+        },
+    ] + [
+        {
             "id": f"base-{name}",
             "title": f"Base movement: {name.replace('_', ' ')}",
             "category": "base",
-            "code": (
-                f"duet.move({velocity[0]}, {velocity[1]}, {velocity[2]}, 0.5)"
-            ),
+            "code": f"duet.{name}(0.5)",
             "expected": "Controller accepts the bounded command, produces the requested brief movement, then confirms zero velocity.",
         }
-        for name, velocity in DUET_MOVEMENT_PRESETS.items()
+        for name in DUET_MOVEMENT_PRESETS
     ]
     steps.append({
         "id": "concurrent-base-arm",
@@ -444,6 +461,13 @@ def _commissioning_steps() -> list[dict]:
             "code": None,
             "expected": "STOP clears velocity and arm leases; measured arms return to carry/default.",
         },
+        {
+            "id": "program-stop-command",
+            "title": "DUET program stop command",
+            "category": "program_stop",
+            "code": "duet.stop()",
+            "expected": "The DUET program executor reports a stopped program after its STOP request and controller zero-velocity confirmation.",
+        },
     ))
     return steps
 
@@ -464,8 +488,38 @@ def commissioning_status() -> dict:
     with _commissioning_lock:
         report = _commissioning_state or _load_commissioning_report_or_none()
         if report is None:
-            return {"status": "not_started", "steps": [], "current_step": None}
-        return json.loads(json.dumps(report))
+            return {
+                "status": "not_started",
+                "steps": [],
+                "current_step": None,
+                "commissioning_enabled": _commissioning_is_enabled(),
+            }
+        result = json.loads(json.dumps(report))
+        result["commissioning_enabled"] = _commissioning_is_enabled()
+        return result
+
+
+def commissioning_evidence() -> dict:
+    report = _load_commissioning_report_or_none()
+    if report is None:
+        return {"report": None, "events": [], "event_log": ""}
+
+    log_path = _commissioning_log_path()
+    try:
+        event_log = log_path.read_text(encoding="utf-8")
+    except OSError as error:
+        raise DuetControllerError(f"Could not read the DUET commissioning event log: {error}") from error
+    events = []
+    try:
+        for line_number, line in enumerate(event_log.splitlines(), start=1):
+            if line.strip():
+                event = json.loads(line)
+                if not isinstance(event, dict):
+                    raise ValueError(f"event at line {line_number} is not an object")
+                events.append(event)
+    except (json.JSONDecodeError, ValueError) as error:
+        raise DuetControllerError(f"The DUET commissioning event log is invalid: {error}") from error
+    return {"report": report, "events": events, "event_log": event_log}
 
 
 def start_commissioning(teacher: str) -> dict:
@@ -530,9 +584,10 @@ def start_commissioning(teacher: str) -> dict:
         "updated_at": now,
         "current_step": 0,
         "steps": [
-            {**step, "status": "pending", "result": None, "review": None}
+            {**step, "status": "pending", "result": None, "review": None, "attempts": []}
             for step in _commissioning_steps()
         ],
+        "commissioning_enabled": True,
     }
     with _commissioning_lock:
         _commissioning_state = report
@@ -558,13 +613,16 @@ def run_commissioning_step(step_index: int) -> dict:
         if report.get("status") != "in_progress" or report.get("current_step") != step_index:
             raise DuetControllerError("Only the current pending commissioning step can be run.")
         step = report["steps"][step_index]
-        if step.get("status") != "pending":
-            raise DuetControllerError("The current commissioning step has already been run.")
+        if step.get("status") not in {"pending", "awaiting_review"}:
+            raise DuetControllerError("Only a pending step or an unreviewed step can be run again.")
+        is_retry = step.get("status") == "awaiting_review"
+        attempt_number = len(step.get("attempts", [])) + 1
         step["status"] = "running"
         report["updated_at"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
-        _write_commissioning_report(report, "step_started", {
+        _write_commissioning_report(report, "step_retry_started" if is_retry else "step_started", {
             "step_index": step_index,
             "step_id": step["id"],
+            "attempt": attempt_number,
             "code": step["code"],
         })
 
@@ -586,27 +644,39 @@ def run_commissioning_step(step_index: int) -> dict:
             stopped_status = _stop_gateway_command()
             test_result = {
                 "status": "completed",
-                "motion_active_after_stop": stopped_status.get("motion_active") is True,
+                "motion_active_after_stop": stopped_status.get("motion_active"),
                 "measured_joints": stopped_status.get("measured_joints"),
             }
         else:
             test_result = execute_program(step["code"], commissioning=True)
-            if test_result.get("status") != "completed":
+            expected_status = "stopped" if step["category"] == "program_stop" else "completed"
+            if test_result.get("status") != expected_status:
                 raise DuetControllerError("Commissioning test command did not complete normally.")
         with _commissioning_lock:
             report = _commissioning_state
             step = report["steps"][step_index]
+            feedback = test_result.get("armTelemetry", [])
+            if step["category"] in {"pose", "arm_command", "legacy_gesture", "concurrent", "arm_reset"} and not feedback:
+                raise DuetControllerError(
+                    "The controller returned no measured arm feedback for this arm test."
+                )
             step["status"] = "awaiting_review"
             step["result"] = test_result
-            feedback = test_result.get("armTelemetry", [])
             step["feedback_within_tolerance"] = all(
                 item.get("maximumErrorRad", float("inf")) <= 0.25
                 for item in feedback
             )
+            step.setdefault("attempts", []).append({
+                "attempt": attempt_number,
+                "result": test_result,
+                "feedback_within_tolerance": step["feedback_within_tolerance"],
+                "completed_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+            })
             report["updated_at"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
             _write_commissioning_report(report, "step_completed", {
                 "step_index": step_index,
                 "step_id": step["id"],
+                "attempt": attempt_number,
                 "result": test_result,
                 "feedback_within_tolerance": step["feedback_within_tolerance"],
             })
@@ -652,6 +722,7 @@ def review_commissioning_step(
     passed: bool,
     observed: bool,
     teacher: str,
+    observed_result: str,
     notes: str = "",
 ) -> dict:
     global _commissioning_state
@@ -661,6 +732,8 @@ def review_commissioning_step(
         raise DuetControllerError("Commissioning review requires explicit pass/fail and physical-observation answers.")
     if not isinstance(teacher, str) or not teacher.strip():
         raise DuetControllerError("A signed-in teacher identity is required to review commissioning.")
+    if not isinstance(observed_result, str) or not observed_result.strip() or len(observed_result) > 1000:
+        raise DuetControllerError("A physical observed result of 1–1000 characters is required.")
     if not isinstance(notes, str) or len(notes) > 1000:
         raise DuetControllerError("Commissioning review notes must be no more than 1000 characters.")
     if passed and not observed:
@@ -687,6 +760,7 @@ def review_commissioning_step(
         step["review"] = {
             "passed": passed,
             "physical_result_observed": observed,
+            "observed_result": observed_result.strip(),
             "notes": notes.strip(),
             "teacher": teacher.strip()[:120],
             "reviewed_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
@@ -708,6 +782,7 @@ def review_commissioning_step(
             "step_id": step["id"],
             "passed": passed,
             "physical_result_observed": observed,
+            "observed_result": observed_result.strip(),
             "teacher": teacher.strip()[:120],
             "notes": notes.strip(),
             "acceptance_id": report.get("acceptance_id"),
@@ -1605,6 +1680,12 @@ def execute_program(code: str, *, commissioning: bool = False) -> dict:
                 "target": target,
                 "measured": measured,
                 "maximumErrorRad": max_error,
+                "leftMaximumErrorRad": max(
+                    abs(float(actual) - expected) for actual, expected in zip(measured[:5], target[:5])
+                ),
+                "rightMaximumErrorRad": max(
+                    abs(float(actual) - expected) for actual, expected in zip(measured[5:], target[5:])
+                ),
             })
 
         def reset_arms() -> dict:
@@ -1924,6 +2005,12 @@ def execute_program(code: str, *, commissioning: bool = False) -> dict:
                         "measured": measured,
                         "maximumErrorRad": max(
                             abs(float(actual) - expected) for actual, expected in zip(measured, target)
+                        ),
+                        "leftMaximumErrorRad": max(
+                            abs(float(actual) - expected) for actual, expected in zip(measured[:5], target[:5])
+                        ),
+                        "rightMaximumErrorRad": max(
+                            abs(float(actual) - expected) for actual, expected in zip(measured[5:], target[5:])
                         ),
                     })
                 active_arm_command = None

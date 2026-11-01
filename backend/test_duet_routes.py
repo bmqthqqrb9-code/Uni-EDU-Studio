@@ -41,12 +41,14 @@ class DuetRouteTests(unittest.TestCase):
     def test_duet_commissioning_routes_are_teacher_only(self):
         requests = (
             ("get", "/api/duet/commissioning", None),
+            ("get", "/api/duet/commissioning/evidence", None),
             ("post", "/api/duet/commissioning/start", None),
             ("post", "/api/duet/commissioning/step", {"step_index": 0}),
             ("post", "/api/duet/commissioning/review", {
                 "step_index": 0,
                 "passed": True,
                 "observed": True,
+                "observed_result": "Observed the expected bounded response.",
                 "notes": "",
             }),
             ("post", "/api/duet/commissioning/abort", None),
@@ -81,15 +83,41 @@ class DuetRouteTests(unittest.TestCase):
             reviewed = self.client.post(
                     "/api/duet/commissioning/review",
                     headers=self.teacher,
-                    json={"step_index": 0, "passed": True, "observed": True, "notes": "clear"},
+                    json={
+                        "step_index": 0,
+                        "passed": True,
+                        "observed": True,
+                        "observed_result": "Observed the expected bounded response.",
+                        "notes": "clear",
+                    },
             )
             aborted = self.client.post("/api/duet/commissioning/abort", headers=self.teacher)
 
         self.assertEqual([started.status_code, stepped.status_code, reviewed.status_code, aborted.status_code], [200] * 4)
         start.assert_called_once_with("teacher")
         run_step.assert_called_once_with(0)
-        review.assert_called_once_with(0, True, True, "teacher", "clear")
+        review.assert_called_once_with(
+            0,
+            True,
+            True,
+            "teacher",
+            "Observed the expected bounded response.",
+            notes="clear",
+        )
         abort.assert_called_once_with("teacher")
+
+    def test_teacher_can_fetch_full_commissioning_evidence(self):
+        evidence = {
+            "report": {"status": "passed"},
+            "events": [{"event": "started"}],
+            "event_log": '{"event":"started"}\n',
+        }
+        with patch.object(server, "duet_commissioning_evidence", return_value=evidence) as get_evidence:
+            response = self.client.get("/api/duet/commissioning/evidence", headers=self.teacher)
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json(), evidence)
+        get_evidence.assert_called_once_with()
 
     def test_duet_run_rejects_legacy_commands_before_gateway_access(self):
         with patch.object(server, "active_navigation_operation", return_value=None), patch.object(
@@ -107,6 +135,83 @@ class DuetRouteTests(unittest.TestCase):
         for response in responses:
             self.assertEqual(response.status_code, 400)
             self.assertIn("duet", response.json()["detail"].lower())
+
+    def test_duet_saved_motion_library_is_teacher_only_and_resolves_named_calls(self):
+        forbidden = self.client.get("/api/duet/motions", headers=self.student)
+        self.assertEqual(forbidden.status_code, 403)
+        forbidden_save = self.client.post(
+            "/api/duet/motions",
+            headers=self.student,
+            json={"name": "Student motion", "code": 'duet.arm_carry(1.5)'},
+        )
+        self.assertEqual(forbidden_save.status_code, 403)
+
+        saved = self.client.post(
+            "/api/duet/motions",
+            headers=self.teacher,
+            json={"name": "Welcome wave", "code": 'duet.wave_left("mid", 1)'},
+        )
+        self.assertEqual(saved.status_code, 200)
+        motion = saved.json()["motion"]
+        self.assertEqual(motion["name"], "Welcome wave")
+        self.assertRegex(motion["id"], r"^welcome_wave_[a-f0-9]{8}$")
+        listed = self.client.get("/api/duet/motions", headers=self.teacher)
+        self.assertEqual([entry["id"] for entry in listed.json()["motions"]], [motion["id"]])
+
+        resolved = server.expand_duet_motion_calls(
+            f'duet.saved_motion("{motion["id"]}")',
+            "teacher",
+        )
+        self.assertEqual(resolved, "duet.wave_left('mid', 1)")
+        with self.assertRaises(server.DuetProgramValidationError):
+            server.expand_duet_motion_calls(
+                f'duet.saved_motion("{motion["id"]}")',
+                "student1",
+            )
+
+    def test_duet_saved_motion_storage_rejects_unsafe_or_duplicate_definitions(self):
+        invalid = self.client.post(
+            "/api/duet/motions",
+            headers=self.teacher,
+            json={"name": "Unsafe", "code": "__import__('os').system('true')"},
+        )
+        self.assertEqual(invalid.status_code, 400)
+        self.assertIn("duet", invalid.json()["detail"].lower())
+
+        first = self.client.post(
+            "/api/duet/motions",
+            headers=self.teacher,
+            json={"name": "Carry", "code": "duet.arm_carry(1.5)"},
+        )
+        duplicate = self.client.post(
+            "/api/duet/motions",
+            headers=self.teacher,
+            json={"name": " carry ", "code": "duet.arm_carry(1.5)"},
+        )
+        self.assertEqual(first.status_code, 200)
+        self.assertEqual(duplicate.status_code, 409)
+
+    def test_duet_run_expands_saved_motion_before_controller_execution(self):
+        saved = self.client.post(
+            "/api/duet/motions",
+            headers=self.teacher,
+            json={"name": "Safe wave", "code": 'duet.wave_left("mid", 1)'},
+        ).json()["motion"]
+        expected = {"status": "completed", "commandsExecuted": 1}
+        with patch.object(server, "active_navigation_operation", return_value=None), patch.object(
+            server, "active_lidar_scan", return_value=None
+        ), patch.object(
+            server, "robot_status", return_value={"running": False}
+        ), patch.object(server, "execute_duet_program", return_value=expected) as execute:
+            response = self.client.post(
+                "/api/duet/run",
+                headers=self.teacher,
+                json={"code": f'duet.saved_motion("{saved["id"]}")'},
+            )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json(), expected)
+        execute.assert_called_once_with("duet.wave_left('mid', 1)")
 
     def test_duet_connect_reports_missing_gateway_and_does_not_use_sdk(self):
         with patch.dict(os.environ, {
