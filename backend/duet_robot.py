@@ -148,7 +148,7 @@ DUET_ARM_COMMANDS = {
     },
 }
 DUET_ARM_GESTURES = {
-    f"gesture_{name.removeprefix('legacy_')}": tuple(
+    f"gesture_{name[len('legacy_'):] if name.startswith('legacy_') else name}": tuple(
         {"pose": pose, "target": _resolve_arm_pose_target(pose)}
         for pose in definition["poses"]
     )
@@ -439,7 +439,7 @@ def _commissioning_steps() -> list[dict]:
     steps.extend(
         {
             "id": f"gesture-{name}",
-            "title": f"Legacy gesture: {name.removeprefix('gesture_').replace('_', ' ')}",
+            "title": f"Legacy gesture: {(name[len('gesture_'):] if name.startswith('gesture_') else name).replace('_', ' ')}",
             "category": "legacy_gesture",
             "code": f"duet.{name}(2.5)",
             "expected": "Each mirrored DUET target is issued in order with measured feedback, then arms return to carry.",

@@ -165,10 +165,27 @@ elif [[ -f "$LIDAR_ENV_FILE" ]]; then
 fi
 systemctl --user enable uni-edu-studio.service
 systemctl --user restart uni-edu-studio.service
+APP_READY=0
+for attempt in {1..15}; do
+  if "$PYTHON" -c \
+    'from urllib.request import ProxyHandler, build_opener; build_opener(ProxyHandler({})).open("http://127.0.0.1:5179/", timeout=1).read(1)' \
+    >/dev/null 2>&1; then
+    APP_READY=1
+    break
+  fi
+  sleep 1
+done
+if [[ "$APP_READY" != "1" ]]; then
+  echo "Uni EDU Studio did not serve its frontend on http://127.0.0.1:5179 after restart." >&2
+  echo "Service status and recent logs:" >&2
+  systemctl --user --no-pager -l status uni-edu-studio.service >&2 || true
+  journalctl --user -u uni-edu-studio.service -n 40 --no-pager >&2 || true
+  exit 1
+fi
 sudo loginctl enable-linger "$USER"
 
 echo
-echo "Uni EDU Studio is enabled and will start automatically at boot."
+echo "Uni EDU Studio is serving its frontend and will start automatically at boot."
 echo "Open http://<this-computer-wifi-ip>:5179 on a device connected to the same Wi-Fi."
 echo "Check service status with: systemctl --user status uni-edu-studio"
 if [[ "$LIDAR_CONFIGURED" != "1" && "$LIDAR_PREVIOUSLY_INSTALLED" != "1" ]]; then

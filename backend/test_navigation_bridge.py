@@ -106,7 +106,8 @@ class NavigationBridgeTests(unittest.TestCase):
         }
 
         def get(url, **kwargs):
-            path = url.removeprefix("http://127.0.0.1:8282")
+            bridge_prefix = "http://127.0.0.1:8282"
+            path = url[len(bridge_prefix):] if url.startswith(bridge_prefix) else url
             return SimpleNamespace(status_code=200, json=lambda: payloads[path])
 
         return patch.object(navigation_bridge.httpx, "get", side_effect=get)

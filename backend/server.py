@@ -3383,7 +3383,7 @@ async def lidar_live_updates(websocket: WebSocket):
         ),
         None,
     )
-    token = protocol.removeprefix("edu-auth.") if protocol else None
+    token = protocol[len("edu-auth."):] if protocol else None
     user = get_user_from_token(token)
     if not user:
         await websocket.close(code=1008, reason="Authenticated classroom session required.")
