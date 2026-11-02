@@ -92,12 +92,12 @@ export const G1_MOTION_TEMPLATES = [
   {
     id: 'sidestep-left',
     label: 'Sidestep left',
-    code: `robot.sidestep("left")\n`,
+    code: `robot.sidestep("left", 1)\n`,
   },
   {
     id: 'sidestep-right',
     label: 'Sidestep right',
-    code: `robot.sidestep("right")\n`,
+    code: `robot.sidestep("right", 1)\n`,
   },
   {
     id: 'turn-left-90',
@@ -627,9 +627,11 @@ export function buildLegacyG1SimulationFrames(pythonCode, options = {}) {
 
     if (methodName === 'sidestep') {
       const side = /["']right["']/i.test(argsRaw) ? -90 : 90;
+      const stepCountMatch = argsRaw.match(/,\s*(\d+)/);
+      const stepCount = stepCountMatch ? Number(stepCountMatch[1]) : 1;
       const previousHeading = heading;
       heading += side;
-      walkThrough(0.4, 1, 'Sidestep', side > 0 ? 'Left' : 'Right', 2);
+      walkThrough(0.4 * stepCount, 1, 'Sidestep', `${side > 0 ? 'Left' : 'Right'} • ${stepCount} ${stepCount === 1 ? 'step' : 'steps'}`, 2 * stepCount);
       heading = previousHeading;
     }
 
@@ -882,7 +884,10 @@ export function buildLegacyG1SimulationFrames(pythonCode, options = {}) {
       }
       let selectedThen;
       let summary;
-      if (node.variable) {
+      if (typeof node.value === 'boolean') {
+        selectedThen = node.value;
+        summary = `${node.code} → ${selectedThen ? 'then' : 'else'}`;
+      } else if (node.variable) {
         if (!booleanVariables.has(node.variable)) {
           throw new Error(`Boolean variable '${node.variable}' was not assigned before simulation.`);
         }
@@ -903,7 +908,9 @@ export function buildLegacyG1SimulationFrames(pythonCode, options = {}) {
         const side = sector === 'rear' ? 'rear' : 'forward';
         summary = `Nearest ${side} obstacle: ${distance.toFixed(2)} m ${node.operator} ${node.threshold} m → ${selectedThen ? 'then' : 'else'}`;
       }
-      const label = node.variable ? 'Boolean condition' : 'Distance condition';
+      const label = node.variable || typeof node.value === 'boolean'
+        ? 'Boolean condition'
+        : 'Distance condition';
       actions.push({ label, summary });
       timeline.push({ label, summary });
       addFrame();

@@ -255,6 +255,10 @@ class SharedLidarSettingsRequest(BaseModel):
     show_shared_overlay: bool
 
 
+class SidebarSettingsRequest(BaseModel):
+    locked_panels: List[Literal["planner", "prompt", "camera"]]
+
+
 class SensorServiceRequest(BaseModel):
     sensor_id: Literal["lidar_driver", "lidar_provider"]
     operation: Literal["start", "stop", "restart", "repair"]
@@ -888,6 +892,15 @@ def init_db():
         """
     )
     conn.execute("INSERT OR IGNORE INTO planner_settings (id, active_mode) VALUES (1, 'manual')")
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS teacher_sidebar_settings (
+            username TEXT PRIMARY KEY,
+            locked_panels TEXT NOT NULL DEFAULT '[]',
+            updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+        )
+        """
+    )
     conn.execute(
         """
         CREATE TABLE IF NOT EXISTS lidar_scans (
@@ -3313,6 +3326,52 @@ def update_planner_settings(
     conn.commit()
     conn.close()
     return {"active_mode": request.active_mode}
+
+
+@app.get("/api/classroom/sidebar-settings")
+def get_teacher_sidebar_settings(user: dict = Depends(auth_required)):
+    if user["role"] != "teacher":
+        raise HTTPException(status_code=403, detail="Teacher role required")
+    conn = get_db_connection()
+    row = conn.execute(
+        "SELECT locked_panels FROM teacher_sidebar_settings WHERE username = ?",
+        (user["username"],),
+    ).fetchone()
+    conn.close()
+    if row is None:
+        return {"locked_panels": [], "configured": False}
+    try:
+        locked_panels = json.loads(row["locked_panels"])
+    except (TypeError, json.JSONDecodeError) as error:
+        raise HTTPException(status_code=503, detail="Teacher sidebar settings are invalid.") from error
+    valid_panels = {"planner", "prompt", "camera"}
+    if not isinstance(locked_panels, list) or any(panel not in valid_panels for panel in locked_panels):
+        raise HTTPException(status_code=503, detail="Teacher sidebar settings are invalid.")
+    return {"locked_panels": locked_panels, "configured": True}
+
+
+@app.put("/api/classroom/sidebar-settings")
+def update_teacher_sidebar_settings(
+    request: SidebarSettingsRequest,
+    user: dict = Depends(auth_required),
+):
+    if user["role"] != "teacher":
+        raise HTTPException(status_code=403, detail="Teacher role required")
+    locked_panels = list(dict.fromkeys(request.locked_panels))
+    conn = get_db_connection()
+    conn.execute(
+        """
+        INSERT INTO teacher_sidebar_settings (username, locked_panels, updated_at)
+        VALUES (?, ?, CURRENT_TIMESTAMP)
+        ON CONFLICT(username) DO UPDATE SET
+            locked_panels = excluded.locked_panels,
+            updated_at = CURRENT_TIMESTAMP
+        """,
+        (user["username"], json.dumps(locked_panels)),
+    )
+    conn.commit()
+    conn.close()
+    return {"locked_panels": locked_panels, "configured": True}
 
 
 @app.websocket("/api/lidar/live")

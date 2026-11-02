@@ -126,6 +126,7 @@ test('teacher can create and delete student accounts from the classroom panel', 
 });
 
 test('teacher can hide locked sidebar panels and restore them from settings', async ({ page }) => {
+  test.setTimeout(60000);
   await page.addInitScript(() => {
     localStorage.setItem('edu-classroom-session', JSON.stringify({
       token: 'teacher-sidebar-panels-token',
@@ -133,6 +134,19 @@ test('teacher can hide locked sidebar panels and restore them from settings', as
     }));
   });
   await page.route('**/api/**', async (route) => {
+    const url = new URL(route.request().url());
+    if (url.pathname === '/api/classroom/sidebar-settings') {
+      if (route.request().method() === 'PUT') {
+        lockedPanels = route.request().postDataJSON().locked_panels;
+        sidebarSettingsConfigured = true;
+      }
+      await route.fulfill({
+        status: 200,
+        contentType: 'application/json',
+        body: JSON.stringify({ locked_panels: lockedPanels, configured: sidebarSettingsConfigured }),
+      });
+      return;
+    }
     await route.fulfill({
       status: 200,
       contentType: 'application/json',
@@ -140,13 +154,15 @@ test('teacher can hide locked sidebar panels and restore them from settings', as
     });
   });
 
+  let lockedPanels = [];
+  let sidebarSettingsConfigured = false;
   await page.goto('/');
   await expect(page.locator('canvas')).toBeVisible();
   await page.getByRole('button', { name: 'Open app settings' }).click();
   for (const panelName of ['Path Planner', 'Prompt to Motion', 'Vision to Motion']) {
-    await page.getByRole('checkbox', { name: `Lock ${panelName} open in sidebar` }).check();
+    await page.getByRole('checkbox', { name: `Hide ${panelName} tab from sidebar` }).check();
   }
-  await page.getByRole('checkbox', { name: 'Lock Prompt to Motion open in sidebar' }).uncheck();
+  await page.getByRole('checkbox', { name: 'Hide Prompt to Motion tab from sidebar' }).uncheck();
   await page.getByRole('button', { name: 'Close', exact: true }).click();
 
   for (const panelId of ['planner', 'camera']) {
@@ -170,6 +186,12 @@ test('teacher can hide locked sidebar panels and restore them from settings', as
   expect(await page.evaluate(() => (
     localStorage.getItem('edu-locked-sidebar-panels:teacher-sidebar-panels-test')
   ))).toBe(JSON.stringify(['planner', 'camera']));
+
+  await page.evaluate(() => localStorage.removeItem('edu-locked-sidebar-panels:teacher-sidebar-panels-test'));
+  await page.reload({ waitUntil: 'domcontentloaded' });
+  await expect(page.getByRole('button', { name: 'Path Planner', exact: true })).toHaveCount(0);
+  await expect(page.getByRole('button', { name: 'Vision to Motion', exact: true })).toHaveCount(0);
+  await expect(page.getByRole('button', { name: 'Prompt to Motion', exact: true })).toBeVisible();
 });
 
 test('teacher queue review overlays the workspace and shows the complete submitted project', async ({ page }) => {
@@ -1106,6 +1128,67 @@ test('distance if/then/else programs round-trip between IDE text and Blockly', a
   await expect(page.locator('textarea').first()).toHaveValue(
     'if robot.front_distance_m() < 1:\n    robot.walk(2)\nelse:\n    robot.turn("left", 90)',
   );
+});
+
+test('left and right sidestep counts round-trip between IDE and Blockly', async ({ page }) => {
+  await page.addInitScript(() => {
+    localStorage.setItem('edu-classroom-session', JSON.stringify({
+      token: 'test-token',
+      user: { role: 'student', username: 'student-sidestep-count-test' },
+    }));
+  });
+  await page.route('**/api/**', async (route) => {
+    await route.fulfill({
+      status: 200,
+      contentType: 'application/json',
+      body: JSON.stringify({}),
+    });
+  });
+  const code = 'robot.sidestep("left", 3)\nrobot.sidestep("right", 2)';
+
+  await page.goto('/');
+  await expect(page.locator('canvas')).toBeVisible();
+  await page.getByRole('button', { name: 'IDE', exact: true }).click();
+  await page.locator('textarea').first().fill(code);
+  await page.getByRole('button', { name: 'Blocks', exact: true }).click();
+  await expect.poll(() => page.evaluate(() => (
+    window.Blockly.getMainWorkspace().getAllBlocks()
+      .filter((block) => block.type === 'g1_command_sidestep')
+      .map((block) => [block.getFieldValue('DIRECTION'), block.getFieldValue('STEPS')])
+  ))).toEqual([['left', 3], ['right', 2]]);
+  await page.getByRole('button', { name: 'IDE', exact: true }).click();
+  await expect(page.locator('textarea').first()).toHaveValue(code);
+});
+
+test('condition toolbox provides True and False blocks without a Variables category', async ({ page }) => {
+  await page.addInitScript(() => {
+    localStorage.setItem('edu-classroom-session', JSON.stringify({
+      token: 'test-token',
+      user: { role: 'student', username: 'student-boolean-toolbox-test' },
+    }));
+  });
+  await page.route('**/api/**', async (route) => {
+    await route.fulfill({
+      status: 200,
+      contentType: 'application/json',
+      body: JSON.stringify({}),
+    });
+  });
+
+  await page.goto('/');
+  await expect(page.locator('canvas')).toBeVisible();
+  await page.getByRole('button', { name: 'Blocks', exact: true }).click();
+  const toolboxCategories = await page.getByRole('treeitem').allTextContents();
+  expect(toolboxCategories).toContain('Conditions');
+  expect(toolboxCategories).not.toContain('Variables');
+
+  await page.getByRole('treeitem', { name: 'Conditions' }).click();
+  await expect.poll(() => page.evaluate(() => (
+    window.Blockly.getMainWorkspace().getFlyout().getWorkspace().getAllBlocks()
+      .filter((block) => block.type === 'logic_boolean')
+      .map((block) => block.getFieldValue('BOOL'))
+      .sort()
+  ))).toEqual(['FALSE', 'TRUE']);
 });
 
 test('Boolean variable if/then/else programs round-trip between IDE text and Blockly', async ({ page }) => {

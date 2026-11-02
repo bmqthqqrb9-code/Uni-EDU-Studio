@@ -16,6 +16,45 @@ app = server.app
 
 
 class ServerClassroomTests(unittest.TestCase):
+    def test_sidebar_settings_are_saved_per_teacher_account(self):
+        client = TestClient(app)
+        with tempfile.TemporaryDirectory() as temp_dir, patch.object(
+            server, "DB_PATH", os.path.join(temp_dir, "classroom.db")
+        ):
+            server.init_db()
+            teacher = client.post(
+                "/api/classroom/login",
+                json={"username": "teacher", "password": "teacher"},
+            ).json()
+            student = client.post(
+                "/api/classroom/login",
+                json={"username": "student1", "password": "student1"},
+            ).json()
+            teacher_headers = {"Authorization": f"Bearer {teacher['token']}"}
+            student_headers = {"Authorization": f"Bearer {student['token']}"}
+
+            initial = client.get("/api/classroom/sidebar-settings", headers=teacher_headers)
+            saved = client.put(
+                "/api/classroom/sidebar-settings",
+                headers=teacher_headers,
+                json={"locked_panels": ["planner", "camera", "planner"]},
+            )
+            restored = client.get("/api/classroom/sidebar-settings", headers=teacher_headers)
+            student_denied = client.get("/api/classroom/sidebar-settings", headers=student_headers)
+            invalid = client.put(
+                "/api/classroom/sidebar-settings",
+                headers=teacher_headers,
+                json={"locked_panels": ["settings"]},
+            )
+
+        self.assertEqual(initial.status_code, 200)
+        self.assertEqual(initial.json(), {"locked_panels": [], "configured": False})
+        self.assertEqual(saved.status_code, 200)
+        self.assertEqual(saved.json(), {"locked_panels": ["planner", "camera"], "configured": True})
+        self.assertEqual(restored.json(), saved.json())
+        self.assertEqual(student_denied.status_code, 403)
+        self.assertEqual(invalid.status_code, 422)
+
     def test_planner_mode_setting_is_teacher_controlled_and_shared(self):
         with tempfile.TemporaryDirectory() as temp_dir, patch.object(
             server, "DB_PATH", os.path.join(temp_dir, "classroom.db")

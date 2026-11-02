@@ -139,6 +139,27 @@ test('G1 program parser normalizes commands, clamps numbers, and expands loops',
   assert.equal(flattenG1Commands(nodes).length, 3);
 });
 
+test('sidestep Blockly block and IDE command support a bounded step count', () => {
+  const command = G1_COMMANDS.find((entry) => entry.method === 'sidestep');
+  const [block] = getG1BlocklyCommandBlocks([command]);
+  assert.equal(block.message0, 'Sidestep %1 for %2 steps');
+  assert.equal(block.codeTemplate, 'robot.sidestep("{{DIRECTION}}", {{STEPS}})\n');
+  assert.deepEqual(
+    [block.args0[1].value, block.args0[1].min, block.args0[1].max, block.args0[1].precision],
+    [1, 1, 10, 1],
+  );
+
+  for (const direction of ['left', 'right']) {
+    const code = `robot.sidestep("${direction}", 3)`;
+    const [node] = parseG1Program(code);
+    assert.deepEqual(node.values, [direction, 3]);
+    assert.equal(node.code, code);
+    assert.equal(formatG1Program([node]), code);
+  }
+  assert.deepEqual(parseG1Program('robot.sidestep("left")')[0].values, ['left', 1]);
+  assert.throws(() => parseG1Program('robot.sidestep("right", 1.5)'), /integer/);
+});
+
 test('wait command is bounded, included in the IDE catalog, and previews its full duration', () => {
   const waitCommand = G1_COMMANDS.find((command) => command.method === 'wait');
   const [waitBlock] = getG1BlocklyCommandBlocks([waitCommand]);
@@ -292,6 +313,44 @@ test('Blockly Boolean variables generate literal assignments and branching condi
   } finally {
     workspace.dispose();
   }
+});
+
+test('Blockly True and False conditions generate Python and select the matching simulation branch', () => {
+  const workspace = new Blockly.Workspace();
+  try {
+    const condition = workspace.newBlock('controls_if');
+    const value = workspace.newBlock('logic_boolean');
+    value.setFieldValue('TRUE', 'BOOL');
+    condition.getInput('IF0').connection.connect(value.outputConnection);
+    const generated = pythonGenerator.workspaceToCode(workspace);
+    assert.match(generated, /if True\s*:/);
+  } finally {
+    workspace.dispose();
+  }
+
+  const trueCode = 'if True:\n'
+    + '    robot.walk(1)\n'
+    + 'else:\n'
+    + '    robot.turn("left", 90)';
+  const [trueCondition] = parseG1Program(trueCode);
+  assert.equal(trueCondition.value, true);
+  assert.equal(formatG1Program([trueCondition]), trueCode);
+  assert.ok(buildG1SimulationFrames(trueCode).at(-1).x > 0.3);
+
+  const falseCode = trueCode.replace('True', 'False');
+  const [falseCondition] = parseG1Program(falseCode);
+  assert.equal(falseCondition.value, false);
+  assert.equal(formatG1Program([falseCondition]), falseCode);
+  assert.equal(buildG1SimulationFrames(falseCode).at(-1).heading, 90);
+});
+
+test('simulator applies the selected number of left and right sidesteps', () => {
+  const left = buildG1SimulationFrames('robot.sidestep("left", 3)').at(-1);
+  const right = buildG1SimulationFrames('robot.sidestep("right", 2)').at(-1);
+  assert.ok(Math.abs(left.y - 1.2) < 1e-9);
+  assert.ok(Math.abs(left.time - 6) < 1e-9);
+  assert.ok(Math.abs(right.y + 0.8) < 1e-9);
+  assert.ok(Math.abs(right.time - 4) < 1e-9);
 });
 
 test('simulator selects the near-obstacle branch from the forward sector', () => {

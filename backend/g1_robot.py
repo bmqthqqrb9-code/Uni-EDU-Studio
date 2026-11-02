@@ -199,9 +199,13 @@ def _validate_call(node: ast.AST) -> dict[str, Any]:
         result["degrees"] = _number(args[1], "degrees", 5, 180) if len(args) == 2 else 90
         return result
     if method == "sidestep":
-        if len(args) != 1:
-            raise CommandValidationError('robot.sidestep() expects "left" or "right".')
-        return {"method": method, "direction": _choice(args[0], "direction", ("left", "right"))}
+        if len(args) not in {1, 2}:
+            raise CommandValidationError('robot.sidestep() expects a direction and optional step count, e.g. robot.sidestep("left", 2).')
+        return {
+            "method": method,
+            "direction": _choice(args[0], "direction", ("left", "right")),
+            "steps": _integer(args[1], "steps", 1, 10) if len(args) == 2 else 1,
+        }
     if method in {"getfsm", "getactions", "getvolume"}:
         if args:
             raise CommandValidationError(f"robot.{method}() takes no arguments.")
@@ -469,7 +473,7 @@ def _estimated_duration(command: dict[str, Any]) -> float:
     if method == "turn":
         return math.radians(command["degrees"]) / _TURN_RADIANS_PER_SECOND
     if method == "sidestep":
-        return _STEP_METERS / 0.2
+        return command["steps"] * _STEP_METERS / 0.2
     speed = 0.2 if method.startswith("slow") else 0.8 if method.startswith("fast") else _FORWARD_METERS_PER_SECOND
     if method.endswith("time"):
         return command["seconds"]
@@ -747,7 +751,7 @@ def execute_robot_program(
                 elif method == "sidestep":
                     lateral_speed = 0.2 * (1 if command["direction"] == "left" else -1)
                     _require_locomotion_ready()
-                    _move(0, lateral_speed, 0, _STEP_METERS / abs(lateral_speed))
+                    _move(0, lateral_speed, 0, command["steps"] * _STEP_METERS / abs(lateral_speed))
                 else:
                     speed = 0.2 if method.startswith("slow") else 0.8 if method.startswith("fast") else _FORWARD_METERS_PER_SECOND
                     if method in {"backward", "backwardtime"}:

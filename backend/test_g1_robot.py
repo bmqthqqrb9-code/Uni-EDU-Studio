@@ -641,6 +641,40 @@ class G1RobotProgramTests(unittest.TestCase):
                 self.assertAlmostEqual(g1_robot._STEP_METERS, 0.345)
                 self.assertAlmostEqual(g1_robot._estimated_duration(command), duration)
 
+    def test_sidestep_accepts_bounded_step_count_and_dispatches_matching_duration(self):
+        for direction in ("left", "right"):
+            with self.subTest(direction=direction):
+                command = parse_robot_program(f'robot.sidestep("{direction}", 3)')[0]
+                self.assertEqual(command["direction"], direction)
+                self.assertEqual(command["steps"], 3)
+                self.assertAlmostEqual(
+                    g1_robot._estimated_duration(command),
+                    3 * g1_robot._STEP_METERS / 0.2,
+                )
+
+        self.assertEqual(parse_robot_program('robot.sidestep("left")')[0]["steps"], 1)
+        self.assertEqual(parse_robot_program('robot.sidestep("left", 0)')[0]["steps"], 1)
+        self.assertEqual(parse_robot_program('robot.sidestep("right", 11)')[0]["steps"], 10)
+        for code in ('robot.sidestep("left", 1.5)',):
+            with self.subTest(code=code), self.assertRaises(CommandValidationError):
+                parse_robot_program(code)
+
+        class FakeLocoClient:
+            def GetFsmId(self):
+                return 0, 500
+
+        original_client = g1_robot._client
+        g1_robot._client = FakeLocoClient()
+        moves = []
+        try:
+            with patch.object(g1_robot, "_move", side_effect=lambda *args: moves.append(args)):
+                g1_robot.execute_robot_program('robot.sidestep("right", 3)')
+        finally:
+            g1_robot._client = original_client
+
+        self.assertEqual(moves[0][:3], (0, -0.2, 0))
+        self.assertAlmostEqual(moves[0][3], 3 * g1_robot._STEP_METERS / 0.2)
+
     def test_robot_program_dispatches_stand_to_the_sdk_ready_fsm(self):
         class FakeLocoClient:
             def __init__(self):

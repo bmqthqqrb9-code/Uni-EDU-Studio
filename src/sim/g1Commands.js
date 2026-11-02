@@ -147,7 +147,10 @@ const commandGroups = [
     command('walktime', 'Walk forward for', 'Walking', 'Walk forward for the selected time.', [seconds()]),
     command('backward', 'Walk backward', 'Walking', 'Walk backward the selected number of steps. Distance may vary.', [steps()]),
     command('backwardtime', 'Walk backward for', 'Walking', 'Walk backward for the selected time.', [seconds()]),
-    command('sidestep', 'Sidestep', 'Walking', 'Step sideways in the selected direction.', [direction()]),
+    command('sidestep', 'Sidestep %1 for %2 steps', 'Walking', 'Step sideways the selected number of steps in the chosen direction.', [
+      direction(),
+      integerArgument('STEPS', 'steps', 1, 1, 10),
+    ]),
     command('slowwalk', 'Slow walk', 'Walking', 'Walk forward slowly for the selected steps. Distance may vary.', [steps()]),
     command('slowwalktime', 'Slow walk for', 'Walking', 'Walk forward slowly for the selected time.', [seconds()]),
     command('fastwalk', 'Fast walk', 'Walking', 'Walk forward quickly for the selected steps. Distance may vary.', [steps()]),
@@ -303,6 +306,7 @@ function normalizeCommand(method, rawArgs) {
   const definition = COMMAND_BY_METHOD.get(method);
   if (!definition) throw new Error(`Unknown robot command: ${method}`);
   const args = splitArguments(rawArgs);
+  if (method === 'sidestep' && args.length === 1) args.push('1');
   if (method === 'turn' && args.length === 1) args.push('90');
   if (args.length !== definition.args.length) {
     throw new Error(`robot.${method} expects ${definition.args.length} argument${definition.args.length === 1 ? '' : 's'}.`);
@@ -366,6 +370,15 @@ function parseLines(lines, startIndex, indentLevel, depth, booleanVariables = ne
     }
 
     let condition = parseDistanceCondition(text, lineNumber);
+    const booleanLiteralCondition = !condition && text.match(/^if\s+(True|False)\s*:\s*$/);
+    if (booleanLiteralCondition) {
+      const value = booleanLiteralCondition[1] === 'True';
+      condition = {
+        type: 'condition',
+        value,
+        code: booleanLiteralCondition[1],
+      };
+    }
     const booleanCondition = !condition && text.match(/^if\s+([A-Za-z_]\w*)\s*:\s*$/);
     if (booleanCondition) {
       const variable = booleanCondition[1];
@@ -420,7 +433,7 @@ function parseLines(lines, startIndex, indentLevel, depth, booleanVariables = ne
     }
 
     const call = text.match(/^robot\.([A-Za-z]\w*)\((.*)\);?$/);
-    if (!call) throw new Error(`Unsupported statement on line ${lineNumber}. Use a robot command, bounded for/range loop, boolean variable assignment, or supported condition.`);
+    if (!call) throw new Error(`Unsupported statement on line ${lineNumber}. Use a robot command, bounded for/range loop, boolean condition, or supported sensor condition.`);
     nodes.push({ type: 'command', ...normalizeCommand(call[1], call[2]) });
     index += 1;
   }

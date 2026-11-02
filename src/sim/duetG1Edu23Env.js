@@ -210,21 +210,29 @@ export function simulateDuetG1Edu23Program(code, { obstacles = G1_EDU_23_ENV.def
       continue;
     }
     if (command.type === 'condition') {
-      const sector = command.sensor === 'rear_distance_m' ? 'rear' : 'forward';
-      const distance = closestObstacleDistance(state, obstacles, sector);
-      const operators = {
-        '<': (left, right) => left < right,
-        '<=': (left, right) => left <= right,
-        '>': (left, right) => left > right,
-        '>=': (left, right) => left >= right,
-        '==': (left, right) => left === right,
-        '!=': (left, right) => left !== right,
-      };
-      const selectedThen = operators[command.operator](distance, command.threshold);
-      actions.push({
-        label: 'Distance condition',
-        summary: `Nearest ${sector} obstacle: ${distance.toFixed(2)} m ${command.operator} ${command.threshold} m -> ${selectedThen ? 'then' : 'else'}`,
-      });
+      let selectedThen;
+      let summary;
+      let label;
+      if (typeof command.value === 'boolean') {
+        selectedThen = command.value;
+        summary = `${command.code} -> ${selectedThen ? 'then' : 'else'}`;
+        label = 'Boolean condition';
+      } else {
+        const sector = command.sensor === 'rear_distance_m' ? 'rear' : 'forward';
+        const distance = closestObstacleDistance(state, obstacles, sector);
+        const operators = {
+          '<': (left, right) => left < right,
+          '<=': (left, right) => left <= right,
+          '>': (left, right) => left > right,
+          '>=': (left, right) => left >= right,
+          '==': (left, right) => left === right,
+          '!=': (left, right) => left !== right,
+        };
+        selectedThen = operators[command.operator](distance, command.threshold);
+        summary = `Nearest ${sector} obstacle: ${distance.toFixed(2)} m ${command.operator} ${command.threshold} m -> ${selectedThen ? 'then' : 'else'}`;
+        label = 'Distance condition';
+      }
+      actions.push({ label, summary });
       timeline.push(actions[actions.length - 1]);
       elapsed.value += 1 / FRAME_RATE;
       appendFrame(frames, state, joints, actions, timeline, elapsed.value);

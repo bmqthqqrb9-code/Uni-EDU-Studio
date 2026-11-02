@@ -28,7 +28,7 @@ Simple commands are best for learning:
 - Stand / ready (selects normal locomotion-ready mode; it is not the squat-to-stand recovery action)
 - Squat to stand, lie to stand, and stand to squat
 - Walk forward or backward
-- Sidestep left or right
+- Sidestep left or right for 1–10 steps
 - Turn left or right
 - Slow or fast walk
 

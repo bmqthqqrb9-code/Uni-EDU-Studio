@@ -18,6 +18,19 @@ test('DUET simulator applies bounded base velocity to the path', () => {
   assert.equal(final.mode, 'duet-preview');
 });
 
+test('DUET simulator executes the matching literal Boolean branch', () => {
+  const trueFrames = simulateDuetG1Edu23Program(
+    'if True:\n    duet.forward(1)\nelse:\n    duet.turn_left(1)',
+  );
+  const falseFrames = simulateDuetG1Edu23Program(
+    'if False:\n    duet.forward(1)\nelse:\n    duet.turn_left(1)',
+  );
+
+  assert.ok(trueFrames.at(-1).x > 0);
+  assert.equal(falseFrames.at(-1).x, 0);
+  assert.ok(falseFrames.at(-1).heading > 0);
+});
+
 test('DUET simulator previews base movement and named arm pose over the same interval', () => {
   const frames = simulateDuetG1Edu23Program(
     'with duet.concurrent():\n'

@@ -441,9 +441,36 @@ function parseLines(lines, start, indent, depth) {
       });
       continue;
     }
+    const booleanCondition = line.text.match(/^if\s+(True|False)\s*:\s*$/);
+    if (booleanCondition) {
+      let bodyStart = lineIndexAfter(lines, index + 1);
+      if (bodyStart >= lines.length || lines[bodyStart].indent <= indent) {
+        throw new Error(`Boolean condition on line ${line.lineNumber} has no body.`);
+      }
+      const [then, next] = parseLines(lines, bodyStart, lines[bodyStart].indent, depth + 1);
+      if (!then.length) throw new Error(`Boolean condition on line ${line.lineNumber} has no body.`);
+      index = lineIndexAfter(lines, next);
+      let otherwise = [];
+      if (index < lines.length && lines[index].indent === indent && lines[index].text === 'else:') {
+        bodyStart = lineIndexAfter(lines, index + 1);
+        if (bodyStart >= lines.length || lines[bodyStart].indent <= indent) {
+          throw new Error(`Else branch on line ${lines[index].lineNumber} has no body.`);
+        }
+        [otherwise, index] = parseLines(lines, bodyStart, lines[bodyStart].indent, depth + 1);
+        if (!otherwise.length) throw new Error(`Else branch on line ${line.lineNumber} has no body.`);
+      }
+      nodes.push({
+        type: 'condition',
+        value: booleanCondition[1] === 'True',
+        code: booleanCondition[1],
+        then,
+        else: otherwise,
+      });
+      continue;
+    }
     if (/^if\b/.test(line.text)) {
       throw new Error(
-        `Unsupported condition on line ${line.lineNumber}. Compare duet.front_distance_m() or duet.rear_distance_m() with a numeric threshold.`,
+        `Unsupported condition on line ${line.lineNumber}. Use True, False, or compare duet.front_distance_m() or duet.rear_distance_m() with a numeric threshold.`,
       );
     }
 

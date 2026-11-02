@@ -98,6 +98,10 @@ test('turn and sidestep simulation timing match SDK velocity command estimates',
   const sidestepFrame = buildG1SimulationFrames('robot.sidestep("left")').at(-1);
   assert.ok(Math.abs(sidestepFrame.y - 0.4) < 1e-9);
   assert.ok(Math.abs(sidestepFrame.time - 2) < 1e-9);
+
+  const multiStepRight = buildG1SimulationFrames('robot.sidestep("right", 3)').at(-1);
+  assert.ok(Math.abs(multiStepRight.y + 1.2) < 1e-9);
+  assert.ok(Math.abs(multiStepRight.time - 6) < 1e-9);
 });
 
 test('planner motion normalization keeps forward segments forward and stable', () => {

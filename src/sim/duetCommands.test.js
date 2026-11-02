@@ -403,10 +403,20 @@ test('DUET distance conditions validate sensors, comparisons, thresholds, branch
   }
 });
 
+test('DUET parser accepts literal Boolean conditions and formats both branches', () => {
+  for (const value of ['True', 'False']) {
+    const code = `if ${value}:\n    duet.wait(0.1)\nelse:\n    duet.stop()`;
+    const [condition] = parseDuetProgram(code);
+    assert.equal(condition.type, 'condition');
+    assert.equal(condition.value, value === 'True');
+    assert.equal(formatDuetProgram([condition]), code);
+  }
+});
+
 test('DUET parser rejects legacy commands and unsupported syntax', () => {
   assert.throws(() => parseDuetProgram('robot.walk(1)'), /Unsupported statement/);
   assert.throws(() => parseDuetProgram('duet.raw_joint(1)'), /Unknown DUET command/);
-  assert.throws(() => parseDuetProgram('if True:\n    duet.stop()'), /Unsupported condition/);
+  assert.throws(() => parseDuetProgram('if obstacle:\n    duet.stop()'), /Unsupported condition/);
   assert.throws(() => parseDuetProgram('duet.stop()\nduet.wait(1)'), /must be the final command/);
 });
 

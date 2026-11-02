@@ -58,9 +58,11 @@ export function compileMotionPrompt(prompt = '') {
       const method = timeBased ? 'backwardtime' : 'backward';
       addStep(steps, 'Walk backward', `robot.${method}(${movementAmount})`, timeBased ? `${duration} seconds` : `${distance} steps`);
     } else if (/\b(left|向左)\b.*\b(step|walk|走|移)\b/.test(normalized)) {
-      addStep(steps, 'Sidestep left', 'robot.sidestep("left")', 'one step');
+      const sideSteps = Math.round(clamp(findNumber(normalized, 1, /(?:left|向左)[^\d]*(\d+(?:\.\d+)?)/), 1, 10));
+      addStep(steps, 'Sidestep left', `robot.sidestep("left", ${sideSteps})`, `${sideSteps} ${sideSteps === 1 ? 'step' : 'steps'}`);
     } else if (/\b(right|向右)\b.*\b(step|walk|走|移)\b/.test(normalized)) {
-      addStep(steps, 'Sidestep right', 'robot.sidestep("right")', 'one step');
+      const sideSteps = Math.round(clamp(findNumber(normalized, 1, /(?:right|向右)[^\d]*(\d+(?:\.\d+)?)/), 1, 10));
+      addStep(steps, 'Sidestep right', `robot.sidestep("right", ${sideSteps})`, `${sideSteps} ${sideSteps === 1 ? 'step' : 'steps'}`);
     } else if (/\b(forward|ahead|straight|前进|向前|走)\b/.test(normalized)) {
       const method = speedMode ? `${speedMode}walk${timeBased ? 'time' : ''}` : timeBased ? 'walktime' : 'walk';
       addStep(steps, speedMode ? `${speedMode} walk` : 'Walk forward', `robot.${method}(${movementAmount})`, timeBased ? `${duration} seconds` : `${distance} steps`);

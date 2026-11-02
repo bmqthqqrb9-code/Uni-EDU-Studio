@@ -296,7 +296,7 @@ const UI_TEXT = {
     codeTitle: "PYTHON 预览", loading: "正在加载引擎资源...",
     aboutContent: "Uni++ EDU Studio 是一个专为 Unitree 机器人设计的图形化编程环境。",
     editorTitle: "编辑代码内容", editorSave: "保存并关闭",
-    toolbox: { functions: "图形化函数", logic: "逻辑", loops: "循环", math: "数学", text: "文本", variables: "变量" },
+    toolbox: { functions: "图形化函数", logic: "逻辑", loops: "循环", math: "数学", text: "文本" },
     confirmClear: "确定要新建项目吗？当前未保存的进度将会丢失。",
     btnRun: "运行", btnStop: "停止", statusRunning: "运行中..."
   },
@@ -313,7 +313,7 @@ const UI_TEXT = {
     codeTitle: "PYTHON PREVIEW", loading: "Loading Engine Resources...",
     aboutContent: "Uni++ EDU Studio is a graphical programming environment for Unitree Robots.",
     editorTitle: "Edit Code Content", editorSave: "Save & Close",
-    toolbox: { functions: "Functions", logic: "Logic", loops: "Loops", math: "Math", text: "Text", variables: "Variables" },
+    toolbox: { functions: "Functions", logic: "Logic", loops: "Loops", math: "Math", text: "Text" },
     confirmClear: "Are you sure you want to create a new project? Unsaved progress will be lost.",
     btnRun: "Run", btnStop: "Stop", statusRunning: "Running..."
   }
@@ -890,6 +890,8 @@ export default function App() {
       return [];
     }
   });
+  const [isSidebarSettingsLoading, setIsSidebarSettingsLoading] = useState(true);
+  const [isSidebarSettingsSaving, setIsSidebarSettingsSaving] = useState(false);
   const [lockedSidebarPanelsError, setLockedSidebarPanelsError] = useState('');
   useEffect(() => {
     const keepToolPanelInViewport = () => {
@@ -1122,42 +1124,6 @@ export default function App() {
   const unlockedOverlayTabs = overlayTabs.filter(({ id }) => !lockedSidebarPanels.includes(id));
   const sidebarPanelIsLocked = (id) => lockedSidebarPanels.includes(id);
 
-  useEffect(() => {
-    if (currentUser.role !== 'teacher') {
-      setLockedSidebarPanels([]);
-      return;
-    }
-    try {
-      const savedPanels = JSON.parse(localStorage.getItem(`edu-locked-sidebar-panels:${currentUser.username}`) || '[]');
-      const validPanelIds = ['planner', 'prompt', 'camera'];
-      const nextPanels = Array.isArray(savedPanels)
-        ? savedPanels.filter((id) => validPanelIds.includes(id))
-        : [];
-      setLockedSidebarPanels(nextPanels);
-      setMainTab((tab) => nextPanels.includes(tab) ? 'blocks' : tab);
-      setLockedSidebarPanelsError('');
-    } catch (error) {
-      console.warn('Unable to load locked sidebar panels.', error);
-      setLockedSidebarPanels([]);
-      setLockedSidebarPanelsError('Saved sidebar panel settings could not be loaded.');
-    }
-  }, [currentUser.role, currentUser.username]);
-
-  const handleSidebarPanelLockChange = (panelId, isLocked) => {
-    const nextPanels = isLocked
-      ? [...new Set([...lockedSidebarPanels, panelId])]
-      : lockedSidebarPanels.filter((id) => id !== panelId);
-    try {
-      localStorage.setItem(`edu-locked-sidebar-panels:${currentUser.username}`, JSON.stringify(nextPanels));
-      setLockedSidebarPanels(nextPanels);
-      setLockedSidebarPanelsError('');
-      if (isLocked && mainTab === panelId) setMainTab('blocks');
-    } catch (error) {
-      console.error('Unable to save locked sidebar panels.', error);
-      setLockedSidebarPanelsError('Sidebar panel settings could not be saved.');
-    }
-  };
-
   const apiFetch = useCallback(async (url, options = {}) => {
     const headers = {
       'Content-Type': 'application/json',
@@ -1176,6 +1142,87 @@ export default function App() {
     }
     return data;
   }, [session?.token]);
+
+  useEffect(() => {
+    if (currentUser.role !== 'teacher' || !session?.token) {
+      setLockedSidebarPanels([]);
+      setIsSidebarSettingsLoading(false);
+      return undefined;
+    }
+    let active = true;
+    setIsSidebarSettingsLoading(true);
+    const loadSidebarSettings = async () => {
+      try {
+        let settings = await apiFetch('/api/classroom/sidebar-settings');
+        if (!Array.isArray(settings.locked_panels)) {
+          throw new Error('Teacher sidebar settings response is invalid.');
+        }
+        if (!settings.configured) {
+          const legacyValue = localStorage.getItem(`edu-locked-sidebar-panels:${currentUser.username}`);
+          const legacyPanels = legacyValue ? JSON.parse(legacyValue) : [];
+          const validLegacyPanels = Array.isArray(legacyPanels)
+            ? [...new Set(legacyPanels.filter((panel) => ['planner', 'prompt', 'camera'].includes(panel)))]
+            : [];
+          if (validLegacyPanels.length > 0) {
+            settings = await apiFetch('/api/classroom/sidebar-settings', {
+              method: 'PUT',
+              body: JSON.stringify({ locked_panels: validLegacyPanels }),
+            });
+          }
+        }
+        const validPanels = ['planner', 'prompt', 'camera'];
+        const nextPanels = settings.locked_panels.filter((panel) => validPanels.includes(panel));
+        if (!active) return;
+        setLockedSidebarPanels(nextPanels);
+        setMainTab((tab) => nextPanels.includes(tab) ? 'blocks' : tab);
+        setLockedSidebarPanelsError('');
+        setIsSidebarSettingsLoading(false);
+        try {
+          localStorage.setItem(`edu-locked-sidebar-panels:${currentUser.username}`, JSON.stringify(nextPanels));
+        } catch (error) {
+          console.warn('Unable to cache teacher sidebar settings locally.', error);
+        }
+      } catch (error) {
+        if (!active) return;
+        console.error('Unable to load teacher sidebar settings.', error);
+        setLockedSidebarPanelsError(`Teacher sidebar settings could not be loaded: ${error.message}`);
+        setIsSidebarSettingsLoading(false);
+      }
+    };
+    loadSidebarSettings();
+    return () => {
+      active = false;
+    };
+  }, [apiFetch, currentUser.role, currentUser.username, session?.token]);
+
+  const handleSidebarPanelLockChange = async (panelId, isLocked) => {
+    const previousPanels = lockedSidebarPanels;
+    const nextPanels = isLocked
+      ? [...new Set([...previousPanels, panelId])]
+      : previousPanels.filter((id) => id !== panelId);
+    setLockedSidebarPanels(nextPanels);
+    setIsSidebarSettingsSaving(true);
+    if (isLocked && mainTab === panelId) setMainTab('blocks');
+    try {
+      const settings = await apiFetch('/api/classroom/sidebar-settings', {
+        method: 'PUT',
+        body: JSON.stringify({ locked_panels: nextPanels }),
+      });
+      setLockedSidebarPanels(settings.locked_panels);
+      setLockedSidebarPanelsError('');
+      try {
+        localStorage.setItem(`edu-locked-sidebar-panels:${currentUser.username}`, JSON.stringify(settings.locked_panels));
+      } catch (error) {
+        console.warn('Unable to cache teacher sidebar settings locally.', error);
+      }
+    } catch (error) {
+      setLockedSidebarPanels(previousPanels);
+      console.error('Unable to save teacher sidebar settings.', error);
+      setLockedSidebarPanelsError(`Teacher sidebar settings could not be saved: ${error.message}`);
+    } finally {
+      setIsSidebarSettingsSaving(false);
+    }
+  };
 
   const robotConnection = useMemo(
     () => createRobotConnection('sdk', { request: apiFetch }),
@@ -3209,24 +3256,27 @@ export default function App() {
     <xml xmlns="https://developers.google.com/blockly/xml">
       ${commandCategoriesXml}
       ${isDuetVersion ? `
-        <category name="Distance conditions" colour="200">
+        <category name="Conditions" colour="200">
           <block type="controls_if"></block>
           <block type="controls_if"><mutation else="1"></mutation></block>
+          <block type="logic_boolean"><field name="BOOL">TRUE</field></block>
+          <block type="logic_boolean"><field name="BOOL">FALSE</field></block>
           <block type="logic_compare"></block>
           <block type="duet_front_distance_m"></block>
           <block type="duet_rear_distance_m"></block>
           <block type="math_number"><field name="NUM">1</field></block>
         </category>
       ` : `
-        <category name="${language === 'zh' ? '距离条件' : 'Distance conditions'}" colour="200">
+        <category name="${language === 'zh' ? '条件' : 'Conditions'}" colour="200">
           <block type="controls_if"></block>
           <block type="controls_if"><mutation else="1"></mutation></block>
+          <block type="logic_boolean"><field name="BOOL">TRUE</field></block>
+          <block type="logic_boolean"><field name="BOOL">FALSE</field></block>
           <block type="logic_compare"></block>
           <block type="g1_front_distance_m"></block>
           <block type="g1_rear_distance_m"></block>
           <block type="math_number"><field name="NUM">1</field></block>
         </category>
-        <category name="${language === 'zh' ? '变量' : 'Variables'}" custom="VARIABLE"></category>
       `}
       <sep></sep>
       <category name="${cats.loops}" colour="120">
@@ -4089,8 +4139,9 @@ export default function App() {
       if (method === 'fastwalktime') forwardDistance = numberOfSteps * 0.8;
       if (method === 'sidestep') {
         const sideHeading = heading + (values[0] === 'left' ? 90 : -90);
-        x += Math.cos((sideHeading * Math.PI) / 180) * G1_NOMINAL_STEP_METERS;
-        y += Math.sin((sideHeading * Math.PI) / 180) * G1_NOMINAL_STEP_METERS;
+        const lateralDistance = G1_NOMINAL_STEP_METERS * Number(values[1] || 1);
+        x += Math.cos((sideHeading * Math.PI) / 180) * lateralDistance;
+        y += Math.sin((sideHeading * Math.PI) / 180) * lateralDistance;
         moved = true;
       } else if (method === 'turn') {
         heading += values[0] === 'right' ? -Number(values[1]) : Number(values[1]);
@@ -5100,17 +5151,18 @@ export default function App() {
             )}
             {currentUser.role === 'teacher' && (
               <fieldset className="border-t bg-slate-50 px-5 py-3">
-                <legend className="text-sm font-semibold text-gray-800">Lock sidebar panels open</legend>
+                <legend className="text-sm font-semibold text-gray-800">Hide sidebar tabs for this teacher account</legend>
                 <p className="mb-2 text-xs text-gray-500">
-                  Pinned panels stay visible; the active unlocked panel uses the remaining sidebar space.
+                  Hidden tabs stay hidden on other devices when this teacher account signs in.
                 </p>
                 <div className="flex flex-wrap gap-x-5 gap-y-2">
                   {configurableSidebarPanels.map((panel) => (
                     <label key={panel.id} className="inline-flex items-center gap-2 text-xs text-gray-700">
                       <input
                         type="checkbox"
-                        aria-label={`Lock ${panel.label} open in sidebar`}
+                        aria-label={`Hide ${panel.label} tab from sidebar`}
                         checked={sidebarPanelIsLocked(panel.id)}
+                        disabled={isSidebarSettingsLoading || isSidebarSettingsSaving}
                         onChange={(event) => handleSidebarPanelLockChange(panel.id, event.target.checked)}
                         className="h-4 w-4 accent-blue-700"
                       />
