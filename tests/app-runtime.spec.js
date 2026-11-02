@@ -312,13 +312,11 @@ test('teacher can save a completed queued DUET program as a named command', asyn
   await expect(dialog.getByText('Request completed. Physical movement is not independently verified.')).toBeVisible();
   await dialog.getByLabel('I reviewed the completed motion and it matched the intended result.').check();
   await dialog.getByLabel('Name the successful DUET motion').fill('Teacher wave');
-  await dialog.getByRole('button', { name: 'Save command' }).click();
+  await page.getByRole('button', { name: 'Save command' }).click();
   await expect.poll(() => savedMotions).toEqual([{
     name: 'Teacher wave',
     code: 'duet.wave_left("mid", 1)',
   }]);
-  await dialog.getByRole('button', { name: 'Close request review' }).click();
-  await expect(page.locator('textarea').last()).toHaveValue('duet.saved_motion("teacher-wave-a1b2c3d4")');
 });
 
 test('student can open a shared mode-2 project as a private copy with its original route visible', async ({ page }) => {
@@ -373,13 +371,13 @@ test('student can open a shared mode-2 project as a private copy with its origin
   await expect(page.getByRole('button', { name: 'Rename' })).toHaveCount(0);
   await expect(page.getByRole('button', { name: 'Delete', exact: true })).toHaveCount(0);
   await page.getByRole('button', { name: 'Open project' }).click();
-  await expect(page.getByText('Original route · read only')).toBeVisible();
+  await expect(page.getByText('Original route · read only').last()).toBeVisible();
   await expect(page.getByText('robot.walktime(1)', { exact: true })).toBeVisible();
   await expect(page.getByText('robot.walktime(1.2)', { exact: true })).toBeVisible();
   await expect.poll(() => projectSaves.some((project) => project.name === 'checkpoint-route (copy)')).toBe(true);
 
   await page.getByRole('button', { name: 'IDE', exact: true }).click();
-  await expect(page.getByText('Original route · read only')).toBeVisible();
+  await expect(page.getByText('Original route · read only').last()).toBeVisible();
   await expect(page.locator('textarea').last()).toHaveValue('robot.walktime(1.2)');
 });
 
@@ -654,6 +652,49 @@ test('teacher can preview one explicitly selected fresh robot camera topic', asy
   await expect.poll(() => frameRequests).toBeGreaterThan(0);
   expect(await page.locator('canvas[aria-label="Transient G1 ROS camera preview"]').evaluate((canvas) => canvas.width)).toBe(1);
   expect(await page.evaluate(() => Object.keys(localStorage).filter((key) => /camera|video/i.test(key)))).toEqual([]);
+});
+
+test('DUET prompt and vision tabs expose both approved motion modes', async ({ page }) => {
+  await page.addInitScript(() => {
+    localStorage.setItem('edu-classroom-session', JSON.stringify({
+      token: 'teacher-duet-mode-test-token',
+      user: { role: 'teacher', username: 'teacher' },
+    }));
+  });
+  await page.route('**/api/**', async (route) => {
+    const path = new URL(route.request().url()).pathname;
+    const responses = {
+      '/api/classroom/codes': { codes: [] },
+      '/api/classroom/queue': { items: [] },
+      '/api/classroom/users': { users: [{ username: 'teacher', role: 'teacher' }] },
+      '/api/classroom/status': { status: 'idle' },
+      '/api/classroom/projects/all': { projects: [] },
+      '/api/classroom/project': { project: { name: 'default', sceneObjects: [], plannerWaypoints: [], generatedCode: '' } },
+      '/api/planner/settings': { active_mode: 'manual' },
+      '/api/robot/status': { sdkAvailable: false, running: false },
+      '/api/duet/motions': { motions: [] },
+    };
+    await route.fulfill({
+      status: 200,
+      contentType: 'application/json',
+      body: JSON.stringify(responses[path] || {}),
+    });
+  });
+
+  await page.goto('/');
+  await page.getByRole('button', { name: 'Open app settings' }).click();
+  await page.getByRole('checkbox', { name: 'Enable DUET version two' }).check();
+  await page.getByRole('button', { name: 'Close', exact: true }).click();
+
+  await page.getByRole('button', { name: 'Prompt to Motion' }).click();
+  await expect(page.getByText('DUET motion mode')).toBeVisible();
+  await page.getByRole('button', { name: 'Follow and save' }).click();
+  await expect(page.getByText('Create a bounded motion series, review and run it, then save it as one named DUET command.')).toBeVisible();
+
+  await page.getByRole('button', { name: 'Vision to Motion' }).click();
+  await expect(page.getByText('DUET motion mode')).toBeVisible();
+  await expect(page.getByRole('button', { name: 'Follow and save' })).toHaveAttribute('aria-pressed', 'true');
+  await expect(page.getByText('Vision to DUET motion')).toBeVisible();
 });
 
 test('student queue does not expose teacher sensor diagnostics or call sensor APIs', async ({ page }) => {

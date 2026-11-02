@@ -779,7 +779,11 @@ export function compileDuetMotionPrompt(prompt = '') {
       }
     }
   }
-  const durationMatch = normalized.match(/\b(?:for\s+)?(\d+(?:\.\d+)?)\s*(s|secs?|seconds?)\b/);
+  const durationMatches = [...normalized.matchAll(/\b(?:for\s+)?(\d+(?:\.\d+)?)\s*(s|secs?|seconds?)\b/g)];
+  const durationMatch = durationMatches[0];
+  if (durationMatches.length > 1) {
+    unknown.push('DUET prompt generation supports one shared duration per series; split requests with different durations into separate prompts.');
+  }
   const durationValue = durationMatch ? Number(durationMatch[1]) : 1;
   const durationError = durationMatch && (durationValue < 0.1 || durationValue > 3)
     ? `Requested duration ${durationValue} seconds is outside the supported 0.1-3 second range.`
@@ -1009,6 +1013,7 @@ export function compileDuetMotionPrompt(prompt = '') {
       code = `for _ in range(${repetitions}):\n${code.split('\n').map((line) => `    ${line}`).join('\n')}`;
     }
   }
+  if (unknown.length) code = '';
   if (code) parseDuetProgram(code);
   return {
     code,

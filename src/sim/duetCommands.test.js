@@ -479,6 +479,18 @@ test('DUET prompt compiler preserves supported duration and accepts safe bounded
     assert.equal(result.code, '', prompt);
     assert.ok(result.unknown.length > 0, prompt);
   }
+
+  const mixedValidAndInvalid = compileDuetMotionPrompt(
+    'walk forward for 1 second, then high five for 0.5 seconds',
+  );
+  assert.equal(mixedValidAndInvalid.code, '');
+  assert.ok(mixedValidAndInvalid.unknown.length > 0);
+
+  const unsupportedWithValidMotion = compileDuetMotionPrompt(
+    'walk forward for 1 second and dance',
+  );
+  assert.equal(unsupportedWithValidMotion.code, '');
+  assert.ok(unsupportedWithValidMotion.unknown.length > 0);
 });
 
 test('DUET prompt compiler creates timed and until-reset commands for named mirrored arm poses', () => {

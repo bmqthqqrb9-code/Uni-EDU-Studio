@@ -1789,6 +1789,8 @@ export default function App() {
     setQueueReviewSavedProject(item.result_project || null);
     setQueueReviewNavigationPreview(null);
     setQueueReviewNavigationOperation(null);
+    setLastSuccessfulDuetCode('');
+    setDuetMotionReviewConfirmed(false);
   };
 
   const handlePreviewQueuedNavigation = async () => {
@@ -3596,6 +3598,7 @@ export default function App() {
     compiledPlannerCodeRef.current = nextCode;
     applyGeneratedCode(nextCode, { syncBlocks: true });
     setMainTab('blocks');
+    setIsSimulatorOpen(false);
   };
 
   const placePlannerWaypoint = ({ x, y }) => {
@@ -4296,7 +4299,6 @@ export default function App() {
       lastSuccessfulDuetCode === generatedCode
       || (
         queueReviewItem?.controller_version === 'duet'
-        && queueReviewItem.status === 'completed'
         && queueReviewItem.code === lastSuccessfulDuetCode
       )
     )
@@ -4321,8 +4323,12 @@ export default function App() {
       setDuetMotionSaveName('');
       setDuetMotionReviewConfirmed(false);
       setLastSuccessfulDuetCode('');
-      updateGeneratedCode(`duet.saved_motion(${JSON.stringify(response.motion.id)})`);
-      setVisionMotionStatus(`Saved "${response.motion.name}" as a reusable DUET command.`);
+      if (controllerVersion === 'duet') {
+        updateGeneratedCode(`duet.saved_motion(${JSON.stringify(response.motion.id)})`);
+      }
+      setVisionMotionStatus(controllerVersion === 'duet'
+        ? `Saved "${response.motion.name}" as a reusable DUET command.`
+        : `Saved "${response.motion.name}" to the DUET library. The legacy SDK workspace was left unchanged.`);
     } catch (error) {
       setDuetMotionSaveError(error.message);
     } finally {
