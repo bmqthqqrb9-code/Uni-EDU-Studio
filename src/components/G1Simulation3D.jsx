@@ -9,6 +9,10 @@ import {
 import { buildG1SimulationFrames, G1_EDU_23_ENV } from '../sim/g1Edu23Env';
 import { simulateDuetG1Edu23Program } from '../sim/duetG1Edu23Env';
 import { getSceneObjectScale } from '../sim/sceneObjects';
+import {
+  DEFAULT_CAMERA_DISTANCE, DEFAULT_CAMERA_PITCH, DEFAULT_CAMERA_TARGET_HEIGHT,
+  DEFAULT_CAMERA_YAW, getCameraPanDirection, getCameraPanTargetOffset,
+} from '../sim/cameraNavigation';
 
 const JOINT_AXES = {
   left_hip_pitch: 'x', right_hip_pitch: 'x', left_knee: 'x', right_knee: 'x', left_knee_pitch: 'x', right_knee_pitch: 'x',
@@ -141,25 +145,6 @@ function updateCameraPosition(camera, view) {
     view.target.z + Math.cos(view.yaw) * Math.cos(view.pitch) * view.distance,
   );
   camera.lookAt(view.target);
-}
-
-function getCameraPanKey(key) {
-  switch (key.toLowerCase()) {
-    case 'arrowleft':
-    case 'a':
-      return [-1, 0];
-    case 'arrowright':
-    case 'd':
-      return [1, 0];
-    case 'arrowup':
-    case 'w':
-      return [0, 1];
-    case 'arrowdown':
-    case 's':
-      return [0, -1];
-    default:
-      return null;
-  }
 }
 
 function addSegment(parent, start, end, width, color) {
@@ -565,10 +550,10 @@ export default function G1Simulation3D({ code, simulatorState, controllerVersion
   const draggingMarkerRef = useRef(null);
   const simulatorStateRef = useRef(simulatorState);
   const viewRef = useRef({
-    yaw: 0.55,
-    pitch: 0.62,
-    distance: 7,
-    target: new THREE.Vector3(0, 1.05, 0),
+    yaw: DEFAULT_CAMERA_YAW,
+    pitch: DEFAULT_CAMERA_PITCH,
+    distance: DEFAULT_CAMERA_DISTANCE,
+    target: new THREE.Vector3(0, DEFAULT_CAMERA_TARGET_HEIGHT, 0),
     focusOffset: new THREE.Vector3(0, 0, 0),
     pointers: new Map(),
     pinchDistance: 0,
@@ -652,7 +637,8 @@ export default function G1Simulation3D({ code, simulatorState, controllerVersion
   const panView = (horizontal, forward) => {
     const view = viewRef.current;
     const step = view.distance * 0.12;
-    moveCameraTarget(view, horizontal * step, forward * step);
+    const offset = getCameraPanTargetOffset(horizontal, forward, step);
+    moveCameraTarget(view, offset.horizontal, offset.forward);
     updateCameraPosition(cameraRef.current, view);
   };
 
@@ -664,11 +650,11 @@ export default function G1Simulation3D({ code, simulatorState, controllerVersion
 
   const resetView = () => {
     const view = viewRef.current;
-    view.yaw = 0.55;
-    view.pitch = 0.62;
-    view.distance = 7;
+    view.yaw = DEFAULT_CAMERA_YAW;
+    view.pitch = DEFAULT_CAMERA_PITCH;
+    view.distance = DEFAULT_CAMERA_DISTANCE;
     view.focusOffset.set(0, 0, 0);
-    view.target.set(0, 1.05, 0);
+    view.target.set(0, DEFAULT_CAMERA_TARGET_HEIGHT, 0);
     updateCameraPosition(cameraRef.current, view);
   };
 
@@ -717,7 +703,12 @@ export default function G1Simulation3D({ code, simulatorState, controllerVersion
     }), { minX: 0, maxX: 0, minY: 0, maxY: 0 });
     const view = viewRef.current;
     const camera = cameraRef.current;
-    const radius = Math.hypot((bounds.maxX - bounds.minX) / 2, (bounds.maxY - bounds.minY) / 2);
+    const radius = Math.max(
+      Math.hypot(bounds.minX, bounds.minY),
+      Math.hypot(bounds.minX, bounds.maxY),
+      Math.hypot(bounds.maxX, bounds.minY),
+      Math.hypot(bounds.maxX, bounds.maxY),
+    );
     const verticalFov = THREE.MathUtils.degToRad(camera?.fov ?? 42);
     const horizontalFov = 2 * Math.atan(Math.tan(verticalFov / 2) * (camera?.aspect ?? 1));
     const requiredDistance = Math.max(
@@ -726,11 +717,11 @@ export default function G1Simulation3D({ code, simulatorState, controllerVersion
     ) * 1.15;
 
     view.target.set(
-      (bounds.minX + bounds.maxX) / 2 + view.focusOffset.x,
-      1.05 + view.focusOffset.y,
-      -(bounds.minY + bounds.maxY) / 2 + view.focusOffset.z,
+      view.focusOffset.x,
+      DEFAULT_CAMERA_TARGET_HEIGHT + view.focusOffset.y,
+      view.focusOffset.z,
     );
-    view.distance = Math.max(7, requiredDistance);
+    view.distance = Math.max(DEFAULT_CAMERA_DISTANCE, requiredDistance);
   }, [waypoints]);
 
   useEffect(() => {
@@ -1064,7 +1055,7 @@ export default function G1Simulation3D({ code, simulatorState, controllerVersion
         !mount.contains(activeElement)
         || activeElement?.matches('input, textarea, select, [contenteditable="true"]')
       ) return;
-      const pan = getCameraPanKey(event.key);
+      const pan = getCameraPanDirection(event.key);
       const view = viewRef.current;
       if (pan) {
         event.preventDefault();
