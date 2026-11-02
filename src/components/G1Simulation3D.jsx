@@ -896,6 +896,7 @@ export default function G1Simulation3D({ code, simulatorState, controllerVersion
       });
     };
     const onPointerDown = (event) => {
+      renderer.domElement.focus({ preventScroll: true });
       readPointer(event);
       const now = performance.now();
       const isDoubleClickDrag = event.pointerType === 'mouse'
@@ -1058,6 +1059,11 @@ export default function G1Simulation3D({ code, simulatorState, controllerVersion
       updateCamera();
     };
     const onKeyDown = (event) => {
+      const activeElement = document.activeElement;
+      if (
+        !mount.contains(activeElement)
+        || activeElement?.matches('input, textarea, select, [contenteditable="true"]')
+      ) return;
       const pan = getCameraPanKey(event.key);
       const view = viewRef.current;
       if (pan) {
@@ -1086,7 +1092,7 @@ export default function G1Simulation3D({ code, simulatorState, controllerVersion
     renderer.domElement.addEventListener('pointercancel', onPointerUp);
     renderer.domElement.addEventListener('pointerleave', onPointerUp);
     renderer.domElement.addEventListener('wheel', onWheel, { passive: false });
-    renderer.domElement.addEventListener('keydown', onKeyDown);
+    mount.addEventListener('keydown', onKeyDown);
     renderer.domElement.addEventListener('contextmenu', onContextMenu);
 
     const clock = new THREE.Clock();
@@ -1171,7 +1177,7 @@ export default function G1Simulation3D({ code, simulatorState, controllerVersion
       renderer.domElement.removeEventListener('pointercancel', onPointerUp);
       renderer.domElement.removeEventListener('pointerleave', onPointerUp);
       renderer.domElement.removeEventListener('wheel', onWheel);
-      renderer.domElement.removeEventListener('keydown', onKeyDown);
+      mount.removeEventListener('keydown', onKeyDown);
       renderer.domElement.removeEventListener('contextmenu', onContextMenu);
       renderer.domElement.removeEventListener('webglcontextlost', onWebGLContextLost);
       renderer.dispose();

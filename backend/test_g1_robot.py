@@ -369,6 +369,10 @@ class G1RobotProgramTests(unittest.TestCase):
     def test_motion_values_are_bounded(self):
         commands = parse_robot_program('robot.walktime(99)')
         self.assertEqual(commands[0]["seconds"], 10)
+        self.assertEqual(parse_robot_program("robot.walk(99)")[0]["steps"], 20)
+        self.assertEqual(parse_robot_program('robot.sidestep("left", 99)')[0]["steps"], 20)
+        with self.assertRaisesRegex(CommandValidationError, "integer"):
+            parse_robot_program("robot.walk(1.5)")
 
     def test_wait_is_bounded_without_aggregate_program_duration_limit(self):
         self.assertEqual(
@@ -383,8 +387,11 @@ class G1RobotProgramTests(unittest.TestCase):
             len(parse_robot_program("robot.wait(10)\nrobot.wait(10)\nrobot.wait(10)\nrobot.wait(1)")),
             4,
         )
-        with self.assertRaisesRegex(CommandValidationError, "duration in seconds"):
+        with self.assertRaisesRegex(CommandValidationError, "whole number"):
             parse_robot_program("robot.wait()")
+        for code in ("robot.wait(0.1)", "robot.wait(1.5)"):
+            with self.subTest(code=code), self.assertRaisesRegex(CommandValidationError, "integer"):
+                parse_robot_program(code)
 
     def test_sit_command_is_rejected(self):
         with self.assertRaisesRegex(CommandValidationError, "Unknown robot command: sit"):
@@ -654,7 +661,7 @@ class G1RobotProgramTests(unittest.TestCase):
 
         self.assertEqual(parse_robot_program('robot.sidestep("left")')[0]["steps"], 1)
         self.assertEqual(parse_robot_program('robot.sidestep("left", 0)')[0]["steps"], 1)
-        self.assertEqual(parse_robot_program('robot.sidestep("right", 11)')[0]["steps"], 10)
+        self.assertEqual(parse_robot_program('robot.sidestep("right", 99)')[0]["steps"], 20)
         for code in ('robot.sidestep("left", 1.5)',):
             with self.subTest(code=code), self.assertRaises(CommandValidationError):
                 parse_robot_program(code)

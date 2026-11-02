@@ -133,7 +133,7 @@ test('all executable Blockly command blocks instantiate successfully', () => {
 
 test('G1 program parser normalizes commands, clamps numbers, and expands loops', () => {
   const nodes = parseG1Program('robot.walk(99)\nfor _ in range(2):\n    robot.turn("left")\n');
-  assert.equal(nodes[0].code, 'robot.walk(10)');
+  assert.equal(nodes[0].code, 'robot.walk(20)');
   assert.equal(nodes[1].times, 2);
   assert.equal(nodes[1].body[0].code, 'robot.turn("left", 90)');
   assert.equal(flattenG1Commands(nodes).length, 3);
@@ -146,7 +146,7 @@ test('sidestep Blockly block and IDE command support a bounded step count', () =
   assert.equal(block.codeTemplate, 'robot.sidestep("{{DIRECTION}}", {{STEPS}})\n');
   assert.deepEqual(
     [block.args0[1].value, block.args0[1].min, block.args0[1].max, block.args0[1].precision],
-    [1, 1, 10, 1],
+    [1, 1, 20, 1],
   );
 
   for (const direction of ['left', 'right']) {
@@ -166,16 +166,28 @@ test('wait command is bounded, included in the IDE catalog, and previews its ful
   assert.equal(waitBlock.message0, 'Wait for %1 seconds');
   assert.deepEqual(
     [waitBlock.args0[0].value, waitBlock.args0[0].min, waitBlock.args0[0].max, waitBlock.args0[0].precision],
-    [1, 0.1, 10, 0.001],
+    [1, 1, 10, 1],
   );
-  assert.equal(parseG1Program('robot.wait(0.1)')[0].values[0], 0.1);
+  assert.throws(() => parseG1Program('robot.wait(0.1)'), /integer/);
+  assert.equal(parseG1Program('robot.wait(1)')[0].values[0], 1);
   assert.equal(parseG1Program('robot.wait(2)')[0].code, 'robot.wait(2)');
   assert.equal(parseG1Program('robot.wait(2);')[0].code, 'robot.wait(2)');
   assert.equal(parseG1Program('robot.wait(99)')[0].code, 'robot.wait(10)');
+  assert.throws(() => parseG1Program('robot.wait(1.1)'), /integer/);
   const frames = buildG1SimulationFrames('robot.wait(2)');
   assert.ok(Math.abs(frames.at(-1).time - 2) < 1e-9);
   assert.equal(frames.at(-1).actions.length, 1);
   assert.equal(frames.at(-1).actions[0].label, 'Wait');
+});
+
+test('all step-count Blocks use a whole-number range of 1 through 20', () => {
+  for (const method of ['walk', 'backward', 'slowwalk', 'fastwalk']) {
+    const [block] = getG1BlocklyCommandBlocks([G1_COMMANDS.find((entry) => entry.method === method)]);
+    assert.deepEqual([block.args0[0].min, block.args0[0].max, block.args0[0].precision], [1, 20, 1]);
+    assert.equal(parseG1Program(`robot.${method}(20)`)[0].values[0], 20);
+    assert.throws(() => parseG1Program(`robot.${method}(1.5)`), /integer/);
+    assert.equal(parseG1Program(`robot.${method}(99)`)[0].values[0], 20);
+  }
 });
 
 test('G1 program formatter preserves executable loop structure', () => {
@@ -470,6 +482,10 @@ test('prompt output uses only shared catalog commands', () => {
   assert.match(result.code, /robot\.turn\("right", 45\)/);
   assert.match(result.code, /robot\.waveleft\("high"\)/);
   assert.doesNotThrow(() => parseG1Program(result.code));
+
+  const longerSteps = compileMotionPrompt('Walk forward 18 steps');
+  assert.match(longerSteps.code, /robot\.walk\(18\)/);
+  assert.doesNotThrow(() => parseG1Program(longerSteps.code));
 });
 
 test('simulation expands the same bounded IDE loop syntax', () => {

@@ -462,12 +462,14 @@ function formatLidarDistanceStatus(sensor) {
 
 const SAFE_COMMAND_LIMITS = {
   SPEED: { min: 0.5, max: 2 },
-  STEPS: { min: 1, max: 10 },
+  STEPS: { min: 1, max: 20 },
   ANGLE: { min: 5, max: 180 },
   DEGREES: { min: 0, max: 180 },
   SECONDS: { min: 0.1, max: 10 },
   TIME: { min: 0, max: 10 },
 };
+
+const boundedLoopCountFields = new WeakSet();
 
 const clampSafeValue = (fieldName, rawValue) => {
   const limiter = SAFE_COMMAND_LIMITS[fieldName];
@@ -628,7 +630,7 @@ const ROBOT_IDE_COMMAND_BLOCKS = [
   {
     type: 'robot_walk_forward_steps',
     message0: 'Walk Forward %1 steps',
-    args0: [{ type: 'field_number', name: 'STEPS', value: 3, min: 1, max: 10 }],
+    args0: [{ type: 'field_number', name: 'STEPS', value: 3, min: 1, max: 20 }],
     previousStatement: null,
     nextStatement: null,
     colour: 210,
@@ -637,7 +639,7 @@ const ROBOT_IDE_COMMAND_BLOCKS = [
   {
     type: 'robot_walk_back_steps',
     message0: 'Walk Back %1 steps',
-    args0: [{ type: 'field_number', name: 'STEPS', value: 3, min: 1, max: 10 }],
+    args0: [{ type: 'field_number', name: 'STEPS', value: 3, min: 1, max: 20 }],
     previousStatement: null,
     nextStatement: null,
     colour: 210,
@@ -646,7 +648,7 @@ const ROBOT_IDE_COMMAND_BLOCKS = [
   {
     type: 'robot_walk_sideways_left_steps',
     message0: 'Walk Left %1 steps',
-    args0: [{ type: 'field_number', name: 'STEPS', value: 2, min: 1, max: 10 }],
+    args0: [{ type: 'field_number', name: 'STEPS', value: 2, min: 1, max: 20 }],
     previousStatement: null,
     nextStatement: null,
     colour: 210,
@@ -655,7 +657,7 @@ const ROBOT_IDE_COMMAND_BLOCKS = [
   {
     type: 'robot_walk_sideways_right_steps',
     message0: 'Walk Right %1 steps',
-    args0: [{ type: 'field_number', name: 'STEPS', value: 2, min: 1, max: 10 }],
+    args0: [{ type: 'field_number', name: 'STEPS', value: 2, min: 1, max: 20 }],
     previousStatement: null,
     nextStatement: null,
     colour: 210,
@@ -3435,6 +3437,24 @@ export default function App() {
         if (event.type === Blockly.Events.UI || event.element === 'category') {
           scheduleResize();
         }
+        workspaceRef.current?.getAllBlocks(false).forEach((block) => {
+          if (block.type !== 'controls_repeat_ext') return;
+          const countField = block.getInputTargetBlock('TIMES')?.getField('NUM');
+          if (!countField) return;
+          if (!boundedLoopCountFields.has(countField)) {
+            countField.setValidator((value) => {
+              const numeric = Number(value);
+              if (!Number.isFinite(numeric)) return null;
+              return String(Math.min(20, Math.max(1, Math.round(numeric))));
+            });
+            boundedLoopCountFields.add(countField);
+          }
+          const currentValue = Number(countField.getValue());
+          const boundedValue = Math.min(20, Math.max(1, Math.round(currentValue)));
+          if (Number.isFinite(boundedValue) && boundedValue !== currentValue) {
+            countField.setValue(String(boundedValue));
+          }
+        });
       };
       workspaceRef.current.addChangeListener(handleBlocklyEvents);
 

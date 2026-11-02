@@ -110,8 +110,9 @@ const command = (method, label, category, description, args = []) => ({
   }).join(', ')})\n`,
 });
 
-const steps = (value = 2) => numberArgument('STEPS', 'steps', value, 1, 10);
+const steps = (value = 2) => integerArgument('STEPS', 'steps', value, 1, 20);
 const seconds = (value = 1) => numberArgument('SECONDS', 'seconds', value, 0.1, 10, 0.001);
+const wholeSeconds = (value = 1) => integerArgument('SECONDS', 'seconds', value, 1, 10);
 const degrees = (value = 90) => numberArgument('DEGREES', 'degrees', value, 0, 120);
 const direction = (value = 'left') => choiceArgument('DIRECTION', 'direction', [['Left', 'left'], ['Right', 'right']], value);
 const level = (value = 'mid') => choiceArgument('LEVEL', 'level', [['High', 'high'], ['Mid', 'mid'], ['Low', 'low']], value);
@@ -140,16 +141,16 @@ const ARM_HOLD_PRESETS = ARM_PRESETS.filter(([, preset]) => (
 const commandGroups = [
   [
     command('stand', 'Stand / ready', 'Basics', 'Stand ready to move.'),
-    command('wait', 'Wait for %1 seconds', 'Basics', 'Pause for the selected number of seconds.', [seconds()]),
+    command('wait', 'Wait for %1 seconds', 'Basics', 'Pause for the selected whole number of seconds.', [wholeSeconds()]),
   ],
   [
     command('walk', 'Walk forward', 'Walking', 'Walk forward the selected number of steps. Distance may vary.', [steps()]),
     command('walktime', 'Walk forward for', 'Walking', 'Walk forward for the selected time.', [seconds()]),
     command('backward', 'Walk backward', 'Walking', 'Walk backward the selected number of steps. Distance may vary.', [steps()]),
     command('backwardtime', 'Walk backward for', 'Walking', 'Walk backward for the selected time.', [seconds()]),
-    command('sidestep', 'Sidestep %1 for %2 steps', 'Walking', 'Step sideways the selected number of steps in the chosen direction.', [
+    command('sidestep', 'Sidestep %1 for %2 steps', 'Walking', 'Step sideways the selected number of steps (1–20) in the chosen direction.', [
       direction(),
-      integerArgument('STEPS', 'steps', 1, 1, 10),
+      integerArgument('STEPS', 'steps', 1, 1, 20),
     ]),
     command('slowwalk', 'Slow walk', 'Walking', 'Walk forward slowly for the selected steps. Distance may vary.', [steps()]),
     command('slowwalktime', 'Slow walk for', 'Walking', 'Walk forward slowly for the selected time.', [seconds()]),

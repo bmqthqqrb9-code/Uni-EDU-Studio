@@ -34,7 +34,7 @@ export function compileMotionPrompt(prompt = '') {
   const normalized = prompt.toLowerCase().replace(/[,.!?;:]/g, ' ');
   const steps = [];
   const unknown = [];
-  const distance = clamp(findNumber(normalized, 3, /(?:forward|backward|back|walk|step|走|步)[^\d]*(\d+(?:\.\d+)?)/), 1, 10);
+  const distance = Math.round(clamp(findNumber(normalized, 3, /(?:forward|backward|back|walk|step|走|步)[^\d]*(\d+(?:\.\d+)?)/), 1, 20));
   const angle = clamp(findNumber(normalized, 90, /(?:turn|rotate|degree|角度|转)[^\d]*(\d+(?:\.\d+)?)/), 5, 180);
   const duration = clamp(findNumber(normalized, 1, /(?:for|time|second|秒)[^\d]*(\d+(?:\.\d+)?)/), 0.1, 10);
   const timeBased = /\b(second|seconds|time|秒)\b/.test(normalized);
@@ -42,7 +42,7 @@ export function compileMotionPrompt(prompt = '') {
   const movementAmount = timeBased ? duration : distance;
 
   if (/\b(square|box pattern|四边形|正方形)\b/.test(normalized)) {
-    const side = clamp(findNumber(normalized, 2), 1, 8);
+    const side = clamp(findNumber(normalized, 2), 1, 20);
     for (let index = 0; index < 4; index += 1) {
       addStep(steps, 'Walk forward', `robot.walk(${side})`, `${side} steps`);
       addStep(steps, 'Turn left', 'robot.turn("left", 90)', '90 degrees');
@@ -58,10 +58,10 @@ export function compileMotionPrompt(prompt = '') {
       const method = timeBased ? 'backwardtime' : 'backward';
       addStep(steps, 'Walk backward', `robot.${method}(${movementAmount})`, timeBased ? `${duration} seconds` : `${distance} steps`);
     } else if (/\b(left|向左)\b.*\b(step|walk|走|移)\b/.test(normalized)) {
-      const sideSteps = Math.round(clamp(findNumber(normalized, 1, /(?:left|向左)[^\d]*(\d+(?:\.\d+)?)/), 1, 10));
+      const sideSteps = Math.round(clamp(findNumber(normalized, 1, /(?:left|向左)[^\d]*(\d+(?:\.\d+)?)/), 1, 20));
       addStep(steps, 'Sidestep left', `robot.sidestep("left", ${sideSteps})`, `${sideSteps} ${sideSteps === 1 ? 'step' : 'steps'}`);
     } else if (/\b(right|向右)\b.*\b(step|walk|走|移)\b/.test(normalized)) {
-      const sideSteps = Math.round(clamp(findNumber(normalized, 1, /(?:right|向右)[^\d]*(\d+(?:\.\d+)?)/), 1, 10));
+      const sideSteps = Math.round(clamp(findNumber(normalized, 1, /(?:right|向右)[^\d]*(\d+(?:\.\d+)?)/), 1, 20));
       addStep(steps, 'Sidestep right', `robot.sidestep("right", ${sideSteps})`, `${sideSteps} ${sideSteps === 1 ? 'step' : 'steps'}`);
     } else if (/\b(forward|ahead|straight|前进|向前|走)\b/.test(normalized)) {
       const method = speedMode ? `${speedMode}walk${timeBased ? 'time' : ''}` : timeBased ? 'walktime' : 'walk';

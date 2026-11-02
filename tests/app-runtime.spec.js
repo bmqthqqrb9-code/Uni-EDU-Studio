@@ -907,9 +907,19 @@ test('3D camera keypad is draggable and has no shrink control', async ({ page })
   await page.mouse.move(movedHandle.x + movedHandle.width / 2 - 60, movedHandle.y + movedHandle.height / 2 - 30);
   await page.mouse.up();
 
-  await canvas.focus();
-  await expect(canvas).toBeFocused();
+  await page.evaluate(() => {
+    document.addEventListener('keydown', (event) => {
+      window.cameraKeyWasHandled = event.defaultPrevented;
+    });
+  });
+  await page.getByRole('button', { name: 'Pan view right' }).click();
   await page.keyboard.press('ArrowUp');
+  await expect.poll(() => page.evaluate(() => window.cameraKeyWasHandled)).toBe(true);
+
+  await canvas.click({ position: { x: 150, y: 120 } });
+  await page.evaluate(() => { window.cameraKeyWasHandled = false; });
+  await page.keyboard.press('q');
+  await expect.poll(() => page.evaluate(() => window.cameraKeyWasHandled)).toBe(true);
 });
 
 test('3D camera navigation controls remain reachable on a mobile viewport', async ({ page }) => {
@@ -1035,6 +1045,38 @@ test('Blockly workspace survives collapsing and reopening its side panel', async
   ))).toBe(true);
 });
 
+test('Blockly loop counts are restricted to 1 through 20', async ({ page }) => {
+  await page.addInitScript(() => {
+    localStorage.setItem('edu-classroom-session', JSON.stringify({
+      token: 'test-token',
+      user: { role: 'student', username: 'student-loop-count-test' },
+    }));
+  });
+
+  await page.goto('/');
+  await expect(page.locator('canvas')).toBeVisible();
+  await page.getByRole('button', { name: 'IDE', exact: true }).click();
+  await page.locator('textarea').first().fill('for count in range(20):\n    robot.stand()');
+  await page.getByRole('button', { name: 'Blocks', exact: true }).click();
+  await expect.poll(() => page.evaluate(() => {
+    const workspace = window.Blockly.getMainWorkspace();
+    const repeatBlock = workspace.getAllBlocks(false).find((block) => block.type === 'controls_repeat_ext');
+    return Number(repeatBlock?.getInputTargetBlock('TIMES')?.getFieldValue('NUM'));
+  })).toBe(20);
+
+  await page.evaluate(() => {
+    const workspace = window.Blockly.getMainWorkspace();
+    const repeatBlock = workspace.getAllBlocks(false).find((block) => block.type === 'controls_repeat_ext');
+    const countField = repeatBlock.getInputTargetBlock('TIMES').getField('NUM');
+    countField.setValue('21');
+  });
+  await expect.poll(() => page.evaluate(() => {
+    const workspace = window.Blockly.getMainWorkspace();
+    const repeatBlock = workspace.getAllBlocks(false).find((block) => block.type === 'controls_repeat_ext');
+    return Number(repeatBlock?.getInputTargetBlock('TIMES')?.getFieldValue('NUM'));
+  })).toBe(20);
+});
+
 test('student IDE multiline commands render as Blocks and generate code', async ({ page }) => {
   const pageErrors = [];
   page.on('pageerror', (error) => pageErrors.push(error.message));
@@ -1158,6 +1200,47 @@ test('left and right sidestep counts round-trip between IDE and Blockly', async 
   ))).toEqual([['left', 3], ['right', 2]]);
   await page.getByRole('button', { name: 'IDE', exact: true }).click();
   await expect(page.locator('textarea').first()).toHaveValue(code);
+});
+
+test('editing a wait in the IDE preserves the commands below it', async ({ page }) => {
+  await page.addInitScript(() => {
+    localStorage.setItem('edu-classroom-session', JSON.stringify({
+      token: 'test-token',
+      user: { role: 'student', username: 'student-ide-edit-preserve-test' },
+    }));
+  });
+  await page.route('**/api/**', async (route) => {
+    await route.fulfill({
+      status: 200,
+      contentType: 'application/json',
+      body: JSON.stringify({}),
+    });
+  });
+  const initialCode = 'robot.wait(2)\nrobot.walk(3)\nrobot.turn("left", 90)';
+  const expectedCode = 'robot.wait(5)\nrobot.walk(3)\nrobot.turn("left", 90)';
+
+  await page.goto('/');
+  await expect(page.locator('canvas')).toBeVisible();
+  await page.getByRole('button', { name: 'IDE', exact: true }).click();
+  const editor = page.locator('textarea').first();
+  await editor.fill(initialCode);
+  await editor.evaluate((element) => {
+    const position = element.value.indexOf('2');
+    element.focus();
+    element.setSelectionRange(position, position + 1);
+  });
+  await editor.pressSequentially('5');
+  await expect(editor).toHaveValue(expectedCode);
+  await page.getByRole('button', { name: 'Blocks', exact: true }).click();
+  await expect(page.getByRole('alert')).toHaveCount(0);
+  await page.evaluate(() => {
+    const waitBlock = window.Blockly.getMainWorkspace().getAllBlocks()
+      .find((block) => block.type === 'g1_command_wait');
+    waitBlock.setFieldValue('6', 'SECONDS');
+  });
+  const updatedCode = 'robot.wait(6)\nrobot.walk(3)\nrobot.turn("left", 90)';
+  await page.getByRole('button', { name: 'IDE', exact: true }).click();
+  await expect(editor).toHaveValue(updatedCode);
 });
 
 test('condition toolbox provides True and False blocks without a Variables category', async ({ page }) => {

@@ -183,15 +183,15 @@ def _validate_call(node: ast.AST) -> dict[str, Any]:
     if method in {"walk", "backward", "slowwalk", "fastwalk"}:
         if len(args) != 1:
             raise CommandValidationError(f"robot.{method}() expects a step count.")
-        return {"method": method, "steps": _number(args[0], "steps", 1, 10)}
+        return {"method": method, "steps": _integer(args[0], "steps", 1, 20)}
     if method in {"walktime", "backwardtime", "slowwalktime", "fastwalktime"}:
         if len(args) != 1:
             raise CommandValidationError(f"robot.{method}() expects a duration in seconds.")
         return {"method": method, "seconds": _number(args[0], "seconds", 0.1, 10)}
     if method == "wait":
         if len(args) != 1:
-            raise CommandValidationError("robot.wait() expects a duration in seconds.")
-        return {"method": method, "seconds": _number(args[0], "seconds", 0.1, 10)}
+            raise CommandValidationError("robot.wait() expects a whole number duration from 1 to 10 seconds.")
+        return {"method": method, "seconds": _integer(args[0], "seconds", 1, 10)}
     if method == "turn":
         if len(args) not in {1, 2}:
             raise CommandValidationError('robot.turn() expects a direction and optional angle, e.g. robot.turn("left", 90).')
@@ -204,7 +204,7 @@ def _validate_call(node: ast.AST) -> dict[str, Any]:
         return {
             "method": method,
             "direction": _choice(args[0], "direction", ("left", "right")),
-            "steps": _integer(args[1], "steps", 1, 10) if len(args) == 2 else 1,
+            "steps": _integer(args[1], "steps", 1, 20) if len(args) == 2 else 1,
         }
     if method in {"getfsm", "getactions", "getvolume"}:
         if args:

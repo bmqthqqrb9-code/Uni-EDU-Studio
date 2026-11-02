@@ -28,7 +28,7 @@ Simple commands are best for learning:
 - Stand / ready (selects normal locomotion-ready mode; it is not the squat-to-stand recovery action)
 - Squat to stand, lie to stand, and stand to squat
 - Walk forward or backward
-- Sidestep left or right for 1–10 steps
+- Walk and sidestep commands accept whole-number counts from 1–20 steps
 - Turn left or right
 - Slow or fast walk
 
@@ -48,7 +48,7 @@ robot.backwardtime(1)
 
 Programs can also use bounded `for` loops. The legacy G1 arm presets are available with `robot.arm_action("hands up")` and the other names listed below. A preset does not automatically release the arms; add `robot.arm_action("release arm")` explicitly when you want that motion. For a timed static-pose sequence, use `robot.hold_arm("hands up", 3)`; the available poses are the stationary arm presets shown in the Blocks toolbox, excluding moving gestures such as clapping and waving. This command starts the preset and keeps the program on that pose for at least the requested 0.1–10 seconds. It does not send continuous joint targets: the physical SDK confirms request acceptance but does not report that the pose was reached or actively hold it, so actual pose duration depends on the G1 preset/controller behavior. Simulation shows approximate poses, not SDK trajectories. Allow a preset to finish before asking the robot to walk. Walking is sent only when the locomotion FSM reports ready state 500; if it is in another state, the program stops with an instruction to run `robot.stand()` and wait for that transition. The teacher's `Stop robot` button stops locomotion but cannot cancel an accepted arm preset, so keep the robot area clear and use direct teacher supervision.
 
-`robot.wait(2)` pauses the program for 2 seconds. Wait durations are entered in seconds, from 0.1 to 10, in both Blocks and the IDE.
+`robot.wait(2)` pauses the program for 2 seconds. Wait durations are whole seconds from 1 to 10 in both Blocks and the IDE. Timed walking and arm holds can still use fractional seconds.
 
 There is no overall 30-second runtime cap for a program. Per-command input bounds, a maximum of 20 loop repetitions, and the limit of 400 expanded commands per execution path still apply. The teacher's explicit stop path remains available; as noted above, the SDK cannot cancel an arm preset it has already accepted.
 
@@ -98,7 +98,7 @@ robot.arm_action("hands up")
 
 The available preset names are: `release arm`, `two-hand kiss`, `left kiss`, `right kiss`, `hands up`, `clap`, `high five`, `hug`, `heart`, `right heart`, `reject`, `right hand up`, `x-ray`, `face wave`, `high wave`, and `shake hand`.
 
-`wait(seconds)` pauses a v1 program for 0.1 to 10 seconds. Neither v1 nor DUET v2 has an aggregate program-duration cap. Their individual command durations remain bounded; each loop allows up to 20 repetitions and programs allow up to 400 expanded commands (v1 counts the maximum execution path).
+`wait(seconds)` pauses a v1 program for 1 to 10 whole seconds. Walking step counts are whole numbers from 1 to 20. Neither v1 nor DUET v2 has an aggregate program-duration cap. Their individual command durations remain bounded; each loop allows up to 20 repetitions and programs allow up to 400 expanded commands (v1 counts the maximum execution path).
 
 Arm presets:
 - Release arm: relax the arms.
