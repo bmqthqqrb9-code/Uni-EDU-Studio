@@ -1,0 +1,74 @@
+[
+  {
+    "name": "walk-forward",
+    "title": "Walk Forward",
+    "description": "Take one short, conservative DUET forward motion.",
+    "code": "duet.walk(1)",
+    "controller_version": "duet",
+    "builtin": true
+  },
+  {
+    "name": "walk-backward",
+    "title": "Walk Backward",
+    "description": "Take one short, conservative DUET backward motion.",
+    "code": "duet.backward(1)",
+    "controller_version": "duet",
+    "builtin": true
+  },
+  {
+    "name": "turn-around-180",
+    "title": "Turn Around 180",
+    "description": "Turn in place by about 180 degrees using bounded yaw segments. The final angle is approximate.",
+    "code": "duet.turn_around_180()",
+    "controller_version": "duet",
+    "builtin": true
+  },
+  {
+    "name": "hands-up-gesture",
+    "title": "Hands Up Gesture",
+    "description": "Run the catalogued DUET hands-up gesture through the approved arm-target gateway.",
+    "code": "duet.gesture_hands_up(1)",
+    "controller_version": "duet",
+    "builtin": true
+  },
+  {
+    "name": "follow-along-walk-and-wave",
+    "title": "Follow Along: Walk and Wave",
+    "description": "Run a short forward motion and fixed hands-up gesture concurrently.",
+    "code": "with duet.concurrent():\n    duet.walk(1)\n    duet.gesture_hands_up(1)",
+    "controller_version": "duet",
+    "builtin": true
+  },
+  {
+    "name": "follow-along-walk-turn-return",
+    "title": "Follow Along: Walk, Turn, Return",
+    "description": "Walk, make an approximate half-turn in place, then walk back.",
+    "code": "duet.walk(1)\nduet.turn_around_180()\nduet.backward(1)",
+    "controller_version": "duet",
+    "builtin": true
+  },
+  {
+    "name": "follow-along-classroom-groove",
+    "title": "Follow Along: Classroom Groove",
+    "description": "A short walk, a timed left turn, and a fixed clap gesture.",
+    "code": "duet.walk(1)\nduet.turn_left(1)\nduet.gesture_clap(1)",
+    "controller_version": "duet",
+    "builtin": true
+  },
+  {
+    "name": "front-sensor-stop-or-go",
+    "title": "Front Sensor: Stop or Go",
+    "description": "Requires a fresh MID-360 front-distance sample; explicitly stop when clearance is under one metre.",
+    "code": "if duet.front_distance_m() < 1:\n    duet.stop()\nelse:\n    duet.walk(1)",
+    "controller_version": "duet",
+    "builtin": true
+  },
+  {
+    "name": "rear-sensor-stop-or-go",
+    "title": "Rear Sensor: Stop or Go",
+    "description": "Requires a fresh MID-360 rear-distance sample; explicitly stop when clearance is under one metre.",
+    "code": "if duet.rear_distance_m() < 1:\n    duet.stop()\nelse:\n    duet.backward(1)",
+    "controller_version": "duet",
+    "builtin": true
+  }
+]

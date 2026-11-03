@@ -1,0 +1,27 @@
+{
+  "format": "uni-edu-studio-block-example-v1",
+  "controller_version": "duet",
+  "name": "follow-along-walk-and-wave",
+  "title": "Follow Along: Walk and Wave",
+  "blocks": [
+    {
+      "type": "duet_concurrent_action",
+      "blocks": [
+        {
+          "type": "duet_command_walk",
+          "method": "walk",
+          "inputs": [
+            "1"
+          ]
+        },
+        {
+          "type": "duet_command_gesture_hands_up",
+          "method": "gesture_hands_up",
+          "inputs": [
+            "1"
+          ]
+        }
+      ]
+    }
+  ]
+}

@@ -1,0 +1,15 @@
+{
+  "format": "uni-edu-studio-block-example-v1",
+  "controller_version": "duet",
+  "name": "walk-forward",
+  "title": "Walk Forward",
+  "blocks": [
+    {
+      "type": "duet_command_walk",
+      "method": "walk",
+      "inputs": [
+        "1"
+      ]
+    }
+  ]
+}

@@ -1,0 +1,74 @@
+[
+  {
+    "name": "walk-forward",
+    "title": "Walk Forward",
+    "description": "Get ready, then take two small forward steps.",
+    "code": "robot.stand()\nrobot.wait(2)\nrobot.walk(2)",
+    "controller_version": "legacy",
+    "builtin": true
+  },
+  {
+    "name": "walk-backward",
+    "title": "Walk Backward",
+    "description": "Get ready, then take one small backward step.",
+    "code": "robot.stand()\nrobot.wait(2)\nrobot.backward(1)",
+    "controller_version": "legacy",
+    "builtin": true
+  },
+  {
+    "name": "turn-around-180",
+    "title": "Turn Around 180",
+    "description": "Turn in place by about 180 degrees. The final angle is approximate.",
+    "code": "robot.stand()\nrobot.wait(2)\nrobot.turn_around_180()",
+    "controller_version": "legacy",
+    "builtin": true
+  },
+  {
+    "name": "hands-up-gesture",
+    "title": "Hands Up Gesture",
+    "description": "Run a fixed, teacher-supervised G1 arm preset.",
+    "code": "robot.hold_arm(\"hands up\", 2)",
+    "controller_version": "legacy",
+    "builtin": true
+  },
+  {
+    "name": "follow-along-walk-and-wave",
+    "title": "Follow Along: Walk and Wave",
+    "description": "Take one short walk, then perform a fixed hands-up gesture.",
+    "code": "robot.stand()\nrobot.wait(2)\nrobot.walk(1)\nrobot.hold_arm(\"hands up\", 2)",
+    "controller_version": "legacy",
+    "builtin": true
+  },
+  {
+    "name": "follow-along-walk-turn-return",
+    "title": "Follow Along: Walk, Turn, Return",
+    "description": "Walk, make an approximate half-turn in place, then walk back.",
+    "code": "robot.stand()\nrobot.wait(2)\nrobot.walk(2)\nrobot.turn_around_180()\nrobot.backward(2)\nrobot.stand()",
+    "controller_version": "legacy",
+    "builtin": true
+  },
+  {
+    "name": "follow-along-classroom-groove",
+    "title": "Follow Along: Classroom Groove",
+    "description": "A short walk, a quarter turn, and a fixed clap preset.",
+    "code": "robot.stand()\nrobot.wait(2)\nrobot.walk(1)\nrobot.turn(\"left\", 90)\nrobot.arm_action(\"clap\")\nrobot.stand()",
+    "controller_version": "legacy",
+    "builtin": true
+  },
+  {
+    "name": "front-sensor-stop-or-go",
+    "title": "Front Sensor: Stop or Go",
+    "description": "Requires a fresh MID-360 front-distance sample; stand instead of walking when clearance is under one metre.",
+    "code": "robot.stand()\nif robot.front_distance_m() < 1:\n    robot.stand()\nelse:\n    robot.walk(1)",
+    "controller_version": "legacy",
+    "builtin": true
+  },
+  {
+    "name": "rear-sensor-stop-or-go",
+    "title": "Rear Sensor: Stop or Go",
+    "description": "Requires a fresh MID-360 rear-distance sample; stand instead of backing up when clearance is under one metre.",
+    "code": "robot.stand()\nif robot.rear_distance_m() < 1:\n    robot.stand()\nelse:\n    robot.backward(1)",
+    "controller_version": "legacy",
+    "builtin": true
+  }
+]

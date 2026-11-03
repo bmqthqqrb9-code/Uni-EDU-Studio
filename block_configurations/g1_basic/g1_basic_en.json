@@ -382,17 +382,6 @@
         "codeTemplate": "audio_client.TtsMaker('{{TEXT}}', {{SPEAKER}})\n"
       },
       {
-        "type": "g1_audio_set_volume",
-        "message0": "Set Volume (0-100) %1",
-        "args0": [
-          { "type": "field_number", "name": "VOLUME", "value": 50, "min": 0, "max": 100 }
-        ],
-        "previousStatement": null,
-        "nextStatement": null,
-        "colour": 210,
-        "codeTemplate": "audio_client.SetVolume({{VOLUME}})\n"
-      },
-      {
         "type": "g1_audio_get_volume_print",
         "message0": "Get Volume and Print",
         "args0": [],

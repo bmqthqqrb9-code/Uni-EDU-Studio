@@ -1,8 +1,9 @@
 import React, { useState, useEffect, useRef, useCallback, useMemo } from 'react';
+import { createPortal } from 'react-dom';
 import { 
   Save, FolderOpen, Download, Settings, Play, Square,
-  Code, X, RefreshCw, FileJson, Check, Loader2, Globe,
-  Menu, Undo, Redo, Info, ChevronRight, Sidebar, MoreVertical,
+  Code, X, RefreshCw, FileJson, Check, Loader2,
+  Menu, Undo, Redo, ChevronRight, Sidebar, MoreVertical, Trash2,
   Upload, FileText, Edit3, FunctionSquare
 } from 'lucide-react';
 import * as Blockly from 'blockly/core';
@@ -287,8 +288,8 @@ const UI_TEXT = {
     appName: "Uni++ EDU Studio",
     version: "v2.1 Stable",
     menuFile: "文件", menuEdit: "编辑", menuView: "视图", menuHelp: "帮助",
-    actNew: "新建项目", actOpen: "打开项目 (.json)", actSave: "保存项目 (.json)", actExportPy: "导出 Python (.py)",
-    actUndo: "撤销", actRedo: "重做", actToggleCode: "切换代码预览", actAbout: "关于",
+    projectMenu: "项目", actSaveToAccount: "保存到账号", actNew: "新建项目", actImportJson: "导入 JSON", actExportJson: "导出 JSON", actImportPython: "导入 Python", actExportPy: "导出 Python (.py)",
+    actUndo: "撤销", actRedo: "重做", actClear: "清空工作区", actToggleCode: "切换代码预览", actAbout: "关于",
     actConfigImport: "导入配置", actConfigExport: "导出配置",
     configTitle: "机器人积木配置",
     configDesc: "机器人命令由共享命令目录管理。旧配置仅供迁移参考，不能增加可执行命令。",
@@ -304,8 +305,8 @@ const UI_TEXT = {
     appName: "Uni++ EDU Studio",
     version: "v2.1 Stable",
     menuFile: "File", menuEdit: "Edit", menuView: "View", menuHelp: "Help",
-    actNew: "New Project", actOpen: "Open Project (.json)", actSave: "Save Project (.json)", actExportPy: "Export Python (.py)",
-    actUndo: "Undo", actRedo: "Redo", actToggleCode: "Toggle Code View", actAbout: "About",
+    projectMenu: "Project", actSaveToAccount: "Save to account", actNew: "New Project", actImportJson: "Import JSON", actExportJson: "Export JSON", actImportPython: "Import Python", actExportPy: "Export Python (.py)",
+    actUndo: "Undo", actRedo: "Redo", actClear: "Clear workspace", actToggleCode: "Toggle Code View", actAbout: "About",
     actConfigImport: "Import Config", actConfigExport: "Export Config",
     configTitle: "Robot Block Config",
     configDesc: "Executable commands come from the shared G1 command catalog. Legacy configs are for migration only and cannot add robot commands.",
@@ -319,8 +320,8 @@ const UI_TEXT = {
   }
 };
 
-const MenuItem = ({ label, shortcut, onClick, icon: Icon, danger }) => (
-  <button onClick={onClick} className={`w-full text-left px-4 py-1.5 text-sm flex items-center justify-between hover:bg-blue-50 transition-colors ${danger ? 'text-red-600 hover:bg-red-50' : 'text-gray-700'}`}>
+const MenuItem = ({ label, shortcut, onClick, icon: Icon, danger, dark = false }) => (
+  <button onClick={onClick} className={`w-full text-left px-4 py-1.5 text-sm flex items-center justify-between transition-colors ${dark ? (danger ? 'text-red-300 hover:bg-slate-800' : 'text-slate-200 hover:bg-slate-800') : `hover:bg-blue-50 ${danger ? 'text-red-600 hover:bg-red-50' : 'text-gray-700'}`}`}>
     <div className="flex items-center gap-2">{Icon && <Icon size={14} className="opacity-70" />}<span>{label}</span></div>
     {shortcut && <span className="text-xs text-gray-400 font-mono ml-4">{shortcut}</span>}
   </button>
@@ -847,6 +848,7 @@ export default function App() {
   const codeEditorRef = useRef(null);
   const resizeObserverRef = useRef(null);
   const fileInputRef = useRef(null);
+  const pythonFileInputRef = useRef(null);
   const compiledPlannerCodeRef = useRef(null);
   const applyGeneratedCodeRef = useRef(null);
   const syncBlocksFromGeneratedCodeRef = useRef(null);
@@ -866,8 +868,9 @@ export default function App() {
   const [configText, setConfigText] = useState(JSON.stringify(DEFAULT_ROBOT_CONFIG_EN, null, 2));
   
   const [activeMenu, setActiveMenu] = useState(null);
+  const [projectMenuPosition, setProjectMenuPosition] = useState(null);
   const [showConfigEditor, setShowConfigEditor] = useState(false);
-  const [showAbout, setShowAbout] = useState(false);
+  const [showAppSettings, setShowAppSettings] = useState(false);
   const [isBlocklyLoaded, setIsBlocklyLoaded] = useState(false);
   
   const [promptState, setPromptState] = useState({ isOpen: false, message: '', defaultValue: '', callback: null, inputValue: '' });
@@ -895,6 +898,13 @@ export default function App() {
   const [isSidebarSettingsLoading, setIsSidebarSettingsLoading] = useState(true);
   const [isSidebarSettingsSaving, setIsSidebarSettingsSaving] = useState(false);
   const [lockedSidebarPanelsError, setLockedSidebarPanelsError] = useState('');
+  const [safeModeEnabled, setSafeModeEnabled] = useState(false);
+  const [isSafeModeSettingsLoading, setIsSafeModeSettingsLoading] = useState(true);
+  const [isSafeModeSettingsSaving, setIsSafeModeSettingsSaving] = useState(false);
+  const [safeModeSettingsError, setSafeModeSettingsError] = useState('');
+  const [speakerVolume, setSpeakerVolume] = useState(70);
+  const [speakerVolumeStatus, setSpeakerVolumeStatus] = useState('Read the current robot volume or choose a level and apply it.');
+  const [isSpeakerVolumeBusy, setIsSpeakerVolumeBusy] = useState(false);
   useEffect(() => {
     const keepToolPanelInViewport = () => {
       const sceneBounds = sceneShellRef.current?.getBoundingClientRect();
@@ -976,10 +986,17 @@ export default function App() {
     }
   });
   const currentUser = session?.user ?? { role: 'student', username: 'guest' };
+  const legacyCommandsForCurrentUser = useMemo(
+    () => G1_EXECUTABLE_COMMANDS.filter((command) => (
+      currentUser.role === 'teacher' || command.category !== 'Diagnostics'
+    )),
+    [currentUser.role],
+  );
   const [savedDuetArmMotions, setSavedDuetArmMotions] = useState([]);
   const [duetArmMotionName, setDuetArmMotionName] = useState('');
   const [duetArmMotionError, setDuetArmMotionError] = useState('');
   const [savedCodes, setSavedCodes] = useState([]);
+  const [starterCodes, setStarterCodes] = useState([]);
   const [queueItems, setQueueItems] = useState([]);
   const [queueReviewItem, setQueueReviewItem] = useState(null);
   const [queueReviewError, setQueueReviewError] = useState('');
@@ -1197,6 +1214,56 @@ export default function App() {
     };
   }, [apiFetch, currentUser.role, currentUser.username, session?.token]);
 
+  useEffect(() => {
+    if (currentUser.role !== 'teacher' || !session?.token) {
+      setSafeModeEnabled(false);
+      setIsSafeModeSettingsLoading(false);
+      return undefined;
+    }
+    let active = true;
+    setIsSafeModeSettingsLoading(true);
+    apiFetch('/api/classroom/safe-mode')
+      .then((settings) => {
+        if (typeof settings.enabled !== 'boolean') {
+          throw new Error('Teacher Safe Mode settings response is invalid.');
+        }
+        if (!active) return;
+        setSafeModeEnabled(settings.enabled);
+        setSafeModeSettingsError('');
+      })
+      .catch((error) => {
+        if (!active) return;
+        console.error('Unable to load teacher Safe Mode settings.', error);
+        setSafeModeSettingsError(`Safe Mode settings could not be loaded: ${error.message}`);
+      })
+      .finally(() => {
+        if (active) setIsSafeModeSettingsLoading(false);
+      });
+    return () => {
+      active = false;
+    };
+  }, [apiFetch, currentUser.role, session?.token]);
+
+  const handleSafeModeToggle = async (enabled) => {
+    const previousValue = safeModeEnabled;
+    setSafeModeEnabled(enabled);
+    setIsSafeModeSettingsSaving(true);
+    try {
+      const settings = await apiFetch('/api/classroom/safe-mode', {
+        method: 'PUT',
+        body: JSON.stringify({ enabled }),
+      });
+      setSafeModeEnabled(settings.enabled);
+      setSafeModeSettingsError('');
+    } catch (error) {
+      setSafeModeEnabled(previousValue);
+      console.error('Unable to save teacher Safe Mode settings.', error);
+      setSafeModeSettingsError(`Safe Mode could not be saved: ${error.message}`);
+    } finally {
+      setIsSafeModeSettingsSaving(false);
+    }
+  };
+
   const handleSidebarPanelLockChange = async (panelId, isLocked) => {
     const previousPanels = lockedSidebarPanels;
     const nextPanels = isLocked
@@ -1315,6 +1382,7 @@ export default function App() {
         apiFetch('/api/classroom/projects')
       ]);
       setSavedCodes(codesRes.codes || []);
+      setStarterCodes(codesRes.starter_codes || []);
       setQueueItems(queueRes.items || []);
       setTeacherRoster(usersRes.users || []);
       setClassroomStatus(statusRes.status || 'idle');
@@ -1689,6 +1757,7 @@ export default function App() {
   const handleLogout = () => {
     setSession(null);
     setSavedCodes([]);
+    setStarterCodes([]);
     setQueueItems([]);
     setTeacherRoster([]);
     setClassroomStatus('idle');
@@ -2264,6 +2333,38 @@ export default function App() {
     }
   };
 
+  const handleSpeakerVolume = async (operation) => {
+    if (currentUser.role !== 'teacher' || controllerVersion !== 'legacy' || !isRobotConnected) return;
+    setIsSpeakerVolumeBusy(true);
+    setSpeakerVolumeStatus(operation === 'read' ? 'Reading speaker volume…' : 'Applying speaker volume…');
+    try {
+      const code = operation === 'read'
+        ? 'robot.getvolume()'
+        : `robot.setvolume(${speakerVolume})`;
+      const result = await apiFetch('/api/run', {
+        method: 'POST',
+        body: JSON.stringify({ code }),
+      });
+      if (result.status !== 'completed') {
+        throw new Error('The G1 SDK did not confirm the speaker-volume operation.');
+      }
+      if (operation === 'read') {
+        const volume = result.results?.find((item) => item.command === 'getvolume')?.value?.volume;
+        if (!Number.isInteger(volume) || volume < 0 || volume > 100) {
+          throw new Error('The G1 SDK returned an invalid speaker-volume value.');
+        }
+        setSpeakerVolume(volume);
+        setSpeakerVolumeStatus(`Current speaker volume: ${volume}/100.`);
+      } else {
+        setSpeakerVolumeStatus(`Speaker volume set to ${speakerVolume}/100.`);
+      }
+    } catch (error) {
+      setSpeakerVolumeStatus(`Could not ${operation === 'read' ? 'read' : 'set'} speaker volume: ${error.message}`);
+    } finally {
+      setIsSpeakerVolumeBusy(false);
+    }
+  };
+
   const stopDeviceCamera = useCallback(() => {
     deviceCameraRequestRef.current += 1;
     deviceCameraStreamRef.current?.getTracks().forEach((track) => track.stop());
@@ -2538,6 +2639,38 @@ export default function App() {
       setIsRobotConnecting(false);
     }
   };
+
+  const handleLoadStarterCode = async (entry) => {
+    if (!entry || !['legacy', 'duet'].includes(entry.controller_version)) return;
+    if (entry.controller_version === controllerVersion) {
+      updateGeneratedCode(entry.code);
+      return;
+    }
+    codeByVersionRef.current[entry.controller_version] = entry.code;
+    await handleControllerVersionChange(entry.controller_version === 'duet');
+  };
+
+  const renderStarterMotionLibrary = () => (
+    <div className="rounded-xl border border-blue-200 bg-blue-50 p-3">
+      <p className="text-[10px] uppercase tracking-wide text-blue-800 font-semibold">Starter motion library</p>
+      <p className="mt-1 text-[10px] leading-relaxed text-blue-900">
+        Examples load into the editor only. Check the controller mode, inspect the code, and require teacher approval before any physical run.
+      </p>
+      <div className="mt-2 space-y-2">
+        {starterCodes.map((entry) => (
+          <div key={`${entry.controller_version}-${entry.name}`} className="rounded-lg border border-blue-100 bg-white p-2">
+            <div className="flex items-start justify-between gap-2">
+              <span className="min-w-0 break-words text-xs font-semibold text-slate-800">{entry.name}</span>
+              <span className="shrink-0 rounded-full bg-slate-100 px-2 py-0.5 text-[9px] uppercase text-slate-600">{entry.controller_version}</span>
+            </div>
+            <p className="mt-1 text-[10px] text-slate-600">{entry.description}</p>
+            <button type="button" onClick={() => handleLoadStarterCode(entry)} className="mt-2 text-xs font-semibold text-blue-700 hover:text-blue-900">Load into editor</button>
+          </div>
+        ))}
+        {starterCodes.length === 0 && <p className="text-xs text-slate-500">Starter motion examples are unavailable.</p>}
+      </div>
+    </div>
+  );
 
   const handleSensorServiceOperation = async (sensorId, operation) => {
     if (currentUser.role !== 'teacher') return;
@@ -3239,7 +3372,7 @@ export default function App() {
     const isDuetVersion = controllerVersion === 'duet';
     const commandBlocks = isDuetVersion
       ? getDuetBlocklyCommandBlocks(savedDuetMotions)
-      : getG1BlocklyCommandBlocks(G1_EXECUTABLE_COMMANDS);
+      : getG1BlocklyCommandBlocks(legacyCommandsForCurrentUser);
     const categories = [...new Set(commandBlocks.map((definition) => definition.category))];
     const commandCategoriesXml = categories.map((category) => {
       const blocks = commandBlocks
@@ -3286,7 +3419,7 @@ export default function App() {
       </category>
     </xml>
     `;
-  }, [controllerVersion, savedDuetMotions]);
+  }, [controllerVersion, legacyCommandsForCurrentUser, savedDuetMotions]);
 
   const registerBlocks = useCallback((robotCategories) => {
     if (!Blockly || !pythonGenerator) return;
@@ -3568,6 +3701,28 @@ export default function App() {
     };
     reader.readAsText(file);
     event.target.value = ''; 
+  };
+
+  const loadPythonFile = (event) => {
+    const file = event.target.files[0];
+    if (!file) return;
+    const reader = new FileReader();
+    reader.onload = () => {
+      if (typeof reader.result !== 'string') {
+        alert('Could not read the selected Python file as text.');
+        return;
+      }
+      setMainTab('ide');
+      applyGeneratedCode(reader.result, { syncBlocks: true, preserveFormatting: true });
+    };
+    reader.onerror = () => alert(`Could not read the selected Python file: ${reader.error?.message || 'unknown file error'}`);
+    reader.readAsText(file);
+    event.target.value = '';
+  };
+
+  const handleImportPythonClick = () => {
+    pythonFileInputRef.current?.click();
+    setActiveMenu(null);
   };
 
   const downloadPython = () => { const a = document.createElement("a"); a.href = URL.createObjectURL(new Blob([generatedCode], {type: "text/x-python;charset=utf-8"})); a.download = "task.py"; a.click(); };
@@ -3868,10 +4023,15 @@ export default function App() {
               : `${decision.clear ? `clear within ${decision.max_range_m} m` : `${decision.distance_m.toFixed(2)} m`} ${decision.operator} ${decision.threshold_m} m → ${decision.branch}`
           )).join('; ')}.`
           : '';
+        const safetyOutput = result.safetyInterventions?.length
+          ? ` Safe Mode: ${result.safetyInterventions.map((intervention) => (
+            `${intervention.command} ${intervention.status} (${intervention.reason})`
+          )).join('; ')}.`
+          : '';
         if (!keepDuetRunLock) {
           const controllerName = controllerVersion === 'duet' ? 'DUET' : 'SDK';
           const accepted = controllerVersion === 'duet' ? 'accepted' : 'finished sending';
-          setRobotConnectionStatus(`${controllerName} ${accepted} ${result.commandsExecuted} command(s). Physical movement is not verified.${conditionOutput}${output}`);
+          setRobotConnectionStatus(`${controllerName} ${accepted} ${result.commandsExecuted} command(s). Physical movement is not verified.${conditionOutput}${safetyOutput}${output}`);
         }
       } catch (error) {
         alert(`Robot run failed: ${error.message}`);
@@ -4165,6 +4325,8 @@ export default function App() {
         moved = true;
       } else if (method === 'turn') {
         heading += values[0] === 'right' ? -Number(values[1]) : Number(values[1]);
+      } else if (method === 'turn_around_180') {
+        heading += 180;
       } else if (forwardDistance) {
         x += Math.cos((heading * Math.PI) / 180) * forwardDistance;
         y += Math.sin((heading * Math.PI) / 180) * forwardDistance;
@@ -5119,8 +5281,17 @@ export default function App() {
         type="file" 
         ref={fileInputRef} 
         className="hidden" 
+        aria-label="Import JSON file"
         accept=".json" 
         onChange={loadProject} 
+      />
+      <input
+        type="file"
+        ref={pythonFileInputRef}
+        className="hidden"
+        aria-label="Import Python file"
+        accept=".py,text/x-python,text/plain"
+        onChange={loadPythonFile}
       />
 
       {showConfigEditor && (
@@ -5136,8 +5307,91 @@ export default function App() {
               </div>
             </div>
             <div className="flex-1 bg-slate-900 p-0 overflow-hidden"><textarea className="w-full h-full p-6 font-mono text-sm bg-slate-900 text-green-400 resize-none focus:outline-none" value={configText || ''} onChange={(e) => setConfigText(e.target.value)} spellCheck={false} /></div>
-            {currentUser.role === 'teacher' && (
-              <div className="flex items-center justify-between gap-3 border-t bg-white px-5 py-3">
+            <div className="p-4 border-t bg-white flex justify-end gap-3"><button onClick={() => setShowConfigEditor(false)} className="px-5 py-2 text-sm text-gray-600 font-medium hover:bg-gray-100 rounded-lg">{t.closeBtn}</button><button onClick={handleApplyConfig} className="flex items-center gap-2 px-6 py-2 text-sm bg-blue-600 text-white rounded-lg font-bold hover:bg-blue-700 shadow-md"><Check size={16} /> {t.applyBtn}</button></div>
+          </div>
+        </div>
+      )}
+
+      {showAppSettings && (
+        <div className="fixed inset-0 z-[9999] flex items-center justify-center bg-black/60 backdrop-blur-sm animate-in fade-in p-4" onClick={(event) => event.stopPropagation()}>
+          <div className="flex max-h-[90vh] w-full max-w-4xl flex-col overflow-hidden rounded-xl bg-white shadow-2xl">
+            <div className="flex items-center justify-between border-b bg-slate-50 px-5 py-4">
+              <div>
+                <h2 className="text-xl font-bold text-slate-800">Settings</h2>
+                <p className="mt-1 text-xs text-slate-500">Application preferences{currentUser.role === 'teacher' ? ' and teacher robot settings' : ''}.</p>
+              </div>
+              <button
+                type="button"
+                onClick={() => setShowAppSettings(false)}
+                className="rounded-md px-3 py-1.5 text-sm font-medium text-slate-600 hover:bg-slate-200"
+              >
+                Close
+              </button>
+            </div>
+            <div className="space-y-3 overflow-y-auto p-5">
+              <div className="flex flex-wrap items-center justify-between gap-4 rounded-xl border border-slate-200 bg-slate-50 px-5 py-4">
+                <div>
+                  <p className="text-sm font-semibold text-slate-800">Language</p>
+                  <p className="text-xs text-slate-500">Choose the application language.</p>
+                </div>
+                <button
+                  type="button"
+                  onClick={toggleLanguage}
+                  aria-label="Toggle application language"
+                  className="rounded-md border border-slate-300 bg-white px-3 py-1.5 text-sm font-semibold text-slate-700 hover:bg-slate-100"
+                >
+                  {lang === 'zh' ? 'English' : '中文'}
+                </button>
+              </div>
+              {currentUser.role === 'teacher' && (
+                <>
+              <fieldset className="rounded-xl border border-violet-200 bg-violet-50 px-5 py-4">
+                <legend className="text-sm font-semibold text-violet-950">Robot speaker volume</legend>
+                <p className="mt-1 text-xs text-violet-900">
+                  Speech uses the robot's current global speaker volume; TTS has no per-message volume setting. Unitree volume ranges from 0 to 100.
+                </p>
+                <div className="mt-2 flex flex-wrap items-center gap-3">
+                  <label className="flex items-center gap-2 text-xs font-medium text-slate-700">
+                    Volume
+                    <input
+                      type="range"
+                      aria-label="Robot speaker volume"
+                      min="0"
+                      max="100"
+                      step="1"
+                      value={speakerVolume}
+                      disabled={!isRobotConnected || controllerVersion !== 'legacy' || isRunning || isSpeakerVolumeBusy}
+                      onChange={(event) => setSpeakerVolume(Number(event.target.value))}
+                      className="w-40 accent-violet-700 disabled:opacity-50"
+                    />
+                    <span className="min-w-12 text-right tabular-nums">{speakerVolume}/100</span>
+                  </label>
+                  <button
+                    type="button"
+                    onClick={() => handleSpeakerVolume('read')}
+                    disabled={!isRobotConnected || controllerVersion !== 'legacy' || isRunning || isSpeakerVolumeBusy}
+                    className="rounded border border-violet-300 bg-white px-3 py-1.5 text-xs font-semibold text-violet-900 disabled:opacity-50"
+                  >
+                    Read current
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => handleSpeakerVolume('set')}
+                    disabled={!isRobotConnected || controllerVersion !== 'legacy' || isRunning || isSpeakerVolumeBusy}
+                    className="rounded bg-violet-700 px-3 py-1.5 text-xs font-semibold text-white disabled:opacity-50"
+                  >
+                    {isSpeakerVolumeBusy ? 'Working…' : 'Apply volume'}
+                  </button>
+                </div>
+                <p role="status" aria-live="polite" className="mt-2 text-xs text-slate-700">
+                  {controllerVersion !== 'legacy'
+                    ? 'Switch to legacy G1 SDK mode to adjust speaker volume.'
+                    : !isRobotConnected
+                      ? 'Connect the legacy G1 SDK before reading or changing speaker volume.'
+                      : speakerVolumeStatus}
+                </p>
+              </fieldset>
+              <div className="flex items-center justify-between gap-3 rounded-xl border border-cyan-200 bg-cyan-50 px-5 py-4">
                 <div>
                   <p className="text-sm font-semibold text-gray-800">Shared LiDAR map</p>
                   <p className="text-xs text-gray-500">Show the teacher-approved room map on student grids.</p>
@@ -5150,9 +5404,7 @@ export default function App() {
                   className="h-5 w-5 accent-cyan-700"
                 />
               </div>
-            )}
-            {currentUser.role === 'teacher' && (
-              <div className="flex items-center justify-between gap-3 border-t bg-blue-50 px-5 py-3">
+              <div className="flex items-center justify-between gap-3 rounded-xl border border-blue-200 bg-blue-50 px-5 py-4">
                 <div>
                   <p className="text-sm font-semibold text-gray-800">DUET version two preview</p>
                   <p className="text-xs text-gray-600">
@@ -5165,12 +5417,40 @@ export default function App() {
                   checked={controllerVersion === 'duet'}
                   disabled={isRunning || isRobotConnecting || isDuetCommissioningBusy || isDuetCommissioningAborting}
                   onChange={(event) => handleControllerVersionChange(event.target.checked)}
-                  className="h-5 w-5 accent-blue-700"
+                  className="h-5 w-5 shrink-0 accent-blue-700"
                 />
               </div>
-            )}
-            {currentUser.role === 'teacher' && (
-              <fieldset className="border-t bg-slate-50 px-5 py-3">
+              <fieldset className="rounded-xl border border-amber-300 bg-amber-50 px-5 py-4">
+                <div className="flex items-start justify-between gap-4">
+                  <div>
+                    <p className="text-sm font-semibold text-amber-950">Safe Mode • registered obstacle coverage</p>
+                    <p className="mt-1 text-xs text-amber-900">
+                      Combines live front/rear clearance with recent LiDAR points registered in the map frame as the robot moves.
+                      Checks the robot's swept footprint during forward, reverse, sideways, and turning motion.
+                      Relevant missing or stale coverage stops movement; arm commands are skipped if the model-derived reach envelope is obstructed.
+                    </p>
+                    <p className="mt-1 text-xs font-medium text-red-800">
+                      Arm geometry is inflated by 0.20 m, but that is not a physical-safety certification. Sensor occlusion, model mismatch,
+                      latency, and stopping distance still require validation on the actual robot.
+                    </p>
+                  </div>
+                  <input
+                    type="checkbox"
+                    aria-label="Enable Safe Mode spatial guards"
+                    checked={safeModeEnabled}
+                    disabled={isSafeModeSettingsLoading || isSafeModeSettingsSaving || isRunning}
+                    onChange={(event) => handleSafeModeToggle(event.target.checked)}
+                    className="mt-1 h-5 w-5 shrink-0 accent-amber-700"
+                  />
+                </div>
+                <p className="mt-2 text-xs text-slate-700">
+                  DUET can stop its active arm/base lease when a relevant obstacle is detected. Legacy arm actions are checked before dispatch,
+                  because mid-action cancellation is unverified. Stale observations only affect an action when their mapped location intersects its swept area.
+                  Autonomous mode 3 and Return to Origin keep Nav2 as the fallback when the optional registered layer is unavailable.
+                </p>
+                {safeModeSettingsError && <p role="alert" className="mt-2 text-xs text-red-700">{safeModeSettingsError}</p>}
+              </fieldset>
+              <fieldset className="rounded-xl border border-slate-200 bg-slate-50 px-5 py-4">
                 <legend className="text-sm font-semibold text-gray-800">Hide sidebar tabs for this teacher account</legend>
                 <p className="mb-2 text-xs text-gray-500">
                   Hidden tabs stay hidden on other devices when this teacher account signs in.
@@ -5192,8 +5472,9 @@ export default function App() {
                 </div>
                 {lockedSidebarPanelsError && <p role="alert" className="mt-2 text-xs text-red-600">{lockedSidebarPanelsError}</p>}
               </fieldset>
-            )}
-            <div className="p-4 border-t bg-white flex justify-end gap-3"><button onClick={() => setShowConfigEditor(false)} className="px-5 py-2 text-sm text-gray-600 font-medium hover:bg-gray-100 rounded-lg">{t.closeBtn}</button><button onClick={handleApplyConfig} className="flex items-center gap-2 px-6 py-2 text-sm bg-blue-600 text-white rounded-lg font-bold hover:bg-blue-700 shadow-md"><Check size={16} /> {t.applyBtn}</button></div>
+                </>
+              )}
+            </div>
           </div>
         </div>
       )}
@@ -5225,32 +5506,6 @@ export default function App() {
           </div>
         </div>
       )}
-
-      {showAbout && (
-        <div className="fixed inset-0 z-[9999] flex items-center justify-center bg-black/40 backdrop-blur-sm p-4" onClick={() => setShowAbout(false)}>
-          <div className="bg-white max-w-md w-full rounded-xl shadow-2xl p-8 text-center" onClick={e => e.stopPropagation()}>
-            <div className="w-16 h-16 bg-blue-600 text-white rounded-2xl flex items-center justify-center text-3xl font-bold mx-auto mb-4 shadow-lg shadow-blue-200">U++</div>
-            <h2 className="text-2xl font-bold text-gray-800">{t.appName}</h2><p className="text-sm text-blue-600 font-mono mt-1 mb-6">{t.version}</p><p className="text-gray-600 text-sm leading-relaxed mb-6">{t.aboutContent}</p>
-            <button onClick={() => setShowAbout(false)} className="px-6 py-2 bg-gray-100 hover:bg-gray-200 text-gray-700 rounded-lg font-medium transition-colors">Close</button>
-          </div>
-        </div>
-      )}
-
-      <div className="h-9 bg-[#f8f9fa] border-b flex items-center px-2 select-none z-40 text-sm">
-        <div className="flex items-center gap-2 mr-6 px-2"><div className="w-5 h-5 bg-blue-600 text-white rounded flex items-center justify-center font-bold text-xs">U</div><span className="font-semibold text-gray-700 tracking-tight">{t.appName}</span></div>
-        <div className="flex items-center h-full">
-          {[
-            { id: 'file', label: t.menuFile, content: <><MenuItem label={t.actNew} icon={FileText} onClick={() => { handleClear(); setActiveMenu(null); }} /><MenuItem label={t.actOpen} icon={FolderOpen} onClick={handleOpenProjectClick} /><MenuItem label={t.actSave} icon={Save} onClick={() => { saveProject(); setActiveMenu(null); }} /><div className="h-px bg-gray-200 my-1"></div><MenuItem label={t.actExportPy} icon={Download} onClick={() => { downloadPython(); setActiveMenu(null); }} /></> },
-            { id: 'edit', label: t.menuEdit, content: <><MenuItem label={t.actUndo} icon={Undo} shortcut="Ctrl+Z" onClick={() => { handleUndo(); setActiveMenu(null); }} /><MenuItem label={t.actRedo} icon={Redo} shortcut="Ctrl+Y" onClick={() => { handleRedo(); setActiveMenu(null); }} /></> },
-            { id: 'view', label: t.menuView, content: <><MenuItem label="Open IDE" icon={Code} onClick={() => { setMainTab('ide'); setActiveMenu(null); }} /></> },
-            { id: 'help', label: t.menuHelp, content: <><MenuItem label={t.actAbout} icon={Info} onClick={() => { setShowAbout(true); setActiveMenu(null); }} /></> }
-          ].map(menu => (
-            <div key={menu.id} className="relative h-full"><button className={`h-full px-3 hover:bg-gray-200 transition-colors ${activeMenu === menu.id ? 'bg-gray-200 text-blue-700' : 'text-gray-700'}`} onClick={(e) => { e.stopPropagation(); setActiveMenu(activeMenu === menu.id ? null : menu.id); }}>{menu.label}</button>{activeMenu === menu.id && (<div className="absolute top-full left-0 w-56 bg-white border shadow-xl rounded-b-lg rounded-r-lg py-1 z-50 animate-in fade-in zoom-in-95 duration-100" onClick={e => e.stopPropagation()}>{menu.content}</div>)}</div>
-          ))}
-        </div>
-        <div className="flex-1"></div>
-        <button onClick={toggleLanguage} className="flex items-center gap-1 text-xs text-gray-500 hover:text-blue-600 px-3 transition-colors"><Globe size={12} /> {lang === 'zh' ? 'English' : '中文'}</button>
-      </div>
 
       {isSimulatorOpen && (
       <div className="fixed inset-0 z-50 bg-slate-950/20" onClick={() => setIsSimulatorOpen(false)}>
@@ -5853,6 +6108,7 @@ export default function App() {
                     ))}
                   </div>
                 </div>
+                {renderStarterMotionLibrary()}
               </>
             ) : (
               <>
@@ -5875,6 +6131,7 @@ export default function App() {
                     ))}
                   </div>
                 </div>
+                {renderStarterMotionLibrary()}
                 {savedCodes.length === 0 ? <p className="text-sm text-slate-500">No saved code yet.</p> : savedCodes.map((code) => (
                   <div key={code.name} className="rounded-lg border border-slate-200 p-2">
                     <p className="font-medium text-slate-800 text-sm">{code.name}</p>
@@ -6224,43 +6481,116 @@ export default function App() {
 
           {!toolPanelCollapsed && (
             <div className="border-b border-slate-700 bg-slate-900/90 p-2">
-              <div className="flex gap-2">
+              <div data-testid="workspace-actions" className="flex flex-wrap items-center gap-2">
                 <button type="button" onClick={handleRunSimulation} className="flex-1 rounded-md bg-emerald-500 px-2 py-2 text-[10px] font-bold text-slate-950 hover:bg-emerald-400">
                   {isPreviewPlaying ? 'Running simulation' : 'Run simulation'}
                 </button>
                 {currentUser.role === 'student' && (
-                  <>
-                    <button type="button" onClick={handleSubmitToQueue} className="flex-1 rounded-md bg-violet-500 px-2 py-2 text-[10px] font-bold text-white hover:bg-violet-400">
-                      Submit to teacher
-                    </button>
-                    <button type="button" onClick={() => setIsSimulatorOpen(true)} className="rounded-md bg-slate-700 px-2 py-2 text-[10px] font-bold text-white hover:bg-slate-600" title="Open saved code">
-                      Library
-                    </button>
-                  </>
+                  <button type="button" onClick={handleSubmitToQueue} className="flex-1 rounded-md bg-violet-500 px-2 py-2 text-[10px] font-bold text-white hover:bg-violet-400">
+                    Submit to teacher
+                  </button>
                 )}
                 {currentUser.role === 'teacher' && (
-                  <>
-                    <button type="button" onClick={() => setIsSimulatorOpen(true)} className="flex-1 rounded-md bg-blue-500 px-2 py-2 text-[10px] font-bold text-white hover:bg-blue-400">
-                      Open queue
-                    </button>
-                    <button
-                      type="button"
-                      onClick={handleRunCode}
-                      disabled={lidarScanJob?.status === 'scanning' && !isRunning}
-                      className="rounded-md bg-amber-500 px-2 py-2 text-[10px] font-bold text-slate-950 hover:bg-amber-400 disabled:cursor-not-allowed disabled:opacity-50"
-                      title={lidarScanJob?.status === 'scanning' ? 'SDK motion is locked while the LiDAR room scan is capturing' : isRunning ? 'Stops locomotion; cannot cancel an active arm preset' : 'Run code on connected robot'}
-                    >
-                      {isRunning ? 'Stop robot' : 'Robot run'}
-                    </button>
-                  </>
+                  <button type="button" onClick={() => setIsSimulatorOpen(true)} className="flex-1 rounded-md bg-blue-500 px-2 py-2 text-[10px] font-bold text-white hover:bg-blue-400">
+                    Open queue
+                  </button>
+                )}
+                {currentUser.role === 'student' && (
+                  <button type="button" onClick={() => setIsSimulatorOpen(true)} className="rounded-md bg-slate-700 px-2 py-2 text-[10px] font-bold text-white hover:bg-slate-600" title="Open saved code">
+                    Library
+                  </button>
+                )}
+                {currentUser.role === 'teacher' && (
+                  <button
+                    type="button"
+                    onClick={handleRunCode}
+                    disabled={lidarScanJob?.status === 'scanning' && !isRunning}
+                    className="rounded-md bg-amber-500 px-2 py-2 text-[10px] font-bold text-slate-950 hover:bg-amber-400 disabled:cursor-not-allowed disabled:opacity-50"
+                    title={lidarScanJob?.status === 'scanning' ? 'SDK motion is locked while the LiDAR room scan is capturing' : isRunning ? 'Stops locomotion; cannot cancel an active arm preset' : 'Run code on connected robot'}
+                  >
+                    {isRunning ? 'Stop robot' : 'Robot run'}
+                  </button>
                 )}
               </div>
               <div className="mt-2 flex items-center justify-between text-[10px] text-slate-400">
                 <span>{currentUser.role === 'teacher' ? 'Teacher workspace' : 'Student workspace'}</span>
                 <div className="flex items-center gap-2">
-                  <button type="button" onClick={handleSaveCodeToAccount} className="text-slate-300 hover:text-white">Save</button>
+                  <div className="relative">
+                    <button
+                      type="button"
+                      aria-label="Open project actions"
+                      aria-expanded={activeMenu === 'project'}
+                      onClick={(event) => {
+                        event.stopPropagation();
+                        if (activeMenu === 'project') {
+                          setActiveMenu(null);
+                          return;
+                        }
+                        const bounds = event.currentTarget.getBoundingClientRect();
+                        const margin = 8;
+                        const width = Math.min(224, window.innerWidth - margin * 2);
+                        const above = bounds.top - margin;
+                        const below = window.innerHeight - bounds.bottom - margin;
+                        const openAbove = above >= below;
+                        const availableHeight = Math.max(1, Math.min(520, openAbove ? above : below));
+                        setProjectMenuPosition({
+                          position: 'fixed',
+                          left: Math.max(margin, Math.min(bounds.left, window.innerWidth - width - margin)),
+                          top: openAbove
+                            ? Math.max(margin, bounds.top - availableHeight - margin)
+                            : bounds.bottom + margin,
+                          maxHeight: availableHeight,
+                        });
+                        setActiveMenu('project');
+                      }}
+                      className="text-slate-300 hover:text-white"
+                    >
+                      {t.projectMenu}
+                    </button>
+                    {activeMenu === 'project' && createPortal(
+                      <div
+                        role="menu"
+                        aria-label="Project actions"
+                        className="z-[100] w-56 max-w-[calc(100vw-1rem)] overflow-y-auto rounded-xl border border-slate-700 bg-slate-900 py-1 text-slate-200 shadow-xl"
+                        style={projectMenuPosition}
+                        onClick={(event) => event.stopPropagation()}
+                      >
+                        <MenuItem dark label={t.actSaveToAccount} icon={Save} onClick={() => { handleSaveCodeToAccount(); setActiveMenu(null); }} />
+                        <div className="my-1 h-px bg-slate-700"></div>
+                        <MenuItem dark label={t.actNew} icon={FileText} onClick={() => { handleClear(); setActiveMenu(null); }} />
+                        <MenuItem dark label={t.actImportJson} icon={FolderOpen} onClick={handleOpenProjectClick} />
+                        <MenuItem dark label={t.actExportJson} icon={Save} onClick={() => { saveProject(); setActiveMenu(null); }} />
+                        <MenuItem dark label={t.actImportPython} icon={Code} onClick={handleImportPythonClick} />
+                        <MenuItem dark label={t.actExportPy} icon={Download} onClick={() => { downloadPython(); setActiveMenu(null); }} />
+                        <div className="my-1 h-px bg-slate-700"></div>
+                        <MenuItem dark label={t.actUndo} icon={Undo} shortcut="Ctrl+Z" onClick={() => { handleUndo(); setActiveMenu(null); }} />
+                        <MenuItem dark label={t.actRedo} icon={Redo} shortcut="Ctrl+Y" onClick={() => { handleRedo(); setActiveMenu(null); }} />
+                        <MenuItem dark label={t.actClear} icon={Trash2} danger onClick={() => { handleClear(); setActiveMenu(null); }} />
+                      </div>,
+                      document.body,
+                    )}
+                  </div>
                   <button type="button" onClick={handleLogout} className="text-slate-300 hover:text-white">Logout</button>
-                  <button type="button" onClick={() => setShowConfigEditor(true)} className="text-slate-300 hover:text-white" aria-label="Open app settings">Settings</button>
+                  {currentUser.role === 'teacher' && (
+                    <>
+                      <button
+                        type="button"
+                        onClick={() => setShowConfigEditor(true)}
+                        aria-label="Open robot configuration"
+                        className="text-slate-300 hover:text-white"
+                      >
+                        Configure
+                      </button>
+                    </>
+                  )}
+                  <button
+                    type="button"
+                    onClick={() => setShowAppSettings(true)}
+                    aria-label="Open app settings"
+                    className="text-slate-300 hover:text-white"
+                  >
+                    Settings
+                  </button>
                 </div>
               </div>
             </div>
@@ -6297,53 +6627,6 @@ export default function App() {
 
               <div className="flex min-h-0 flex-1 flex-col gap-2 overflow-hidden p-3">
                 <div className={`${mainTab === 'blocks' ? 'min-h-0 flex-[2_1_0%] overflow-y-auto' : 'hidden'} space-y-3 text-slate-200`}>
-                    <div className="rounded-xl border border-slate-700 bg-slate-900 p-3">
-                      <p className="text-[10px] uppercase tracking-[0.18em] text-slate-400">
-                        {controllerVersion === 'duet' ? 'Workspace • DUET version two' : 'Workspace'}
-                      </p>
-                      <div className="mt-3 flex gap-2">
-                        <button type="button" onClick={handleRunSimulation} className="flex-1 rounded-md bg-emerald-600 px-2 py-2 text-xs font-semibold text-white hover:bg-emerald-500">Run simulation</button>
-                        {currentUser.role === 'teacher' && (
-                          <button
-                            type="button"
-                            onClick={handleRunCode}
-                            disabled={(!isRobotConnected && !isRunning) || (lidarScanJob?.status === 'scanning' && !isRunning)}
-                            title={lidarScanJob?.status === 'scanning' ? 'SDK motion is locked while the LiDAR room scan is capturing' : isRunning ? 'Stops locomotion; cannot cancel an active arm preset' : isRobotConnected ? 'Send this program to the connected G1' : 'Connect the G1 SDK before sending commands'}
-                            className="flex-1 rounded-md bg-amber-500 px-2 py-2 text-xs font-semibold text-slate-950 hover:bg-amber-400 disabled:cursor-not-allowed disabled:opacity-50"
-                          >
-                            {isRunning ? 'Stop robot' : 'Send to robot'}
-                          </button>
-                        )}
-                        <button
-                          type="button"
-                          onClick={handleUndo}
-                          title="Undo blocks (Ctrl+Z or Cmd+Z)"
-                          aria-label="Undo blocks"
-                          className="flex items-center justify-center gap-1 rounded-md bg-slate-700 px-2 py-2 text-[10px] font-semibold text-slate-200 hover:bg-slate-600"
-                        >
-                          <Undo size={14} />
-                          <span className="hidden sm:inline">Undo</span>
-                        </button>
-                        <button
-                          type="button"
-                          onClick={handleRedo}
-                          title="Redo blocks (Ctrl+Y, Ctrl+Shift+Z, or Cmd+Shift+Z)"
-                          aria-label="Redo blocks"
-                          className="flex items-center justify-center gap-1 rounded-md bg-slate-700 px-2 py-2 text-[10px] font-semibold text-slate-200 hover:bg-slate-600"
-                        >
-                          <Redo size={14} />
-                          <span className="hidden sm:inline">Redo</span>
-                        </button>
-                        <button type="button" onClick={handleClear} className="flex-1 rounded-md bg-slate-700 px-2 py-2 text-xs font-semibold text-slate-200 hover:bg-slate-600">Clear</button>
-                      </div>
-                      {currentUser.role === 'teacher' && (
-                        <p className="mt-2 text-[10px] text-slate-400" role="status" aria-live="polite">
-                          {lidarScanJob?.status === 'scanning'
-                            ? 'SDK motion is locked while the room scan captures data.'
-                            : isRunning ? 'Sending/running program on the G1…' : isRobotConnected ? 'G1 connected and ready for a program.' : 'Connect the G1 SDK before sending a physical run.'}
-                        </p>
-                      )}
-                    </div>
                     <div className="relative h-[min(680px,calc(100vh-16rem))] min-h-[420px] overflow-hidden rounded-xl border border-slate-700 bg-slate-900">
                       <div ref={blocklyDiv} className="h-full w-full" />
                       {blockSyncError && (
@@ -7364,7 +7647,7 @@ export default function App() {
                             description: example.label,
                             script: example.code,
                           }))
-                          : G1_EXECUTABLE_COMMANDS).flatMap((command) => {
+                          : legacyCommandsForCurrentUser).flatMap((command) => {
                           if (controllerVersion === 'duet') {
                             return [{
                               ...command,

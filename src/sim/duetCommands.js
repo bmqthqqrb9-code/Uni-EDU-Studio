@@ -151,12 +151,20 @@ export const DUET_COMMANDS = Object.freeze([
     numberArgument('YAW_RATE', 'yaw rad/s', 0, -0.35, 0.35),
     seconds(),
   ], 'Move with custom velocity'),
-  presetMove('forward', 'Move forward for %1 s', 'Move forward at a conservative fixed velocity.', 0.15, 0, 0),
+  presetMove('walk', 'Walk forward for %1 s', 'Walk forward at a conservative fixed velocity for the selected time. DUET uses timed velocity, not Legacy step counts.', 0.15, 0, 0),
   presetMove('backward', 'Move backward for %1 s', 'Move backward at a conservative fixed velocity.', -0.1, 0, 0),
   presetMove('strafe_left', 'Strafe left for %1 s', 'Move laterally left at a conservative fixed velocity.', 0, 0.1, 0),
   presetMove('strafe_right', 'Strafe right for %1 s', 'Move laterally right at a conservative fixed velocity.', 0, -0.1, 0),
   presetMove('turn_left', 'Turn left for %1 s', 'Turn left at a conservative fixed yaw rate; final angle is not guaranteed.', 0, 0, 0.25),
   presetMove('turn_right', 'Turn right for %1 s', 'Turn right at a conservative fixed yaw rate; final angle is not guaranteed.', 0, 0, -0.25),
+  {
+    ...command(
+      'turn_around_180',
+      'Turn around about 180° in place',
+      'Turn in place by about 180° using bounded left-yaw segments. The final angle is approximate; keep the area clear and supervise.',
+    ),
+    motion: Object.freeze({ vx: 0, vy: 0, yawRate: 0.25 }),
+  },
   presetMove('arc_forward_left', 'Arc forward-left for %1 s', 'Combine conservative forward velocity and left yaw rate.', 0.12, 0, 0.2),
   presetMove('arc_forward_right', 'Arc forward-right for %1 s', 'Combine conservative forward velocity and right yaw rate.', 0.12, 0, -0.2),
   presetMove('arc_backward_left', 'Arc backward-left for %1 s', 'Combine conservative backward velocity and left yaw rate.', -0.08, 0, 0.2),
@@ -212,6 +220,11 @@ export const DUET_COMMANDS = Object.freeze([
 })));
 
 const COMMAND_BY_METHOD = new Map(DUET_COMMANDS.map((definition) => [definition.method, definition]));
+const DUET_COMMAND_ALIASES = Object.freeze({
+  // `forward` was the original DUET spelling. Keep saved programs valid while
+  // generating the Legacy-aligned `walk` spelling for new/normalized code.
+  forward: 'walk',
+});
 const POSE_METHODS = Object.freeze({
   carry: 'arm_carry',
   forward: 'arm_reach',
@@ -263,6 +276,19 @@ function formatValue(value, argument) {
 }
 
 function normalizeCommand(method, rawArgs, lineNumber) {
+  const canonicalMethod = DUET_COMMAND_ALIASES[method];
+  if (canonicalMethod) return normalizeCommand(canonicalMethod, rawArgs, lineNumber);
+  if (method === 'turn_around_180') {
+    if (splitArguments(rawArgs, lineNumber).length) {
+      throw new Error(`duet.turn_around_180 takes no arguments on line ${lineNumber}.`);
+    }
+    return {
+      type: 'command',
+      method,
+      values: [Number((Math.PI / 0.25).toFixed(3))],
+      code: 'duet.turn_around_180()',
+    };
+  }
   if (method === 'saved_motion') {
     const args = splitArguments(rawArgs, lineNumber);
     if (args.length !== 1) {
@@ -537,7 +563,9 @@ function countCommands(nodes) {
         ? 1 + (getDuetCommand(node.gesture.method)?.armPoses?.length || 1)
         : node.type === 'condition'
           ? 1 + Math.max(countCommands(node.then), countCommands(node.else))
-        : getDuetCommand(node.method)?.armPoses?.length || 1)
+        : node.method === 'turn_around_180'
+          ? 5
+          : getDuetCommand(node.method)?.armPoses?.length || 1)
   ), 0);
 }
 
@@ -705,7 +733,7 @@ export function getDuetBlocklyCommandBlocks(savedMotions = []) {
 }
 
 export function getDuetCommand(method) {
-  return COMMAND_BY_METHOD.get(method) || null;
+  return COMMAND_BY_METHOD.get(DUET_COMMAND_ALIASES[method] || method) || null;
 }
 
 export function getDuetCommandExamples(savedMotions = []) {
@@ -742,7 +770,7 @@ export function getDuetCommandExamples(savedMotions = []) {
     {
       key: 'front_distance_condition',
       label: 'Front distance condition example',
-      code: 'if duet.front_distance_m() < 1:\n    duet.stop()\nelse:\n    duet.forward(1)',
+      code: 'if duet.front_distance_m() < 1:\n    duet.stop()\nelse:\n    duet.walk(1)',
     },
     {
       key: 'rear_distance_condition',
@@ -836,7 +864,7 @@ export function compileDuetMotionPrompt(prompt = '') {
       const [, direction, side] = concurrentMatch;
       const armDuration = Math.max(1, Number((duration + 0.5).toFixed(1)));
       const level = /\b(high|up)\b/.test(normalized) ? 'high' : /\b(low|down)\b/.test(normalized) ? 'low' : 'mid';
-      const movementMethod = direction === 'backward' ? 'backward' : 'forward';
+      const movementMethod = direction === 'backward' ? 'backward' : 'walk';
       steps.push({
         label: `Move ${direction} while waving ${side}`,
         code: `with duet.concurrent():\n    duet.${movementMethod}(${duration})\n    duet.wave_${side}("${level}", ${armDuration})`,
@@ -881,7 +909,7 @@ export function compileDuetMotionPrompt(prompt = '') {
     }
     if (action === 'walk' || action === 'move') {
       if (/\bdegrees?\b|\bangle\b/.test(normalized)) {
-        unknown.push('Angle-based movement is not supported; use forward, backward, left, or right velocity commands.');
+        unknown.push('Angle-based movement is not supported; use walk, backward, left, or right velocity commands.');
         return;
       }
       if (/\bsteps?\b|\bmeters?\b|\bmetres?\b/.test(normalized)) {
@@ -889,13 +917,13 @@ export function compileDuetMotionPrompt(prompt = '') {
         return;
       }
       steps.push({
-        label: direction === 'backward' ? 'Move backward' : 'Move forward',
-        code: `duet.${direction}(${duration})`,
+        label: direction === 'backward' ? 'Walk backward' : 'Walk forward',
+        code: `duet.${direction === 'backward' ? 'backward' : 'walk'}(${duration})`,
         detail: `${duration} seconds at a conservative velocity`,
       });
     } else if (action === 'strafe' || action === 'sidestep' || action === 'step') {
       if (/\bdegrees?\b|\bangle\b/.test(normalized)) {
-        unknown.push('Angle-based movement is not supported; use forward, backward, left, or right velocity commands.');
+        unknown.push('Angle-based movement is not supported; use walk, backward, left, or right velocity commands.');
         return;
       }
       const vy = direction === 'left' ? 0.1 : -0.1;
@@ -1027,7 +1055,7 @@ export function compileDuetMotionPrompt(prompt = '') {
     unknown.push('Kicks, isolated knee raises, dance, and mimic are not available in the DUET command set.');
   }
   if (!steps.length) {
-    unknown.push('Try: “move forward for 1 second, then turn left for 1 second”.');
+    unknown.push('Try: “walk forward for 1 second, then turn left for 1 second”.');
   }
   let code = steps.map((step) => step.code).join('\n');
   const repeatMatch = normalized.match(/\brepeat\b.*?\b(\d+)\s+times?\b/);

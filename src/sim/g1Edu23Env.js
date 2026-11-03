@@ -635,11 +635,15 @@ export function buildLegacyG1SimulationFrames(pythonCode, options = {}) {
       heading = previousHeading;
     }
 
-    if (methodName === 'turn') {
+    if (methodName === 'turn' || methodName === 'turn_around_180') {
       const directionMatch = argsRaw.match(/["'](left|right)["']/i);
       const amountMatch = argsRaw.match(/,\s*(-?\d*\.?\d+)/);
-      const amount = amountMatch ? Number(amountMatch[1]) : 90;
-      const delta = directionMatch?.[1].toLowerCase() === 'right' ? -amount : amount;
+      const amount = methodName === 'turn_around_180'
+        ? 180
+        : amountMatch ? Number(amountMatch[1]) : 90;
+      const delta = methodName === 'turn_around_180' || directionMatch?.[1].toLowerCase() !== 'right'
+        ? amount
+        : -amount;
       const startingHeading = heading;
       animateAction(
         Math.max(10, Math.ceil(Math.abs(amount) / 6)),

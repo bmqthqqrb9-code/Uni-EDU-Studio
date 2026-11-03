@@ -16,6 +16,32 @@ app = server.app
 
 
 class ServerClassroomTests(unittest.TestCase):
+    def test_classroom_code_library_includes_built_in_legacy_and_duet_starters(self):
+        client = TestClient(app)
+        with tempfile.TemporaryDirectory() as temp_dir, patch.object(
+            server, "DB_PATH", os.path.join(temp_dir, "classroom.db")
+        ):
+            server.init_db()
+            teacher = client.post(
+                "/api/classroom/login",
+                json={"username": "teacher", "password": "teacher"},
+            ).json()
+            response = client.get(
+                "/api/classroom/codes",
+                headers={"Authorization": "Bearer " + teacher["token"]},
+            )
+
+        payload = response.json()
+        starters = payload["starter_codes"]
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual({entry["controller_version"] for entry in starters}, {"legacy", "duet"})
+        self.assertEqual(len(starters), 18)
+        self.assertEqual(
+            sum(entry["name"] == "turn-around-180" for entry in starters),
+            2,
+        )
+        self.assertTrue(all(entry["builtin"] for entry in starters))
+
     def test_sidebar_settings_are_saved_per_teacher_account(self):
         client = TestClient(app)
         with tempfile.TemporaryDirectory() as temp_dir, patch.object(
@@ -971,7 +997,11 @@ class ServerClassroomTests(unittest.TestCase):
             self.assertEqual(response.status_code, 200)
             self.assertEqual(response.json()["item"]["status"], "completed")
             self.assertEqual(response.json()["process"]["commandsExecuted"], 1)
-            execute.assert_called_once_with(code)
+            execute.assert_called_once_with(
+                code,
+                safe_mode=False,
+                safe_mode_stop_margin_m=server.SAFE_MODE_STOP_MARGIN_METERS,
+            )
 
     def test_run_next_dispatches_each_project_planner_mode_to_its_executor(self):
         with tempfile.TemporaryDirectory() as temp_dir, patch.object(
@@ -1022,7 +1052,11 @@ class ServerClassroomTests(unittest.TestCase):
                     headers=teacher_headers,
                     json={"item_id": manual_item["id"]},
                 )
-            execute_manual.assert_called_once_with("robot.walktime(1)")
+            execute_manual.assert_called_once_with(
+                "robot.walktime(1)",
+                safe_mode=False,
+                safe_mode_stop_margin_m=server.SAFE_MODE_STOP_MARGIN_METERS,
+            )
             self.assertEqual(manual_result.status_code, 200)
             self.assertEqual(manual_result.json()["status"], "completed")
 

@@ -1,0 +1,15 @@
+{
+  "format": "uni-edu-studio-block-example-v1",
+  "controller_version": "duet",
+  "name": "walk-backward",
+  "title": "Walk Backward",
+  "blocks": [
+    {
+      "type": "duet_command_backward",
+      "method": "backward",
+      "inputs": [
+        "1"
+      ]
+    }
+  ]
+}

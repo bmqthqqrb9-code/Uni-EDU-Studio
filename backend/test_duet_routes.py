@@ -38,6 +38,76 @@ class DuetRouteTests(unittest.TestCase):
 
         self.assertEqual(response.status_code, 403)
 
+    def test_safe_mode_setting_is_teacher_only_and_persists_per_teacher(self):
+        default = self.client.get("/api/classroom/safe-mode", headers=self.teacher)
+        student = self.client.get("/api/classroom/safe-mode", headers=self.student)
+        self.assertEqual(default.status_code, 200)
+        self.assertFalse(default.json()["enabled"])
+        self.assertEqual(default.json()["coverage"], "front_rear_footprint")
+        self.assertFalse(default.json()["full_coverage_available"])
+        self.assertEqual(student.status_code, 403)
+
+        updated = self.client.put(
+            "/api/classroom/safe-mode",
+            headers=self.teacher,
+            json={"enabled": True},
+        )
+        self.assertEqual(updated.status_code, 200)
+        self.assertTrue(updated.json()["enabled"])
+        self.assertTrue(
+            self.client.get("/api/classroom/safe-mode", headers=self.teacher).json()["enabled"]
+        )
+
+        forbidden = self.client.put(
+            "/api/classroom/safe-mode",
+            headers=self.student,
+            json={"enabled": False},
+        )
+        self.assertEqual(forbidden.status_code, 403)
+
+    def test_safe_mode_setting_is_passed_to_both_physical_run_paths(self):
+        updated = self.client.put(
+            "/api/classroom/safe-mode",
+            headers=self.teacher,
+            json={"enabled": True},
+        )
+        self.assertEqual(updated.status_code, 200)
+
+        with patch.object(server, "ensure_sdk_motion_available"), patch.object(
+            server, "execute_robot_program", return_value={"status": "completed"}
+        ) as execute_sdk, patch.object(
+            server, "active_navigation_operation", return_value=None
+        ), patch.object(
+            server, "active_lidar_scan", return_value=None
+        ), patch.object(
+            server, "robot_status", return_value={"running": False}
+        ), patch.object(
+            server, "execute_duet_program", return_value={"status": "completed"}
+        ) as execute_duet:
+            legacy = self.client.post(
+                "/api/run",
+                headers=self.teacher,
+                json={"code": "robot.walk(1)"},
+            )
+            duet = self.client.post(
+                "/api/duet/run",
+                headers=self.teacher,
+                json={"code": "duet.walk(1)"},
+            )
+
+        self.assertEqual(legacy.status_code, 200)
+        self.assertEqual(duet.status_code, 200)
+        execute_sdk.assert_called_once_with(
+            "robot.walk(1)",
+            safe_mode=True,
+            safe_mode_stop_margin_m=server.SAFE_MODE_STOP_MARGIN_METERS,
+        )
+        execute_duet.assert_called_once_with(
+            "duet.walk(1)",
+            safe_mode=True,
+            safe_mode_stop_margin_m=server.SAFE_MODE_STOP_MARGIN_METERS,
+        )
+
     def test_duet_commissioning_routes_are_teacher_only(self):
         requests = (
             ("get", "/api/duet/commissioning", None),
@@ -211,7 +281,11 @@ class DuetRouteTests(unittest.TestCase):
 
         self.assertEqual(response.status_code, 200)
         self.assertEqual(response.json(), expected)
-        execute.assert_called_once_with("duet.wave_left('mid', 1)")
+        execute.assert_called_once_with(
+            "duet.wave_left('mid', 1)",
+            safe_mode=False,
+            safe_mode_stop_margin_m=server.SAFE_MODE_STOP_MARGIN_METERS,
+        )
 
     def test_duet_connect_reports_missing_gateway_and_does_not_use_sdk(self):
         with patch.dict(os.environ, {
@@ -265,7 +339,11 @@ class DuetRouteTests(unittest.TestCase):
 
         self.assertEqual(response.status_code, 200)
         self.assertEqual(response.json(), expected)
-        execute_sdk.assert_called_once_with("robot.walk(1)")
+        execute_sdk.assert_called_once_with(
+            "robot.walk(1)",
+            safe_mode=False,
+            safe_mode_stop_margin_m=server.SAFE_MODE_STOP_MARGIN_METERS,
+        )
         execute_duet.assert_not_called()
 
     def test_legacy_motion_is_blocked_when_duet_owns_or_may_own_motion(self):
@@ -309,7 +387,11 @@ class DuetRouteTests(unittest.TestCase):
             )
 
         self.assertEqual(response.status_code, 200)
-        execute_duet.assert_called_once_with("duet.stop()")
+        execute_duet.assert_called_once_with(
+            "duet.stop()",
+            safe_mode=False,
+            safe_mode_stop_margin_m=server.SAFE_MODE_STOP_MARGIN_METERS,
+        )
         execute_sdk.assert_not_called()
         self.assertEqual(server.list_queue_items()[0]["status"], "completed")
 
@@ -405,7 +487,11 @@ class DuetRouteTests(unittest.TestCase):
 
         self.assertEqual(approved.status_code, 200)
         self.assertEqual(approved.json()["item"]["status"], "completed")
-        execute_sdk.assert_called_once_with("robot.walktime(1)")
+        execute_sdk.assert_called_once_with(
+            "robot.walktime(1)",
+            safe_mode=False,
+            safe_mode_stop_margin_m=server.SAFE_MODE_STOP_MARGIN_METERS,
+        )
         self.assertEqual(server.list_queue_items()[0]["status"], "completed")
 
     def test_teacher_stop_during_queue_run_keeps_item_paused(self):
@@ -416,7 +502,7 @@ class DuetRouteTests(unittest.TestCase):
         )
         item = submitted.json()["item"]
 
-        def stop_during_execution(code):
+        def stop_during_execution(code, **_kwargs):
             server.set_queue_item_status(item["id"], "paused")
             raise server.HTTPException(status_code=409, detail="Robot program stopped by teacher.")
 

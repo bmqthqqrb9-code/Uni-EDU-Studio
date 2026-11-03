@@ -1,4 +1,16 @@
 import { test, expect } from '@playwright/test';
+import { getG1BlocklyCommandBlocks, parseG1Program } from '../src/sim/g1Commands.js';
+import { getDuetBlocklyCommandBlocks, parseDuetProgram } from '../src/sim/duetCommands.js';
+
+test('legacy and DUET expose the same approximate in-place 180-degree turn name', () => {
+  const legacy = parseG1Program('robot.turn_around_180()');
+  const duet = parseDuetProgram('duet.turn_around_180()');
+  expect(legacy[0].method).toBe('turn_around_180');
+  expect(duet[0].method).toBe('turn_around_180');
+  expect(duet[0].code).toBe('duet.turn_around_180()');
+  expect(getG1BlocklyCommandBlocks().some((block) => block.type === 'g1_command_turn_around_180')).toBe(true);
+  expect(getDuetBlocklyCommandBlocks().some((block) => block.type === 'duet_command_turn_around_180')).toBe(true);
+});
 
 test('App loads without runtime initialization errors', async ({ page }) => {
   const pageErrors = [];
@@ -57,6 +69,54 @@ test('public account registration creates a student account only', async ({ page
     password: 'new-student-password',
   });
   await expect(page.getByText('Student workspace')).toBeVisible();
+});
+
+test('starter motion library is visible to students and loading an example does not run it', async ({ page }) => {
+  const loadRequests = [];
+  await page.addInitScript(() => {
+    localStorage.setItem('edu-classroom-session', JSON.stringify({
+      token: 'starter-library-student-token',
+      user: { role: 'student', username: 'motion_student' },
+    }));
+  });
+  await page.route('**/api/**', async (route) => {
+    const request = route.request();
+    const url = new URL(request.url());
+    if (url.pathname === '/api/classroom/codes') {
+      await route.fulfill({
+        status: 200,
+        contentType: 'application/json',
+        body: JSON.stringify({
+          codes: [],
+          starter_codes: [{
+            name: 'walk-forward',
+            title: 'Walk Forward',
+            description: 'One short example.',
+            controller_version: 'legacy',
+            code: 'robot.stand()\nrobot.wait(2)\nrobot.walk(2)',
+            builtin: true,
+          }],
+        }),
+      });
+      return;
+    }
+    if (['/api/run', '/api/duet/run', '/api/classroom/submit-code'].includes(url.pathname)) {
+      loadRequests.push(url.pathname);
+    }
+    await route.fulfill({
+      status: 200,
+      contentType: 'application/json',
+      body: JSON.stringify({}),
+    });
+  });
+
+  await page.goto('/');
+  await expect(page.locator('canvas')).toBeVisible();
+  await page.getByRole('button', { name: 'Library' }).click();
+  await expect(page.getByText('Starter motion library')).toBeVisible();
+  await expect(page.getByText('walk-forward', { exact: true })).toBeVisible();
+  await page.getByRole('button', { name: 'Load into editor' }).click();
+  expect(loadRequests).toEqual([]);
 });
 
 test('teacher can create and delete student accounts from the classroom panel', async ({ page }) => {
@@ -135,6 +195,22 @@ test('teacher can hide locked sidebar panels and restore them from settings', as
   });
   await page.route('**/api/**', async (route) => {
     const url = new URL(route.request().url());
+    if (url.pathname === '/api/classroom/safe-mode') {
+      if (route.request().method() === 'PUT') {
+        safeModeEnabled = route.request().postDataJSON().enabled;
+      }
+      await route.fulfill({
+        status: 200,
+        contentType: 'application/json',
+        body: JSON.stringify({
+          enabled: safeModeEnabled,
+          stop_margin_m: 1,
+          coverage: 'front_rear_footprint',
+          full_coverage_available: false,
+        }),
+      });
+      return;
+    }
     if (url.pathname === '/api/classroom/sidebar-settings') {
       if (route.request().method() === 'PUT') {
         lockedPanels = route.request().postDataJSON().locked_panels;
@@ -156,9 +232,15 @@ test('teacher can hide locked sidebar panels and restore them from settings', as
 
   let lockedPanels = [];
   let sidebarSettingsConfigured = false;
+  let safeModeEnabled = false;
   await page.goto('/');
   await expect(page.locator('canvas')).toBeVisible();
   await page.getByRole('button', { name: 'Open app settings' }).click();
+  const safeModeToggle = page.getByRole('checkbox', { name: 'Enable Safe Mode spatial guards' });
+  await expect(safeModeToggle).not.toBeChecked();
+  await expect(page.getByText(/Arm geometry is inflated by 0\.20 m/)).toBeVisible();
+  await safeModeToggle.check();
+  await expect.poll(() => safeModeEnabled).toBe(true);
   for (const panelName of ['Path Planner', 'Prompt to Motion', 'Vision to Motion']) {
     await page.getByRole('checkbox', { name: `Hide ${panelName} tab from sidebar` }).check();
   }
@@ -192,6 +274,8 @@ test('teacher can hide locked sidebar panels and restore them from settings', as
   await expect(page.getByRole('button', { name: 'Path Planner', exact: true })).toHaveCount(0);
   await expect(page.getByRole('button', { name: 'Vision to Motion', exact: true })).toHaveCount(0);
   await expect(page.getByRole('button', { name: 'Prompt to Motion', exact: true })).toBeVisible();
+  await page.getByRole('button', { name: 'Open app settings' }).click();
+  await expect(page.getByRole('checkbox', { name: 'Enable Safe Mode spatial guards' })).toBeChecked();
 });
 
 test('teacher queue review overlays the workspace and shows the complete submitted project', async ({ page }) => {
@@ -719,7 +803,7 @@ test('DUET prompt and vision tabs expose both approved motion modes', async ({ p
   await expect(page.getByText('Vision to DUET motion')).toBeVisible();
 });
 
-test('student queue does not expose teacher sensor diagnostics or call sensor APIs', async ({ page }) => {
+test('student view hides legacy arm holds and diagnostics without exposing sensor controls', async ({ page }) => {
   const sensorRequests = [];
   await page.addInitScript(() => {
     localStorage.setItem('edu-classroom-session', JSON.stringify({
@@ -738,12 +822,96 @@ test('student queue does not expose teacher sensor diagnostics or call sensor AP
   });
 
   await page.goto('/');
+  await page.getByRole('button', { name: 'IDE', exact: true }).click();
+  await expect(page.getByText('robot.hold_arm("hands up", 3)', { exact: true })).toHaveCount(0);
+  await expect(page.getByText('robot.getfsm()', { exact: true })).toHaveCount(0);
+  await expect(page.getByText('robot.getactions()', { exact: true })).toHaveCount(0);
+  await expect(page.getByText('robot.setvolume(50)', { exact: true })).toHaveCount(0);
   await page.getByRole('button', { name: 'Library' }).click();
   await expect(page.getByText('My Saved Code')).toBeVisible();
   await expect(page.getByText('Sensors and diagnostics')).toHaveCount(0);
+  await expect(page.getByRole('button', { name: 'Discover sensors' })).toHaveCount(0);
   await expect(page.getByRole('button', { name: 'Set Origin' })).toHaveCount(0);
   await expect(page.getByRole('button', { name: 'Return to Origin' })).toHaveCount(0);
   expect(sensorRequests).toEqual([]);
+  await page.getByRole('button', { name: 'Close simulator' }).click();
+  await expect(page.getByRole('button', { name: 'Open robot configuration' })).toHaveCount(0);
+  await expect(page.getByRole('button', { name: 'Open app settings' })).toBeVisible();
+  await page.getByRole('button', { name: 'Open app settings' }).click();
+  await expect(page.getByText('Choose the application language.')).toBeVisible();
+  await expect(page.getByText('Uni++ EDU Studio')).toHaveCount(0);
+  await expect(page.getByText('graphical programming environment for Unitree Robots')).toHaveCount(0);
+  await expect(page.getByRole('slider', { name: 'Robot speaker volume' })).toHaveCount(0);
+  await expect(page.getByRole('checkbox', { name: 'Enable DUET version two' })).toHaveCount(0);
+  await page.getByRole('button', { name: 'Close', exact: true }).click();
+});
+
+test('teacher can read and set speaker volume from Settings', async ({ page }) => {
+  const volumeRequests = [];
+  await page.addInitScript(() => {
+    localStorage.setItem('edu-classroom-session', JSON.stringify({
+      token: 'teacher-speaker-volume-test-token',
+      user: { role: 'teacher', username: 'teacher' },
+    }));
+  });
+  await page.route('**/api/**', async (route) => {
+    const url = new URL(route.request().url());
+    if (url.pathname === '/api/robot/status') {
+      await route.fulfill({
+        status: 200,
+        contentType: 'application/json',
+        body: JSON.stringify({ sdkAvailable: true, interface: 'eth0', distanceSensor: { ready: false } }),
+      });
+      return;
+    }
+    if (url.pathname === '/api/run') {
+      const { code } = route.request().postDataJSON();
+      volumeRequests.push(code);
+      await route.fulfill({
+        status: 200,
+        contentType: 'application/json',
+        body: JSON.stringify(code === 'robot.getvolume()'
+          ? { status: 'completed', results: [{ command: 'getvolume', value: { volume: 35 } }] }
+          : { status: 'completed', results: [] }),
+      });
+      return;
+    }
+    await route.fulfill({
+      status: 200,
+      contentType: 'application/json',
+      body: JSON.stringify({}),
+    });
+  });
+
+  await page.goto('/');
+  await expect(page.getByRole('button', { name: 'Open robot configuration' })).toBeVisible();
+  await expect(page.getByRole('button', { name: 'Open app settings' })).toBeVisible();
+  const actionLabels = await page.getByTestId('workspace-actions').locator('button').allTextContents();
+  expect(actionLabels.map((label) => label.trim())).toEqual([
+    'Run simulation',
+    'Open queue',
+    'Robot run',
+  ]);
+  await page.getByRole('button', { name: 'Open app settings' }).click();
+  const volumeSlider = page.getByRole('slider', { name: 'Robot speaker volume' });
+  await expect(page.getByRole('checkbox', { name: 'Show shared LiDAR map overlay in Settings' })).toBeVisible();
+  await expect(page.getByRole('checkbox', { name: 'Enable DUET version two' })).toBeVisible();
+  await expect(page.getByRole('checkbox', { name: 'Enable Safe Mode spatial guards' })).toBeVisible();
+  await expect(page.getByRole('checkbox', { name: 'Hide Path Planner tab from sidebar' })).toBeVisible();
+  await expect(volumeSlider).toBeEnabled();
+  await page.getByRole('button', { name: 'Read current' }).click();
+  await expect(volumeSlider).toHaveValue('35');
+  await expect(page.getByRole('status').filter({ hasText: 'Current speaker volume: 35/100.' })).toBeVisible();
+  await volumeSlider.focus();
+  await volumeSlider.press('End');
+  await page.getByRole('button', { name: 'Apply volume' }).click();
+  await expect(page.getByRole('status').filter({ hasText: 'Speaker volume set to 100/100.' })).toBeVisible();
+  expect(volumeRequests).toEqual(['robot.getvolume()', 'robot.setvolume(100)']);
+  await page.getByRole('button', { name: 'Close', exact: true }).click();
+  await page.getByRole('button', { name: 'Open robot configuration' }).click();
+  await expect(page.getByText('Robot speaker volume')).toHaveCount(0);
+  await expect(page.getByRole('checkbox', { name: 'Enable Safe Mode spatial guards' })).toHaveCount(0);
+  await page.getByRole('button', { name: 'Close', exact: true }).click();
 });
 
 test('teacher sensor diagnostics label model-derived distance readings as provisional', async ({ page }) => {
@@ -966,7 +1134,7 @@ test('3D camera navigation controls remain reachable on a mobile viewport', asyn
   }).toEqual({ insideScene: true, insideViewport: true });
 });
 
-test('Blockly supports undo and redo buttons and keyboard shortcuts', async ({ page }) => {
+test('Blockly supports Project menu JSON export, history, clear, and keyboard shortcuts', async ({ page }) => {
   await page.addInitScript(() => {
     localStorage.setItem('edu-classroom-session', JSON.stringify({
       token: 'test-token',
@@ -974,7 +1142,38 @@ test('Blockly supports undo and redo buttons and keyboard shortcuts', async ({ p
     }));
   });
   await page.goto('/');
-  await expect(page.getByRole('button', { name: 'Undo blocks' })).toBeVisible();
+  await expect(page.getByRole('button', { name: 'Run simulation', exact: true })).toHaveCount(1);
+  await expect(page.getByRole('button', { name: 'Send to robot', exact: true })).toHaveCount(0);
+  await expect(page.getByText('Workspace', { exact: true })).toHaveCount(0);
+  await expect(page.getByRole('button', { name: 'File', exact: true })).toHaveCount(0);
+  await expect(page.getByRole('button', { name: 'Edit', exact: true })).toHaveCount(0);
+  const actionLabels = await page.getByTestId('workspace-actions').locator('button').allTextContents();
+  expect(actionLabels.map((label) => label.trim())).toEqual([
+    'Run simulation',
+    'Submit to teacher',
+    'Library',
+  ]);
+  await page.getByRole('button', { name: 'Open project actions' }).click();
+  const projectMenu = page.getByRole('menu', { name: 'Project actions' });
+  await expect(projectMenu).toBeVisible();
+  const projectMenuBounds = await projectMenu.boundingBox();
+  const viewport = page.viewportSize();
+  expect(projectMenuBounds.x).toBeGreaterThanOrEqual(0);
+  expect(projectMenuBounds.y).toBeGreaterThanOrEqual(0);
+  expect(projectMenuBounds.x + projectMenuBounds.width).toBeLessThanOrEqual(viewport.width);
+  expect(projectMenuBounds.y + projectMenuBounds.height).toBeLessThanOrEqual(viewport.height);
+  await expect(projectMenu).toHaveClass(/bg-slate-900/);
+  await expect(page.getByRole('button', { name: 'Save to account' })).toBeVisible();
+  await expect(page.getByRole('button', { name: 'New Project' })).toBeVisible();
+  await expect(page.getByRole('button', { name: 'Import JSON' })).toBeVisible();
+  await expect(page.getByRole('button', { name: 'Export JSON' })).toBeVisible();
+  await expect(page.getByRole('button', { name: 'Import Python' })).toBeVisible();
+  await expect(page.getByRole('button', { name: 'Export Python (.py)' })).toBeVisible();
+  await expect(page.getByLabel('Import JSON file')).toHaveAttribute('accept', '.json');
+  await expect(page.getByRole('button', { name: 'Undo' })).toBeVisible();
+  await expect(page.getByRole('button', { name: 'Redo' })).toBeVisible();
+  await expect(page.getByRole('button', { name: 'Clear workspace' })).toBeVisible();
+  await page.getByRole('button', { name: 'Open project actions' }).click();
   await page.evaluate(() => {
     const workspace = window.Blockly.getMainWorkspace();
     const block = workspace.newBlock('g1_command_walk');
@@ -995,14 +1194,47 @@ test('Blockly supports undo and redo buttons and keyboard shortcuts', async ({ p
     window.Blockly.getMainWorkspace().getAllBlocks().length
   ))).toBe(1);
 
-  await page.getByRole('button', { name: 'Undo blocks' }).click();
+  await page.getByRole('button', { name: 'Open project actions' }).click();
+  await page.getByRole('button', { name: 'Undo' }).click();
   await expect.poll(() => page.evaluate(() => (
     window.Blockly.getMainWorkspace().getAllBlocks().length
   ))).toBe(0);
-  await page.getByRole('button', { name: 'Redo blocks' }).click();
+  await page.getByRole('button', { name: 'Open project actions' }).click();
+  await page.getByRole('button', { name: 'Redo' }).click();
   await expect.poll(() => page.evaluate(() => (
     window.Blockly.getMainWorkspace().getAllBlocks().length
   ))).toBe(1);
+
+  await page.getByRole('button', { name: 'Open project actions' }).click();
+  const downloadPromise = page.waitForEvent('download');
+  await page.getByRole('button', { name: 'Export JSON' }).click();
+  const jsonDownload = await downloadPromise;
+  expect(jsonDownload.suggestedFilename()).toBe('project.json');
+
+  page.once('dialog', (dialog) => dialog.accept());
+  await page.getByRole('button', { name: 'Open project actions' }).click();
+  await page.getByRole('button', { name: 'Clear workspace' }).click();
+  await expect.poll(() => page.evaluate(() => (
+    window.Blockly.getMainWorkspace().getAllBlocks().length
+  ))).toBe(0);
+});
+
+test('Project menu imports Python into IDE', async ({ page }) => {
+  await page.addInitScript(() => {
+    localStorage.setItem('edu-classroom-session', JSON.stringify({
+      token: 'test-token',
+      user: { role: 'student', username: 'student-python-import-test' },
+    }));
+  });
+  await page.goto('/');
+  await page.getByRole('button', { name: 'Open project actions' }).click();
+  await page.getByRole('button', { name: 'Import Python' }).click();
+  await page.getByLabel('Import Python file').setInputFiles({
+    name: 'example.py',
+    mimeType: 'text/x-python',
+    buffer: Buffer.from('robot.walk(2)\n'),
+  });
+  await expect(page.locator('textarea').first()).toHaveValue('robot.walk(2)');
 });
 
 test('Blockly workspace survives collapsing and reopening its side panel', async ({ page }) => {

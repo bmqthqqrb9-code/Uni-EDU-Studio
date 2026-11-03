@@ -10,6 +10,8 @@ try:
     from .sensor_discovery import (
         MAX_FUTURE_SKEW_SECONDS,
         MAX_SAMPLE_AGE_SECONDS,
+        ROS_TOPIC_LIST_TIMEOUT_SECONDS,
+        ROS_TOPIC_SAMPLE_TIMEOUT_SECONDS,
         _read_topic_sample,
         _ros_prefix,
         _run,
@@ -18,6 +20,8 @@ except ImportError:
     from sensor_discovery import (
         MAX_FUTURE_SKEW_SECONDS,
         MAX_SAMPLE_AGE_SECONDS,
+        ROS_TOPIC_LIST_TIMEOUT_SECONDS,
+        ROS_TOPIC_SAMPLE_TIMEOUT_SECONDS,
         _read_topic_sample,
         _ros_prefix,
         _run,
@@ -159,7 +163,9 @@ def _camera_intrinsics(text):
 
 def _camera_topics(ros_prefix, runner, now_seconds):
     output, error = _run(
-        ros_prefix + ["topic", "list", "-t"], timeout=3.0, runner=runner
+        ros_prefix + ["topic", "list", "-t"],
+        timeout=ROS_TOPIC_LIST_TIMEOUT_SECONDS,
+        runner=runner,
     )
     if error:
         return [], "Could not inspect ROS camera topics: {}".format(error)
@@ -184,7 +190,7 @@ def _camera_topics(ros_prefix, runner, now_seconds):
             ros_prefix,
             topic["name"],
             runner=runner,
-            timeout=2.0,
+            timeout=ROS_TOPIC_SAMPLE_TIMEOUT_SECONDS,
             include_camera_intrinsics=topic["type"] == CAMERA_INFO_TYPE,
         )
         if message_error:

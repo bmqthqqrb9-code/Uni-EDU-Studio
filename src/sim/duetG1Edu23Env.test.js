@@ -65,7 +65,7 @@ test('DUET simulator overlaps locomotion with multi-stage gestures and keeps sur
 
 test('DUET simulator maps preset locomotion blocks to the same bounded velocity space', () => {
   const final = simulateDuetG1Edu23Program(
-    'duet.forward(1)\n'
+    'duet.walk(1)\n'
     + 'duet.turn_left(1)\n'
     + 'duet.arc_forward_right(1)',
   ).at(-1);

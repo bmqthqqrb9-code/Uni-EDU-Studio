@@ -49,6 +49,33 @@ class G1RobotProgramTests(unittest.TestCase):
         )
         self.assertEqual(commands[-1]["degrees"], 90)
 
+    def test_named_180_turn_uses_the_same_validated_in_place_sdk_mapping(self):
+        parsed = parse_robot_program("robot.turn_around_180()")
+        self.assertEqual(parsed, [{
+            "method": "turn_around_180",
+            "direction": "left",
+            "degrees": 180,
+        }])
+        with self.assertRaisesRegex(CommandValidationError, "takes no arguments"):
+            parse_robot_program("robot.turn_around_180(90)")
+
+        class FakeLocoClient:
+            def GetFsmId(self):
+                return (0, 500)
+
+        client = FakeLocoClient()
+        original_client = g1_robot._client
+        g1_robot._client = client
+        try:
+            with patch.object(g1_robot, "_move") as move:
+                result = g1_robot.execute_robot_program("robot.turn_around_180()")
+            self.assertEqual(move.call_count, 1)
+            self.assertEqual(move.call_args.args[:3], (0, 0, 0.6))
+            self.assertAlmostEqual(move.call_args.args[3], 3.141592653589793 / 0.6)
+            self.assertEqual(result["status"], "completed")
+        finally:
+            g1_robot._client = original_client
+
     def test_distance_condition_preserves_both_validated_branches(self):
         nodes = parse_robot_program(
             "if robot.front_distance_m() < 1.25:\n"
@@ -366,6 +393,111 @@ class G1RobotProgramTests(unittest.TestCase):
         finally:
             g1_robot._client = original_client
 
+    def test_safe_mode_stops_forward_motion_before_sending_velocity_and_continues_program(self):
+        class FakeLocoClient:
+            def __init__(self):
+                self.velocities = []
+                self.fsm_ids = []
+
+            def SetVelocity(self, *values):
+                self.velocities.append(values)
+                return 0
+
+            def SetFsmId(self, fsm_id):
+                self.fsm_ids.append(fsm_id)
+                return 0
+
+        client = FakeLocoClient()
+        obstacle = {"distance_m": 0.6, "clear": False, "max_range_m": 40.0}
+        with patch.object(g1_robot, "_client", client), patch.object(
+            g1_robot, "_require_locomotion_ready"
+        ), patch.object(g1_robot, "get_front_distance_sample", return_value=obstacle):
+            result = g1_robot.execute_robot_program(
+                "robot.walktime(1)\nrobot.stand()",
+                safe_mode=True,
+            )
+
+        self.assertEqual(client.velocities, [(0.0, 0.0, 0.0, 1.0)])
+        self.assertEqual(client.fsm_ids, [500])
+        self.assertEqual(result["safetyInterventions"][0]["status"], "stopped")
+
+    def test_safe_mode_skips_legacy_arm_on_unavailable_sensor_and_continues(self):
+        class FakeLocoClient:
+            def __init__(self):
+                self.fsm_ids = []
+
+            def SetFsmId(self, fsm_id):
+                self.fsm_ids.append(fsm_id)
+                return 0
+
+        class FakeArmClient:
+            def __init__(self):
+                self.actions = []
+
+            def ExecuteAction(self, action_id):
+                self.actions.append(action_id)
+                return 0
+
+        loco = FakeLocoClient()
+        arm = FakeArmClient()
+        with patch.object(g1_robot, "_client", loco), patch.object(
+            g1_robot, "_arm_client", arm
+        ), patch.object(
+            g1_robot,
+            "get_front_distance_sample",
+            side_effect=g1_robot.DistanceSensorError("sample is stale"),
+        ):
+            result = g1_robot.execute_robot_program(
+                'robot.arm_action("clap")\nrobot.stand()',
+                safe_mode=True,
+            )
+
+        self.assertEqual(arm.actions, [])
+        self.assertEqual(loco.fsm_ids, [500])
+        self.assertEqual(result["safetyInterventions"][0]["status"], "skipped")
+        self.assertIn("stale", result["safetyInterventions"][0]["reason"])
+
+    def test_safe_mode_allows_sideways_motion_when_registered_swept_path_is_clear(self):
+        class FakeLocoClient:
+            def __init__(self):
+                self.velocities = []
+
+            def GetFsmId(self):
+                return 0, 500
+
+            def SetVelocity(self, *values):
+                self.velocities.append(values)
+                return 0
+
+        client = FakeLocoClient()
+        clear_snapshot = {
+            "ready": True,
+            "localization": {
+                "ready": True,
+                "frame_id": "map",
+                "pose": {"x": 0.0, "y": 0.0, "z": 0.0, "yaw_rad": 0.0},
+            },
+            "registeredObstacles": {
+                "ready": True,
+                "frame_id": "map",
+                "age_ms": 50,
+                "points": [],
+            },
+            "liveObstacles": {
+                "ready": True,
+                "frame_id": "map",
+                "age_ms": 50,
+                "points": [],
+            },
+        }
+        with patch.object(g1_robot, "_client", client), patch.object(
+            g1_robot, "current_navigation_safety_snapshot", return_value=clear_snapshot
+        ):
+            result = g1_robot.execute_robot_program('robot.sidestep("left")', safe_mode=True)
+
+        self.assertEqual(client.velocities[0][1], 0.2)
+        self.assertEqual(result.get("safetyInterventions", []), [])
+
     def test_motion_values_are_bounded(self):
         commands = parse_robot_program('robot.walktime(99)')
         self.assertEqual(commands[0]["seconds"], 10)
@@ -517,7 +649,7 @@ class G1RobotProgramTests(unittest.TestCase):
                 {"method": "getactions"},
                 {"method": "getvolume"},
                 {"method": "say", "text": "Hello, G1", "speaker": 1},
-                {"method": "setvolume", "volume": 70},
+                {"method": "setvolume", "volume": 100},
                 {"method": "led", "red": 0, "green": 20, "blue": 255},
                 {"method": "playstop", "app_name": "classroom audio"},
             ],

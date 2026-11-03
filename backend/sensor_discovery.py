@@ -15,6 +15,8 @@ MAX_SAMPLE_AGE_SECONDS = 0.5
 MAX_FUTURE_SKEW_SECONDS = 0.1
 MAX_TOPIC_SAMPLE_BYTES = 65536
 MAX_AUXILIARY_TOPIC_SAMPLES = 32
+ROS_TOPIC_LIST_TIMEOUT_SECONDS = 10.0
+ROS_TOPIC_SAMPLE_TIMEOUT_SECONDS = 5.0
 LIDAR_NAME_PATTERN = re.compile(
     r"lidar|livox|mid.?360|utlidar|point.?cloud", re.IGNORECASE
 )
@@ -67,7 +69,13 @@ def _topic_sample_complete(text, include_camera_intrinsics=False):
     return matrix is not None
 
 
-def _read_topic_sample(ros_prefix, topic_name, runner=None, timeout=2.0, include_camera_intrinsics=False):
+def _read_topic_sample(
+    ros_prefix,
+    topic_name,
+    runner=None,
+    timeout=ROS_TOPIC_SAMPLE_TIMEOUT_SECONDS,
+    include_camera_intrinsics=False,
+):
     """Read only the first useful portion of a ROS topic echo without CLI flags."""
     if not ROS_TOPIC_PATTERN.fullmatch(topic_name):
         return None, "ROS topic name is invalid."
@@ -432,7 +440,7 @@ def discover_sensors(
     if ros_prefix is not None:
         topic_output, command_error = _run(
             ros_prefix + ["topic", "list", "-t"],
-            timeout=3.0,
+            timeout=ROS_TOPIC_LIST_TIMEOUT_SECONDS,
             runner=runner,
         )
         if command_error:
@@ -449,7 +457,7 @@ def discover_sensors(
                     ros_prefix,
                     topic["name"],
                     runner=runner,
-                    timeout=2.0,
+                    timeout=ROS_TOPIC_SAMPLE_TIMEOUT_SECONDS,
                 )
                 sample = (
                     _parse_pointcloud_header(header_output, current_time)
@@ -470,7 +478,7 @@ def discover_sensors(
                     ros_prefix,
                     topic["name"],
                     runner=runner,
-                    timeout=2.0,
+                    timeout=ROS_TOPIC_SAMPLE_TIMEOUT_SECONDS,
                 )
                 sample = (
                     _parse_message_header(header_output, current_time, topic["type"].rsplit("/", 1)[-1])

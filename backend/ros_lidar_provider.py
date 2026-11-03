@@ -136,6 +136,24 @@ def parse_camera_source_specs(camera_sources_json: str | None = None) -> list[di
     return result
 
 
+def calibration_failure_status(
+    reason: str,
+    model_fingerprint: str | None,
+    footprint: dict[str, object] | None,
+    base_frame_id: str,
+) -> dict[str, object]:
+    return {
+        "ready": False,
+        "status": "awaiting_live_validation",
+        "reason": reason,
+        "model_fingerprint": model_fingerprint,
+        "footprint": footprint,
+        "calibration_source": None,
+        "base_frame_id": base_frame_id,
+        "transform": None,
+    }
+
+
 class CameraFrameCache:
     def __init__(self, source_specs: list[dict[str, str]]):
         self._specs = {source["topic"]: dict(source) for source in source_specs}
@@ -1270,6 +1288,15 @@ def main() -> None:
                     f"expected {expected_source_frame!r}."
                 )
                 self.cache.mark_unavailable(reason, source_id)
+                if uses_model_mount:
+                    self.cache.update_calibration_status(
+                        calibration_failure_status(
+                            reason,
+                            calibration_model["model_fingerprint"],
+                            footprint,
+                            base_frame_id,
+                        )
+                    )
                 return
             try:
                 now_seconds = self.get_clock().now().nanoseconds / 1_000_000_000
@@ -1422,6 +1449,15 @@ def main() -> None:
                     )
                 )
                 self.cache.mark_unavailable(reason, source_id)
+                if uses_model_mount:
+                    self.cache.update_calibration_status(
+                        calibration_failure_status(
+                            reason,
+                            calibration_model["model_fingerprint"],
+                            footprint,
+                            base_frame_id,
+                        )
+                    )
                 warning_at = time.monotonic()
                 if should_log_tf_warning(self.last_tf_warning_at, warning_at):
                     self.get_logger().warning(reason)
@@ -1430,6 +1466,15 @@ def main() -> None:
             except (TypeError, ValueError, IndexError) as error:
                 reason = f"Point-cloud source {source_topic} could not be transformed/calibrated: {error}"
                 self.cache.mark_unavailable(reason, source_id)
+                if uses_model_mount:
+                    self.cache.update_calibration_status(
+                        calibration_failure_status(
+                            reason,
+                            calibration_model["model_fingerprint"],
+                            footprint,
+                            base_frame_id,
+                        )
+                    )
                 warning_at = time.monotonic()
                 if should_log_tf_warning(self.last_tf_warning_at, warning_at):
                     self.get_logger().warning(reason)

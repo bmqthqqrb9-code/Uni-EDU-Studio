@@ -1,0 +1,41 @@
+{
+  "format": "uni-edu-studio-block-example-v1",
+  "controller_version": "duet",
+  "name": "front-sensor-stop-or-go",
+  "title": "Front Sensor: Stop or Go",
+  "blocks": [
+    {
+      "type": "controls_if",
+      "sensor_block_type": "duet_front_distance_m",
+      "operator": "<",
+      "threshold": 1.0,
+      "test": {
+        "type": "logic_compare",
+        "operator": "<",
+        "left": {
+          "type": "duet_front_distance_m"
+        },
+        "right": {
+          "type": "math_number",
+          "value": 1.0
+        }
+      },
+      "then": [
+        {
+          "type": "duet_command_stop",
+          "method": "stop",
+          "inputs": []
+        }
+      ],
+      "else": [
+        {
+          "type": "duet_command_walk",
+          "method": "walk",
+          "inputs": [
+            "1"
+          ]
+        }
+      ]
+    }
+  ]
+}

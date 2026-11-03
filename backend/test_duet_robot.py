@@ -121,7 +121,7 @@ class DuetProgramValidationTests(unittest.TestCase):
 
     def test_parser_expands_directional_commands_to_bounded_velocity(self):
         commands = duet_robot.parse_duet_program(
-            "duet.forward(1)\n"
+            "duet.walk(1)\n"
             "duet.backward(1)\n"
             "duet.strafe_left(1)\n"
             "duet.strafe_right(1)\n"
@@ -140,7 +140,30 @@ class DuetProgramValidationTests(unittest.TestCase):
         self.assertEqual(commands[-1]["vx_mps"], -0.08)
         self.assertEqual(commands[-1]["yaw_rate_rps"], -0.2)
         with self.assertRaisesRegex(duet_robot.DuetProgramValidationError, "duration must be between"):
-            duet_robot.parse_duet_program("duet.forward(3.1)")
+            duet_robot.parse_duet_program("duet.walk(3.1)")
+
+    def test_forward_alias_preserves_the_original_duet_motion_mapping(self):
+        canonical = duet_robot.parse_duet_program("duet.walk(1)")
+        legacy = duet_robot.parse_duet_program("duet.forward(1)")
+        self.assertEqual(legacy, canonical)
+        self.assertEqual(canonical[0]["vx_mps"], 0.15)
+        self.assertEqual(canonical[0]["vy_mps"], 0.0)
+        self.assertEqual(canonical[0]["yaw_rate_rps"], 0.0)
+
+    def test_named_180_turn_uses_bounded_sdk_gateway_segments(self):
+        segments = duet_robot.parse_duet_program("duet.turn_around_180()")
+        self.assertEqual(len(segments), 5)
+        self.assertTrue(all(segment["type"] == "move" for segment in segments))
+        self.assertTrue(all(segment["vx_mps"] == segment["vy_mps"] == 0 for segment in segments))
+        self.assertTrue(all(segment["yaw_rate_rps"] == 0.25 for segment in segments))
+        self.assertTrue(all(segment["duration_s"] <= 3 for segment in segments))
+        self.assertAlmostEqual(
+            sum(segment["yaw_rate_rps"] * segment["duration_s"] for segment in segments),
+            3.141592653589793,
+            places=3,
+        )
+        with self.assertRaisesRegex(duet_robot.DuetProgramValidationError, "takes no arguments"):
+            duet_robot.parse_duet_program("duet.turn_around_180(90)")
 
     def test_parser_accepts_only_fixed_arm_poses_and_bounded_lease_duration(self):
         command = duet_robot.parse_duet_program('duet.arm_pose("forward", 1.5)')[0]
@@ -716,6 +739,238 @@ class DuetCommissioningTests(unittest.TestCase):
 
 
 class DuetOwnershipTests(unittest.TestCase):
+    def test_safe_mode_skips_blocked_arm_and_continues_to_next_command(self):
+        status = {
+            "protocol": duet_robot.DUET_PROTOCOL,
+            "robot_model": duet_robot.DUET_ROBOT_MODEL,
+            "policy_id": "policy-reviewed-on-robot",
+            "connected": True,
+            "ready": True,
+            "motion_active": False,
+            "arm_targets_active": False,
+            "external_arm_active": False,
+            "control_lease": True,
+            "lowcmd_owner": "duet",
+            "capabilities": ["base_velocity", "wait", "stop", "arm_targets"],
+        }
+        obstacle = {"distance_m": 0.5, "clear": False, "max_range_m": 40.0}
+        clear = {"distance_m": None, "clear": True, "max_range_m": 40.0}
+        front_samples = iter([obstacle])
+        with patch.dict(os.environ, {"DUET_EXPECTED_POLICY_ID": "policy-reviewed-on-robot"}), patch.object(
+            duet_robot, "_require_hardware_acceptance"
+        ), patch.object(
+            duet_robot, "_gateway_request", return_value=status
+        ) as gateway_request, patch.object(
+            duet_robot, "get_front_distance_sample", side_effect=lambda: next(front_samples)
+        ), patch.object(
+            duet_robot, "get_rear_distance_sample", return_value=clear
+        ), patch.object(
+            duet_robot._stop_requested, "wait", return_value=False
+        ):
+            result = duet_robot.execute_program(
+                'duet.arm_carry(1)\nduet.wait(0.1)',
+                safe_mode=True,
+            )
+
+        self.assertEqual(result["status"], "completed")
+        self.assertEqual(result["safetyInterventions"][0]["status"], "skipped")
+        self.assertEqual(result["commandsExecuted"], 2)
+        self.assertEqual([call.args[0] for call in gateway_request.call_args_list], ["STATUS"])
+
+    def test_safe_mode_skips_arm_when_sensor_is_unavailable_and_continues(self):
+        status = {
+            "protocol": duet_robot.DUET_PROTOCOL,
+            "robot_model": duet_robot.DUET_ROBOT_MODEL,
+            "policy_id": "policy-reviewed-on-robot",
+            "connected": True,
+            "ready": True,
+            "motion_active": False,
+            "arm_targets_active": False,
+            "external_arm_active": False,
+            "control_lease": True,
+            "lowcmd_owner": "duet",
+            "capabilities": ["base_velocity", "wait", "stop", "arm_targets"],
+        }
+        with patch.dict(os.environ, {"DUET_EXPECTED_POLICY_ID": "policy-reviewed-on-robot"}), patch.object(
+            duet_robot, "_require_hardware_acceptance"
+        ), patch.object(
+            duet_robot, "_gateway_request", return_value=status
+        ) as gateway_request, patch.object(
+            duet_robot,
+            "get_front_distance_sample",
+            side_effect=duet_robot.DistanceSensorError("sample is stale"),
+        ), patch.object(
+            duet_robot._stop_requested, "wait", return_value=False
+        ):
+            result = duet_robot.execute_program(
+                'duet.arm_carry(1)\nduet.wait(0.1)',
+                safe_mode=True,
+            )
+
+        self.assertEqual(result["status"], "completed")
+        self.assertEqual(result["safetyInterventions"][0]["status"], "skipped")
+        self.assertIn("stale", result["safetyInterventions"][0]["reason"])
+        self.assertEqual([call.args[0] for call in gateway_request.call_args_list], ["STATUS"])
+
+    def test_safe_mode_stops_duet_mid_move_on_obstacle_then_continues_program(self):
+        status = {
+            "protocol": duet_robot.DUET_PROTOCOL,
+            "robot_model": duet_robot.DUET_ROBOT_MODEL,
+            "policy_id": "policy-reviewed-on-robot",
+            "connected": True,
+            "ready": True,
+            "motion_active": False,
+            "arm_targets_active": False,
+            "external_arm_active": False,
+            "control_lease": True,
+            "lowcmd_owner": "duet",
+            "capabilities": ["base_velocity", "wait", "stop", "arm_targets"],
+        }
+        moving = {**status, "motion_active": True}
+        obstacle = {"distance_m": 0.7, "clear": False, "max_range_m": 40.0}
+        clear = {"distance_m": 2.0, "clear": False, "max_range_m": 40.0}
+        clear_safety = {
+            "ready": True,
+            "localization": {
+                "ready": True,
+                "frame_id": "map",
+                "pose": {"x": 0.0, "y": 0.0, "z": 0.0, "yaw_rad": 0.0},
+            },
+            "registeredObstacles": {
+                "ready": True,
+                "frame_id": "map",
+                "age_ms": 50,
+                "points": [],
+            },
+            "liveObstacles": {
+                "ready": True,
+                "frame_id": "map",
+                "age_ms": 50,
+                "points": [],
+            },
+        }
+        samples = iter([clear, obstacle])
+        clock = {"now": 0.0}
+        requests = []
+
+        def gateway_response(request):
+            requests.append(request)
+            if request == "STATUS" or request == "STOP":
+                return status
+            if request.startswith("MOVE "):
+                return moving
+            raise AssertionError(f"Unexpected gateway request: {request}")
+
+        def wait_and_advance(duration):
+            clock["now"] += duration
+            return False
+
+        with patch.dict(os.environ, {"DUET_EXPECTED_POLICY_ID": "policy-reviewed-on-robot"}), patch.object(
+            duet_robot, "_require_hardware_acceptance"
+        ), patch.object(
+            duet_robot, "_gateway_request", side_effect=gateway_response
+        ), patch.object(
+            duet_robot, "get_front_distance_sample", side_effect=lambda: next(samples)
+        ), patch.object(
+            duet_robot, "current_navigation_safety_snapshot", return_value=clear_safety
+        ), patch.object(
+            duet_robot.time, "monotonic", side_effect=lambda: clock["now"]
+        ), patch.object(
+            duet_robot._stop_requested, "wait", side_effect=wait_and_advance
+        ):
+            result = duet_robot.execute_program(
+                "duet.forward(0.2)\nduet.wait(0.1)",
+                safe_mode=True,
+            )
+
+        self.assertEqual(result["status"], "completed")
+        self.assertEqual(result["safetyInterventions"][0]["status"], "stopped")
+        self.assertIn("MOVE 0.150000 0.000000 0.000000 250", requests)
+        self.assertEqual(requests.count("STOP"), 1)
+
+    def test_safe_mode_stops_duet_arm_lease_mid_action_when_obstacle_enters_bubble(self):
+        status = {
+            "protocol": duet_robot.DUET_PROTOCOL,
+            "robot_model": duet_robot.DUET_ROBOT_MODEL,
+            "policy_id": "policy-reviewed-on-robot",
+            "connected": True,
+            "ready": True,
+            "motion_active": False,
+            "arm_targets_active": False,
+            "external_arm_active": False,
+            "control_lease": True,
+            "lowcmd_owner": "duet",
+            "capabilities": ["base_velocity", "wait", "stop", "arm_targets"],
+        }
+        arm_active = {**status, "arm_targets_active": True}
+        obstacle = {"distance_m": 0.5, "clear": False, "max_range_m": 40.0}
+        clear = {"distance_m": 3.0, "clear": False, "max_range_m": 40.0}
+        clear_safety = {
+            "ready": True,
+            "localization": {
+                "ready": True,
+                "frame_id": "map",
+                "pose": {"x": 0.0, "y": 0.0, "z": 0.0, "yaw_rad": 0.0},
+            },
+            "registeredObstacles": {
+                "ready": True,
+                "frame_id": "map",
+                "age_ms": 50,
+                "points": [],
+            },
+            "liveObstacles": {
+                "ready": True,
+                "frame_id": "map",
+                "age_ms": 50,
+                "points": [],
+            },
+        }
+        samples = iter([clear, obstacle])
+        clock = {"now": 0.0}
+        requests = []
+
+        def gateway_response(request):
+            requests.append(request)
+            if request == "STATUS" or request == "STOP":
+                return status
+            if request.startswith("ARM_TARGETS "):
+                return arm_active
+            raise AssertionError(f"Unexpected gateway request: {request}")
+
+        def wait_and_advance(duration):
+            clock["now"] += duration
+            return False
+
+        with patch.dict(os.environ, {"DUET_EXPECTED_POLICY_ID": "policy-reviewed-on-robot"}), patch.object(
+            duet_robot, "_require_hardware_acceptance"
+        ), patch.object(
+            duet_robot, "_gateway_request", side_effect=gateway_response
+        ), patch.object(
+            duet_robot, "get_front_distance_sample", side_effect=lambda: next(samples)
+        ), patch.object(
+            duet_robot, "get_rear_distance_sample", return_value=clear
+        ), patch.object(
+            duet_robot, "current_navigation_safety_snapshot", return_value=clear_safety
+        ), patch.object(
+            duet_robot.time, "monotonic", side_effect=lambda: clock["now"]
+        ), patch.object(
+            duet_robot._stop_requested, "wait", side_effect=wait_and_advance
+        ):
+            result = duet_robot.execute_program(
+                'duet.arm_carry(1)\nduet.wait(0.1)',
+                safe_mode=True,
+            )
+
+        self.assertEqual(result["status"], "completed")
+        self.assertEqual(result["safetyInterventions"][0]["status"], "stopped")
+        self.assertIn("STOP", requests)
+        self.assertNotIn("RESET_ARMS", requests)
+        self.assertEqual(requests.count("STOP"), 1)
+
+    def test_safe_mode_allows_sideways_translation_when_it_can_be_checked_by_registered_coverage(self):
+        movement = duet_robot.parse_duet_program("duet.strafe_left(0.5)")[0]
+        duet_robot._validate_safe_mode_movement(movement)
+
     def test_distance_condition_samples_front_sensor_and_executes_selected_branch(self):
         status = {
             "protocol": duet_robot.DUET_PROTOCOL,

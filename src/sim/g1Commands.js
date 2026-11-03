@@ -53,6 +53,7 @@ const SDK_COMMAND_METHODS = {
   fastwalk: 'LocoClient.SetVelocity',
   fastwalktime: 'LocoClient.SetVelocity',
   turn: 'LocoClient.SetVelocity',
+  turn_around_180: 'LocoClient.SetVelocity',
   squat_to_stand: 'LocoClient.SetFsmId(706) / Squat2StandUp',
   lie_to_stand: 'LocoClient.SetFsmId(702) / Lie2StandUp',
   stand_to_squat: 'LocoClient.SetFsmId(706) / StandUp2Squat',
@@ -157,6 +158,7 @@ const commandGroups = [
     command('fastwalk', 'Fast walk', 'Walking', 'Walk forward quickly for the selected steps. Distance may vary.', [steps()]),
     command('fastwalktime', 'Fast walk for', 'Walking', 'Walk forward quickly for the selected time.', [seconds()]),
     command('turn', 'Turn', 'Walking', 'Turn in the selected direction by about this angle.', [direction(), numberArgument('ANGLE', 'degrees', 90, 5, 180)]),
+    command('turn_around_180', 'Turn around about 180° in place', 'Walking', 'Turn in place by about 180°. The SDK uses a timed yaw velocity, so the final angle is approximate; keep the area clear and supervise.', []),
   ],
   [
     command('squat_to_stand', 'Squat to stand', 'Postures', 'Rise from a squat.'),
@@ -209,7 +211,7 @@ const commandGroups = [
   [
     command('say', 'Speak %1 with voice %2', 'Audio', 'Speak the entered words.', [textArgument('TEXT', 'text', 'Hello'), integerChoiceArgument('SPEAKER', 'speaker', [['Chinese', '0'], ['English', '1']], '1')]),
     command('getvolume', 'Read speaker volume', 'Audio', 'Check the speaker volume.'),
-    command('setvolume', 'Set speaker volume to %1', 'Audio', 'Set speaker volume (0–70).', [integerArgument('VOLUME', 'volume', 50, 0, 70)]),
+    command('setvolume', 'Set speaker volume to %1', 'Audio', 'Set speaker volume (0–100).', [integerArgument('VOLUME', 'volume', 50, 0, 100)]),
     command('led', 'Set head LED R %1 G %2 B %3', 'Audio', 'Set the head light color.', [
       integerArgument('RED', 'red', 0, 0, 255),
       integerArgument('GREEN', 'green', 160, 0, 255),
@@ -222,7 +224,7 @@ const commandGroups = [
 export const G1_NOMINAL_STEP_METERS = 0.345;
 export const G1_COMMANDS = Object.freeze(commandGroups.flat());
 export const G1_EXECUTABLE_COMMANDS = Object.freeze(
-  G1_COMMANDS.filter((entry) => entry.physicalSupported),
+  G1_COMMANDS.filter((entry) => entry.physicalSupported && !['hold_arm', 'setvolume'].includes(entry.method)),
 );
 
 const COMMAND_BY_METHOD = new Map(G1_COMMANDS.map((entry) => [entry.method, entry]));

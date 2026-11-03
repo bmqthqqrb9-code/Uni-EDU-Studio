@@ -47,6 +47,22 @@ except ImportError:
 
 
 class RosLidarProviderTests(unittest.TestCase):
+    def test_calibration_failure_status_reports_specific_reason(self):
+        reason = "No transform from pelvis to torso_link at the point-cloud timestamp."
+
+        status = ros_lidar_provider.calibration_failure_status(
+            reason,
+            "supported-model-fingerprint",
+            {"front": 0.3, "rear": 0.2, "half_width": 0.25},
+            "pelvis",
+        )
+
+        self.assertFalse(status["ready"])
+        self.assertEqual(status["status"], "awaiting_live_validation")
+        self.assertEqual(status["reason"], reason)
+        self.assertEqual(status["model_fingerprint"], "supported-model-fingerprint")
+        self.assertIsNone(status["transform"])
+
     def test_camera_source_configuration_requires_unique_valid_topics_and_frames(self):
         sources = ros_lidar_provider.parse_camera_source_specs(
             json.dumps([

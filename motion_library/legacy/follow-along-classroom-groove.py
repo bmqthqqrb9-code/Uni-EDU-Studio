@@ -1,0 +1,6 @@
+robot.stand()
+robot.wait(2)
+robot.walk(1)
+robot.turn("left", 90)
+robot.arm_action("clap")
+robot.stand()

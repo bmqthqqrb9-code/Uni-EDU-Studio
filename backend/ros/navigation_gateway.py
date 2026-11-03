@@ -76,6 +76,12 @@ MAX_MAP_PREVIEW_CELLS = 250_000
 MAX_PREVIEW_PATH_POSES = 50_000
 MAX_SCAN_POINTS = 300_000
 MAX_LIVE_OBSTACLE_POINTS = 2_500
+MAX_REGISTERED_OBSTACLE_POINTS = 5_000
+MAX_REGISTERED_OBSTACLE_VOXELS = 30_000
+REGISTERED_OBSTACLE_VOXEL_METERS = 0.10
+REGISTERED_OBSTACLE_HISTORY_SECONDS = 2.0
+REGISTERED_OBSTACLE_RELEVANCE_RADIUS_METERS = 3.0
+NAVIGATION_EXTRA_CLEARANCE_METERS = 0.2
 MIN_COMPLETED_SCAN_POINTS = 1_000
 MAX_REQUEST_BYTES = 64 * 1024
 MAX_OPERATIONS = 500
@@ -393,6 +399,9 @@ def _make_ros_node(config: dict[str, Any]):
             self.pointcloud_discovery_truncated = 0
             self.pointcloud_discovery_error: str | None = None
             self.pointcloud_received_monotonic: float | None = None
+            self.registered_obstacles: dict[
+                tuple[int, int, int], tuple[float, float, float, float, str]
+            ] = {}
             self.local_costmap: dict[str, Any] | None = None
             self.local_costmap_received_monotonic: float | None = None
             self.local_costmap_error: str | None = None
@@ -430,6 +439,7 @@ def _make_ros_node(config: dict[str, Any]):
                 if config["robot_healthy_topic"] else None
             )
             self.scan_health_timer = self.create_timer(0.05, self._scan_health_tick)
+            self.navigation_safety_timer = self.create_timer(0.1, self._navigation_safety_tick)
             self.pointcloud_discovery_timer = (
                 self.create_timer(2.0, self._discover_pointcloud_sources)
                 if config["auto_discover_pointcloud_topics"] else None
@@ -553,27 +563,7 @@ def _make_ros_node(config: dict[str, Any]):
             with self.lock:
                 scan_id = self.active_scan_id
                 scan = self.scans.get(scan_id) if scan_id else None
-            if not scan or scan["state"] != "scanning":
-                try:
-                    if source_frame != self.config["map_frame"]:
-                        self.tf_buffer.lookup_transform(
-                            self.config["map_frame"],
-                            source_frame,
-                            Time.from_msg(message.header.stamp),
-                            timeout=Duration(seconds=0.1),
-                        )
-                except (self._transform_exception, TypeError, ValueError) as error:
-                    self.get_logger().warning(
-                        f"Skipping LiDAR readiness sample without a valid map transform: {error}"
-                    )
-                    return
-                self._record_pointcloud(
-                    source_topic,
-                    source_frame,
-                    stamp_age_seconds,
-                    time.monotonic() - callback_started,
-                )
-                return
+            scan_active = bool(scan and scan["state"] == "scanning")
             try:
                 if source_frame == self.config["map_frame"]:
                     translation = (0.0, 0.0, 0.0)
@@ -616,15 +606,16 @@ def _make_ros_node(config: dict[str, Any]):
                 self.get_logger().warning(f"Skipping LiDAR cloud without a valid map transform: {error}")
                 return
             with self.lock:
-                scan = self.scans.get(scan_id)
-                if not scan or scan["state"] != "scanning":
-                    return
                 self._record_pointcloud(
                     source_topic,
                     source_frame,
                     stamp_age_seconds,
                     time.monotonic() - callback_started,
                 )
+                self._record_registered_obstacles(source_topic, points)
+                scan = self.scans.get(scan_id) if scan_active else None
+                if not scan or scan["state"] != "scanning":
+                    return
                 voxels = scan["voxels"]
                 for x, y, z in points:
                     key = (math.floor(x / 0.05), math.floor(y / 0.05), math.floor(z / 0.05))
@@ -633,6 +624,78 @@ def _make_ros_node(config: dict[str, Any]):
                     voxels[key] = (x, y, z)
                 scan["last_cloud_monotonic"] = time.monotonic()
                 scan["updated_at"] = _utc_now()
+
+        def _record_registered_obstacles(
+            self,
+            source_topic: str,
+            points: list[tuple[float, float, float]],
+        ) -> None:
+            now = time.monotonic()
+            expiration = now - REGISTERED_OBSTACLE_HISTORY_SECONDS
+            self.registered_obstacles = {
+                key: value
+                for key, value in self.registered_obstacles.items()
+                if value[3] >= expiration
+            }
+            for x, y, z in points:
+                key = (
+                    math.floor(x / REGISTERED_OBSTACLE_VOXEL_METERS),
+                    math.floor(y / REGISTERED_OBSTACLE_VOXEL_METERS),
+                    math.floor(z / REGISTERED_OBSTACLE_VOXEL_METERS),
+                )
+                self.registered_obstacles[key] = (x, y, z, now, source_topic)
+            if len(self.registered_obstacles) > MAX_REGISTERED_OBSTACLE_VOXELS:
+                oldest = sorted(
+                    self.registered_obstacles.items(),
+                    key=lambda item: item[1][3],
+                )[: len(self.registered_obstacles) - MAX_REGISTERED_OBSTACLE_VOXELS]
+                for key, _value in oldest:
+                    self.registered_obstacles.pop(key, None)
+
+        def _registered_obstacle_snapshot(
+            self,
+            localization: dict[str, Any],
+            pointcloud_status: dict[str, Any],
+        ) -> dict[str, Any]:
+            pose = localization.get("pose") if localization.get("ready") else None
+            if not isinstance(pose, dict):
+                return {
+                    "ready": False,
+                    "frame_id": self.config["map_frame"],
+                    "age_ms": None,
+                    "points": [],
+                    "error": "Fresh localization is unavailable for registered obstacle coverage.",
+                }
+            now = time.monotonic()
+            max_radius_squared = REGISTERED_OBSTACLE_RELEVANCE_RADIUS_METERS ** 2
+            with self.lock:
+                observations = list(self.registered_obstacles.values())
+            nearby = [
+                {
+                    "x": x,
+                    "y": y,
+                    "z": z,
+                    "age_ms": round(max(0.0, now - observed_at) * 1000),
+                    "source": source,
+                }
+                for x, y, z, observed_at, source in observations
+                if (x - pose["x"]) ** 2 + (y - pose["y"]) ** 2 <= max_radius_squared
+            ]
+            nearby.sort(
+                key=lambda point: (
+                    (point["x"] - pose["x"]) ** 2 + (point["y"] - pose["y"]) ** 2,
+                    point["age_ms"],
+                )
+            )
+            points = nearby[:MAX_REGISTERED_OBSTACLE_POINTS]
+            ready = pointcloud_status.get("ready") is True
+            return {
+                "ready": ready,
+                "frame_id": self.config["map_frame"],
+                "age_ms": pointcloud_status.get("age_ms"),
+                "points": points,
+                "error": None if ready else "No fresh registered LiDAR point cloud is available.",
+            }
 
         def _record_pointcloud(
             self,
@@ -687,6 +750,70 @@ def _make_ros_node(config: dict[str, Any]):
                 "age_ms": health["age_ms"],
                 "sources": sources,
             }
+
+        def _navigation_safety_tick(self) -> None:
+            with self.lock:
+                operation_id = self.active_operation_id
+                operation = self.operations.get(operation_id) if operation_id else None
+                if (
+                    not operation
+                    or operation.get("planner_mode") != "live"
+                    or operation.get("state") in TERMINAL_STATES
+                    or operation.get("cancel_requested")
+                ):
+                    return
+                pose = operation.get("current_pose")
+            obstacles = self._local_costmap_snapshot()
+            if not obstacles["ready"]:
+                return
+            if not isinstance(pose, dict) or pose.get("frame_id") != self.config["map_frame"]:
+                localization = self._localization_snapshot()
+                if not localization.get("ready"):
+                    return
+                pose = {
+                    **localization["pose"],
+                    "frame_id": localization["frame_id"],
+                }
+            footprint = {
+                "front": 0.175 + NAVIGATION_EXTRA_CLEARANCE_METERS,
+                "rear": 0.175 + NAVIGATION_EXTRA_CLEARANCE_METERS,
+                "half_width": 0.225 + NAVIGATION_EXTRA_CLEARANCE_METERS,
+            }
+            cosine = math.cos(float(pose["yaw_rad"]))
+            sine = math.sin(float(pose["yaw_rad"]))
+            collision = None
+            for point in obstacles["points"]:
+                dx = float(point["x"]) - float(pose["x"])
+                dy = float(point["y"]) - float(pose["y"])
+                robot_x = cosine * dx + sine * dy
+                robot_y = -sine * dx + cosine * dy
+                if (
+                    -footprint["rear"] <= robot_x <= footprint["front"]
+                    and abs(robot_y) <= footprint["half_width"]
+                ):
+                    collision = point
+                    break
+            if collision is None:
+                return
+            reason = (
+                "The fresh registered Nav2 obstacle layer overlaps the robot footprint "
+                "inflated by 0.20 m; requesting route cancellation."
+            )
+            with self.lock:
+                operation = self.operations.get(operation_id)
+                if (
+                    not operation
+                    or operation.get("state") in TERMINAL_STATES
+                    or operation.get("cancel_requested")
+                ):
+                    return
+                operation["cancel_requested"] = True
+                operation["safety_stop_reason"] = reason
+                operation["updated_at"] = _utc_now()
+                handle = operation.get("_goal_handle")
+            self.get_logger().warning(reason)
+            if handle is not None:
+                self._request_nav2_cancel(operation_id, handle)
 
         def _scan_health_tick(self):
             motion_health = self._motion_health_snapshot()
@@ -1320,6 +1447,7 @@ def _make_ros_node(config: dict[str, Any]):
             pose = {
                 "x": float(translation.x),
                 "y": float(translation.y),
+                "z": float(translation.z),
                 "yaw_rad": _yaw_from_quaternion(rotation),
             }
             if not all(math.isfinite(number) for number in pose.values()):
@@ -1342,6 +1470,10 @@ def _make_ros_node(config: dict[str, Any]):
             motion_health = self._motion_health_snapshot()
             live_obstacles = self._local_costmap_snapshot()
             pointcloud_status = self._pointcloud_snapshot()
+            registered_obstacles = self._registered_obstacle_snapshot(
+                localization,
+                pointcloud_status,
+            )
             with self.lock:
                 grid = self.grid
                 grid_age = (
@@ -1369,6 +1501,7 @@ def _make_ros_node(config: dict[str, Any]):
                     self.config["live_avoidance_enabled"] and live_obstacles["ready"]
                 ),
                 "live_obstacles": live_obstacles,
+                "registered_obstacles": registered_obstacles,
                 "estop": motion_health["estop"],
                 "robot_health": motion_health["robot"],
                 "planner_ready": bool(map_ready and action_ready),
@@ -1637,6 +1770,9 @@ def _make_ros_node(config: dict[str, Any]):
         def submit_route(self, request: Any) -> dict[str, Any]:
             if not isinstance(request, dict):
                 raise GatewayHTTPError(400, "Request body must be a JSON object.")
+            planner_mode = request.get("planner_mode", "live")
+            if planner_mode not in {"live", "static"}:
+                raise GatewayHTTPError(400, "planner_mode must be 'live' or 'static'.")
             with self.lock:
                 grid = self.grid
                 if grid is None:
@@ -1657,6 +1793,13 @@ def _make_ros_node(config: dict[str, Any]):
                     raise GatewayHTTPError(409, "Map version is stale; fetch current map metadata and resubmit.")
                 if request.get("frame_id") != grid["frame_id"] or grid["frame_id"] != self.config["map_frame"]:
                     raise GatewayHTTPError(409, "frame_id must exactly match the current map frame.")
+                if planner_mode == "live":
+                    live_obstacles = self._local_costmap_snapshot()
+                    if not self.config["live_avoidance_enabled"] or not live_obstacles["ready"]:
+                        raise GatewayHTTPError(
+                            503,
+                            "Live adaptive navigation requires a fresh Nav2 local costmap and commissioned obstacle avoidance.",
+                        )
                 goals = request.get("goals")
                 if not isinstance(goals, list) or not goals or len(goals) > MAX_GOALS:
                     raise GatewayHTTPError(400, f"goals must contain between 1 and {MAX_GOALS} poses.")

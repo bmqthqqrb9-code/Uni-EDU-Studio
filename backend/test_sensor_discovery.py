@@ -24,9 +24,10 @@ class SensorDiscoveryTests(unittest.TestCase):
         self.now = 1_800_000_000.0
         self.env = {"XDG_CONFIG_HOME": self.temp_dir.name}
         self.echo_commands = []
+        self.ros_timeouts = []
 
     def run_discovery(self, responses, **kwargs):
-        def runner(command, **_options):
+        def runner(command, **options):
             if command[-5:] == ["-4", "-j", "address", "show", "up"]:
                 stdout = responses.get(
                     "interfaces",
@@ -46,8 +47,10 @@ class SensorDiscoveryTests(unittest.TestCase):
                     ),
                 )
             elif command[1:4] == ["topic", "list", "-t"]:
+                self.ros_timeouts.append(("list", options.get("timeout")))
                 stdout = responses.get("topics", "")
             elif "echo" in command:
+                self.ros_timeouts.append(("sample", options.get("timeout")))
                 self.echo_commands.append(command)
                 self.assertNotIn("--once", command)
                 self.assertNotIn("--field", command)
@@ -68,6 +71,20 @@ class SensorDiscoveryTests(unittest.TestCase):
             ip_executable="/usr/sbin/ip",
             systemctl_executable=kwargs.get("systemctl_executable"),
         )
+
+    def test_ros_discovery_uses_extended_bounded_timeouts(self):
+        self.run_discovery({
+            "topics": "/mid360/livox/lidar [sensor_msgs/msg/PointCloud2]\n",
+            "headers": {
+                "/mid360/livox/lidar": (
+                    "header:\n  stamp:\n    sec: 1799999999\n"
+                    "    nanosec: 900000000\n  frame_id: mid360_link\n"
+                ),
+            },
+        })
+
+        self.assertIn(("list", sensor_discovery.ROS_TOPIC_LIST_TIMEOUT_SECONDS), self.ros_timeouts)
+        self.assertIn(("sample", sensor_discovery.ROS_TOPIC_SAMPLE_TIMEOUT_SECONDS), self.ros_timeouts)
 
     def test_missing_network_settings_are_reported_without_guessing(self):
         report = self.run_discovery({})

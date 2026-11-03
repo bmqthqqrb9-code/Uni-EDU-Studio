@@ -48,6 +48,7 @@ try:
     )
     from .camera_discovery import discover_camera_sources
     from .lidar_distance import distance_sensor_status
+    from .safe_mode import SAFE_MODE_STOP_MARGIN_METERS
     from .ros_lidar_provider import (
         MAX_CAMERA_FRAME_BYTES,
         MAX_CAMERA_HEIGHT,
@@ -93,6 +94,7 @@ except ImportError:
     )
     from camera_discovery import discover_camera_sources
     from lidar_distance import distance_sensor_status
+    from safe_mode import SAFE_MODE_STOP_MARGIN_METERS
     from ros_lidar_provider import (
         MAX_CAMERA_FRAME_BYTES,
         MAX_CAMERA_HEIGHT,
@@ -126,6 +128,7 @@ BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 STATIC_DIR = os.path.join(BASE_DIR, "static")
 PROJECT_ROOT = os.path.dirname(BASE_DIR)
 G1_URDF_PATH = os.path.join(PROJECT_ROOT, "g1_23dof.urdf.txt")
+STARTER_MOTION_LIBRARY_PATH = os.path.join(PROJECT_ROOT, "motion_library", "library.json")
 MAX_NAVIGATION_HOME_REFERENCE_CELLS = 65_536
 MAX_NAVIGATION_HOME_REFERENCE_JSON_BYTES = 262_144
 CAMERA_FRAME_MIN_INTERVAL_SECONDS = 0.25
@@ -257,6 +260,10 @@ class SharedLidarSettingsRequest(BaseModel):
 
 class SidebarSettingsRequest(BaseModel):
     locked_panels: List[Literal["planner", "prompt", "camera"]]
+
+
+class SafeModeSettingsRequest(BaseModel):
+    enabled: bool
 
 
 class SensorServiceRequest(BaseModel):
@@ -903,6 +910,15 @@ def init_db():
     )
     conn.execute(
         """
+        CREATE TABLE IF NOT EXISTS teacher_safe_mode_settings (
+            username TEXT PRIMARY KEY,
+            enabled INTEGER NOT NULL DEFAULT 0 CHECK (enabled IN (0, 1)),
+            updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+        )
+        """
+    )
+    conn.execute(
+        """
         CREATE TABLE IF NOT EXISTS lidar_scans (
             job_id TEXT PRIMARY KEY,
             status TEXT NOT NULL,
@@ -1059,6 +1075,26 @@ def get_saved_codes_for_user(username: str):
     ).fetchall()
     conn.close()
     return [{"name": row["name"], "code": row["code"]} for row in rows]
+
+
+def get_starter_motion_codes() -> list[dict]:
+    try:
+        with open(STARTER_MOTION_LIBRARY_PATH, encoding="utf-8") as library_file:
+            entries = json.load(library_file)
+    except (OSError, json.JSONDecodeError) as error:
+        logger.error("Could not load the built-in starter motion library: %s", error)
+        return []
+    if not isinstance(entries, list):
+        logger.error("Built-in starter motion library must contain a JSON list.")
+        return []
+    return [
+        entry
+        for entry in entries
+        if isinstance(entry, dict)
+        and isinstance(entry.get("name"), str)
+        and isinstance(entry.get("code"), str)
+        and entry.get("controller_version") in {"legacy", "duet"}
+    ]
 
 
 def list_queue_items():
@@ -1651,7 +1687,7 @@ def classroom_me(user: dict = Depends(auth_required)):
 @app.get("/api/classroom/codes")
 def classroom_codes(user: dict = Depends(auth_required)):
     codes = get_saved_codes_for_user(user["username"])
-    return {"codes": codes}
+    return {"codes": codes, "starter_codes": get_starter_motion_codes()}
 
 
 @app.get("/api/classroom/projects")
@@ -2078,11 +2114,19 @@ def run_next(request: QueueRunRequest, user: dict = Depends(auth_required)):
                     if active_navigation_operation() or active_lidar_scan() or robot_status().get("running"):
                         raise HTTPException(status_code=409, detail="Another robot operation currently owns motion.")
                     expanded_code = expand_duet_motion_calls(item["code"], user["username"])
-                    result = execute_duet_program(expanded_code)
+                    result = execute_duet_program(
+                        expanded_code,
+                        safe_mode=teacher_safe_mode_enabled(user["username"]),
+                        safe_mode_stop_margin_m=SAFE_MODE_STOP_MARGIN_METERS,
+                    )
             else:
                 with _MOTION_START_LOCK:
                     ensure_sdk_motion_available()
-                    result = execute_robot_program(item["code"])
+                    result = execute_robot_program(
+                        item["code"],
+                        safe_mode=teacher_safe_mode_enabled(user["username"]),
+                        safe_mode_stop_margin_m=SAFE_MODE_STOP_MARGIN_METERS,
+                    )
         except HTTPException as error:
             set_queue_status_after_motion_error(item["id"], error)
             raise
@@ -2241,7 +2285,11 @@ def run_code(request: CodeRequest, user: dict = Depends(auth_required)):
         raise HTTPException(status_code=403, detail="Teacher role required")
     with _MOTION_START_LOCK:
         ensure_sdk_motion_available()
-        return execute_robot_program(request.code)
+        return execute_robot_program(
+            request.code,
+            safe_mode=teacher_safe_mode_enabled(user["username"]),
+            safe_mode_stop_margin_m=SAFE_MODE_STOP_MARGIN_METERS,
+        )
 
 
 def _checkpoint_localization() -> dict:
@@ -2302,6 +2350,7 @@ def run_checkpointed_planner(
 ):
     if user["role"] != "teacher":
         raise HTTPException(status_code=403, detail="Teacher role required")
+    safe_mode = teacher_safe_mode_enabled(user["username"])
     if os.getenv("G1_SDK_CHECKPOINTED_PLANNER_ENABLED", "").strip() != "1":
         raise HTTPException(
             status_code=503,
@@ -2352,7 +2401,11 @@ def run_checkpointed_planner(
             for point in targets
         ]
         stand = execute_robot_program(
-            "robot.stand()", reset_stop_request=False, clear_stop_request=False
+            "robot.stand()",
+            reset_stop_request=False,
+            clear_stop_request=False,
+            safe_mode=safe_mode,
+            safe_mode_stop_margin_m=SAFE_MODE_STOP_MARGIN_METERS,
         )
         executed_code.append("robot.stand()")
         if stand.get("status") != "completed":
@@ -2367,7 +2420,11 @@ def run_checkpointed_planner(
                 commands = _sdk_commands_to_pose(current, target)
                 if commands:
                     result = execute_robot_program(
-                        "\n".join(commands), reset_stop_request=False, clear_stop_request=False
+                        "\n".join(commands),
+                        reset_stop_request=False,
+                        clear_stop_request=False,
+                        safe_mode=safe_mode,
+                        safe_mode_stop_margin_m=SAFE_MODE_STOP_MARGIN_METERS,
                     )
                     if result.get("status") != "completed":
                         raise HTTPException(status_code=502, detail=f"SDK did not complete waypoint {index + 1}.")
@@ -2392,7 +2449,11 @@ def run_checkpointed_planner(
                     detail=f"Waypoint {index + 1} was not reached within 0.25 m after one SDK correction; route stopped.",
                 )
         stand = execute_robot_program(
-            "robot.stand()", reset_stop_request=False, clear_stop_request=False
+            "robot.stand()",
+            reset_stop_request=False,
+            clear_stop_request=False,
+            safe_mode=safe_mode,
+            safe_mode_stop_margin_m=SAFE_MODE_STOP_MARGIN_METERS,
         )
         executed_code.append("robot.stand()")
         if stand.get("status") != "completed":
@@ -2498,7 +2559,11 @@ def run_duet_code(request: DuetProgramRequest, user: dict = Depends(auth_require
         if robot_status().get("running"):
             raise HTTPException(status_code=409, detail="An SDK robot program is already running.")
         expanded_code = expand_duet_motion_calls(request.code, user["username"])
-        return execute_duet_program(expanded_code)
+        return execute_duet_program(
+            expanded_code,
+            safe_mode=teacher_safe_mode_enabled(user["username"]),
+            safe_mode_stop_margin_m=SAFE_MODE_STOP_MARGIN_METERS,
+        )
     except DuetProgramValidationError as error:
         raise HTTPException(status_code=400, detail=str(error)) from error
     except DuetControllerError as error:
@@ -3372,6 +3437,64 @@ def update_teacher_sidebar_settings(
     conn.commit()
     conn.close()
     return {"locked_panels": locked_panels, "configured": True}
+
+
+def teacher_safe_mode_enabled(username: str) -> bool:
+    conn = get_db_connection()
+    try:
+        row = conn.execute(
+            "SELECT enabled FROM teacher_safe_mode_settings WHERE username = ?",
+            (username,),
+        ).fetchone()
+    finally:
+        conn.close()
+    return bool(row["enabled"]) if row is not None else False
+
+
+@app.get("/api/classroom/safe-mode")
+def get_teacher_safe_mode(
+    response: Response,
+    user: dict = Depends(auth_required),
+):
+    if user["role"] != "teacher":
+        raise HTTPException(status_code=403, detail="Teacher role required")
+    response.headers["Cache-Control"] = "no-store, max-age=0"
+    return {
+        "enabled": teacher_safe_mode_enabled(user["username"]),
+        "stop_margin_m": SAFE_MODE_STOP_MARGIN_METERS,
+        "coverage": "front_rear_footprint",
+        "full_coverage_available": False,
+    }
+
+
+@app.put("/api/classroom/safe-mode")
+def update_teacher_safe_mode(
+    request: SafeModeSettingsRequest,
+    user: dict = Depends(auth_required),
+):
+    if user["role"] != "teacher":
+        raise HTTPException(status_code=403, detail="Teacher role required")
+    conn = get_db_connection()
+    try:
+        conn.execute(
+            """
+            INSERT INTO teacher_safe_mode_settings (username, enabled, updated_at)
+            VALUES (?, ?, CURRENT_TIMESTAMP)
+            ON CONFLICT(username) DO UPDATE SET
+                enabled = excluded.enabled,
+                updated_at = CURRENT_TIMESTAMP
+            """,
+            (user["username"], int(request.enabled)),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+    return {
+        "enabled": request.enabled,
+        "stop_margin_m": SAFE_MODE_STOP_MARGIN_METERS,
+        "coverage": "front_rear_footprint",
+        "full_coverage_available": False,
+    }
 
 
 @app.websocket("/api/lidar/live")

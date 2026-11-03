@@ -6,6 +6,7 @@ import {
   flattenDuetCommands,
   formatDuetProgram,
   getDuetBlocklyCommandBlocks,
+  getDuetCommand,
   getDuetCommandExamples,
   parseDuetProgram,
 } from './duetCommands.js';
@@ -15,12 +16,13 @@ import { G1_ARM_PRESET_DESCRIPTIONS, G1_COMMANDS } from './g1Commands.js';
 test('DUET command catalog contains no legacy robot commands', () => {
   assert.deepEqual(DUET_COMMANDS.map(({ method }) => method), [
     'move',
-    'forward',
+    'walk',
     'backward',
     'strafe_left',
     'strafe_right',
     'turn_left',
     'turn_right',
+    'turn_around_180',
     'arc_forward_left',
     'arc_forward_right',
     'arc_backward_left',
@@ -83,7 +85,11 @@ test('DUET command catalog contains no legacy robot commands', () => {
     || type === 'duet_front_distance_m'
     || type === 'duet_rear_distance_m'
   )));
-  assert.equal(getDuetBlocklyCommandBlocks().filter(({ category }) => category === 'Locomotion').length, 11);
+  const commandBlocks = getDuetBlocklyCommandBlocks();
+  assert.equal(commandBlocks.find(({ type }) => type === 'duet_command_walk')?.message0, 'Walk forward for %1 s');
+  assert.equal(commandBlocks.some(({ type }) => type === 'duet_command_forward'), false);
+  assert.match(getDuetCommand('walk').description, /timed velocity/);
+  assert.equal(getDuetBlocklyCommandBlocks().filter(({ category }) => category === 'Locomotion').length, 12);
   assert.equal(getDuetBlocklyCommandBlocks().find(({ type }) => type === 'duet_concurrent_action').category, 'Concurrent actions');
   assert.equal(getDuetBlocklyCommandBlocks().find(({ type }) => type === 'duet_command_arm_carry').category, 'Arm poses');
   assert.equal(getDuetBlocklyCommandBlocks().find(({ type }) => type === 'duet_command_wave_left_mid').category, 'Arm gestures');
@@ -130,7 +136,7 @@ test('named DUET motions compile as one validated call and populate the toolbox'
 
 test('DUET preset commands have one bounded duration and parse as DUET-only syntax', () => {
   const nodes = parseDuetProgram(
-    'duet.forward(1)\n'
+    'duet.walk(1)\n'
     + 'duet.backward(0.5)\n'
     + 'duet.strafe_left(1)\n'
     + 'duet.strafe_right(1)\n'
@@ -142,7 +148,12 @@ test('DUET preset commands have one bounded duration and parse as DUET-only synt
     + 'duet.arc_backward_right(1)',
   );
   assert.equal(flattenDuetCommands(nodes).length, 10);
-  assert.throws(() => parseDuetProgram('duet.forward(3.1)'), /between 0.1 and 3/);
+  assert.equal(nodes[0].method, 'walk');
+  assert.throws(() => parseDuetProgram('duet.walk(3.1)'), /between 0.1 and 3/);
+  const legacyNodes = parseDuetProgram('duet.forward(1)');
+  assert.equal(legacyNodes[0].method, 'walk');
+  assert.equal(formatDuetProgram(legacyNodes), 'duet.walk(1)');
+  assert.equal(getDuetCommand('forward'), getDuetCommand('walk'));
 });
 
 test('DUET concurrent container pairs any supported locomotion command with a separate arm gesture block', () => {
@@ -168,7 +179,7 @@ test('bounded loops repeat concurrent pairs while ordinary commands remain seque
   const code = 'duet.wait(0.5)\n'
     + 'for _ in range(2):\n'
     + '    with duet.concurrent():\n'
-    + '        duet.forward(1)\n'
+    + '        duet.walk(1)\n'
     + '        duet.arm_reach(1.5)\n'
     + 'duet.wait(0.5)';
   const nodes = parseDuetProgram(code);
@@ -450,7 +461,7 @@ test('DUET parser bounds loop depth and expanded command count', () => {
 
 test('DUET prompt compiler preserves supported duration and accepts safe bounded arm gestures', () => {
   const supported = compileDuetMotionPrompt('walk forward for 2 seconds');
-  assert.equal(supported.code, 'duet.forward(2)');
+  assert.equal(supported.code, 'duet.walk(2)');
   assert.deepEqual(supported.unknown, []);
 
   const waveResult = compileDuetMotionPrompt('wave left for 1 second');

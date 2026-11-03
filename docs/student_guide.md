@@ -114,13 +114,12 @@ Arm presets:
 
 Simulator poses are approximate; the real robot runs its built-in preset.
 
-The audio blocks include speech, volume, head light color, and stopping audio from an app. `robot.playstop("example")` stops audio for an app called `example`; `example` is not a sound name. Available sounds depend on the audio apps installed on the robot, and this command does not list them. Diagnostic blocks can read the current movement mode, speaker volume, and available arm actions.
+The audio blocks include speech, head light color, and stopping audio from an app. Speaker volume is managed by the teacher in Settings, not with a student block. Speech uses the robot's current global speaker volume; the TTS command has no per-message volume argument. `robot.playstop("example")` stops audio for an app called `example`; `example` is not a sound name. Available sounds depend on the audio apps installed on the robot, and this command does not list them. Diagnostic blocks can read the current movement mode, speaker volume, and available arm actions.
 
 Example audio commands:
 
 ```python
 robot.say("Hello, G1", 1)
-robot.setvolume(50)
 robot.led(0, 160, 255)
 robot.getvolume()
 ```

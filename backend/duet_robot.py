@@ -18,11 +18,25 @@ try:
         get_front_distance_sample,
         get_rear_distance_sample,
     )
+    from .safe_mode import (
+        SAFE_MODE_STOP_MARGIN_METERS,
+        current_navigation_safety_snapshot,
+        obstacle_within_margin,
+        registered_arm_obstacle,
+        registered_base_obstacle,
+    )
 except ImportError:
     from lidar_distance import (
         DistanceSensorError,
         get_front_distance_sample,
         get_rear_distance_sample,
+    )
+    from safe_mode import (
+        SAFE_MODE_STOP_MARGIN_METERS,
+        current_navigation_safety_snapshot,
+        obstacle_within_margin,
+        registered_arm_obstacle,
+        registered_base_obstacle,
     )
 
 DUET_ROBOT_MODEL = "g1_23dof"
@@ -35,6 +49,9 @@ DUET_ALLOWED_CAPABILITIES = DUET_BASE_CAPABILITIES | {
     "gateway_identity",
 }
 DUET_MOVEMENT_PRESETS = {
+    "walk": (0.15, 0.0, 0.0),
+    # Backwards compatibility for saved DUET programs authored before the
+    # Legacy-aligned `walk` spelling was introduced.
     "forward": (0.15, 0.0, 0.0),
     "backward": (-0.1, 0.0, 0.0),
     "strafe_left": (0.0, 0.1, 0.0),
@@ -171,6 +188,41 @@ class DuetControllerError(RuntimeError):
 
 class DuetProgramValidationError(DuetControllerError):
     pass
+
+
+def _validate_safe_mode_movement(movement: dict) -> None:
+    if not all(
+        math.isfinite(float(movement[key]))
+        for key in ("vx_mps", "vy_mps", "yaw_rate_rps", "duration_s")
+    ):
+        raise DuetProgramValidationError("Safe Mode movement contains an invalid swept-path parameter.")
+
+
+def _validate_safe_mode_commands(commands: list[dict]) -> None:
+    for command in commands:
+        command_type = command.get("type")
+        if command_type == "distance_condition":
+            _validate_safe_mode_commands(command["then"])
+            _validate_safe_mode_commands(command["else"])
+        elif command_type == "concurrent":
+            _validate_safe_mode_movement(command["movement"])
+        elif command_type == "move":
+            _validate_safe_mode_movement(command)
+        elif command_type == "move_and_arm":
+            _validate_safe_mode_movement(command)
+
+
+def _safe_mode_arm_commands(command: dict) -> list[dict]:
+    command_type = command.get("type")
+    if command_type == "concurrent":
+        return command.get("arm_commands", [])
+    if command_type in {"arm_trajectory"}:
+        return command.get("arm_commands", [])
+    if command_type in {"arm_pose", "arm_target", "arm_target_hold", "reset_arms"}:
+        return [command]
+    if command_type == "move_and_arm":
+        return [{"type": "arm_target", "pose": command["pose"]}]
+    return []
 
 
 def _gateway_configuration() -> tuple[Path, Path]:
@@ -949,7 +1001,7 @@ def _arm_motion_command(method: str, poses: tuple[str, ...], duration: float) ->
     }
 
 
-def _command_from_call(call: ast.Call, line_number: int) -> dict:
+def _command_from_call(call: ast.Call, line_number: int) -> dict | list[dict]:
     function = call.func
     if (
         not isinstance(function, ast.Attribute)
@@ -961,6 +1013,26 @@ def _command_from_call(call: ast.Call, line_number: int) -> dict:
         raise DuetControllerError(f"Keyword arguments are not supported (line {line_number}).")
     method = function.attr
     args = call.args
+
+    if method == "turn_around_180":
+        if args:
+            raise DuetProgramValidationError(
+                f"duet.turn_around_180 takes no arguments (line {line_number})."
+            )
+        yaw_rate = DUET_MOVEMENT_PRESETS["turn_left"][2]
+        remaining = math.pi / yaw_rate
+        segments = []
+        while remaining > 0.0005:
+            duration = min(3.0, remaining)
+            segments.append({
+                "type": "move",
+                "vx_mps": 0.0,
+                "vy_mps": 0.0,
+                "yaw_rate_rps": yaw_rate,
+                "duration_s": duration,
+            })
+            remaining -= duration
+        return segments
 
     if method in {"hold_pose", "hold_pose_until_reset"}:
         expected = 2 if method == "hold_pose" else 1
@@ -1530,6 +1602,17 @@ def _stop_gateway_command() -> dict:
     return status
 
 
+def _stop_gateway_leases() -> dict:
+    status = _validate_controller_status(_gateway_request("STOP"))
+    if (
+        status.get("motion_active") is not False
+        or "arm_pose" in status["capabilities"] and status.get("arm_pose_active") is not False
+        or "arm_targets" in status["capabilities"] and status.get("arm_targets_active") is not False
+    ):
+        raise DuetControllerError("DUET gateway did not confirm that all active motion and arm leases ended.")
+    return status
+
+
 def connect_controller() -> dict:
     result = _gateway_request("ACQUIRE")
     _validate_controller_status(result)
@@ -1559,12 +1642,27 @@ def connect_controller() -> dict:
     }
 
 
-def execute_program(code: str, *, commissioning: bool = False) -> dict:
+def execute_program(
+    code: str,
+    *,
+    commissioning: bool = False,
+    safe_mode: bool = False,
+    safe_mode_stop_margin_m: float = SAFE_MODE_STOP_MARGIN_METERS,
+) -> dict:
     commands = parse_duet_program(code)
     if commissioning:
         _require_commissioning_enabled()
     else:
         _require_hardware_acceptance()
+    if safe_mode:
+        if (
+            isinstance(safe_mode_stop_margin_m, bool)
+            or not isinstance(safe_mode_stop_margin_m, (int, float))
+            or not math.isfinite(float(safe_mode_stop_margin_m))
+            or not 0 < float(safe_mode_stop_margin_m) <= 5
+        ):
+            raise DuetControllerError("Safe Mode stop margin is invalid.")
+        _validate_safe_mode_commands(commands)
     with _run_state_lock:
         if not _run_lock.acquire(blocking=False):
             raise DuetControllerError("A DUET program is already running.")
@@ -1638,11 +1736,16 @@ def execute_program(code: str, *, commissioning: bool = False) -> dict:
             if active_arm_command is not None and active_arm_command.get("type") != "arm_pose":
                 send_arm_command(active_arm_command)
 
-        def wait_with_arm_refresh(duration_s: float) -> bool:
+        def wait_with_arm_refresh(duration_s: float) -> str | None:
             deadline = time.monotonic() + duration_s
             while time.monotonic() < deadline:
                 if _stop_requested.is_set():
-                    return True
+                    return "teacher_stop"
+                if safe_mode and active_arm_command is not None:
+                    reason = active_safe_mode_block_reason(0.0, 0.0, 0.0, True)
+                    if reason:
+                        stop_active_safe_mode_command(reason, active_arm_command.get("type", "arm"))
+                        return "safe_mode"
                 if active_arm_command is not None:
                     arm_status = _validate_controller_status(_gateway_request("STATUS"))
                     if arm_status.get("external_arm_active") is True:
@@ -1661,8 +1764,8 @@ def execute_program(code: str, *, commissioning: bool = False) -> dict:
                 refresh_arm_command()
                 remaining = deadline - time.monotonic()
                 if remaining > 0 and _stop_requested.wait(min(COMMAND_REFRESH_SECONDS, remaining)):
-                    return True
-            return _stop_requested.is_set()
+                    return "teacher_stop"
+            return None
 
         arm_telemetry: list[dict] = []
 
@@ -1701,11 +1804,121 @@ def execute_program(code: str, *, commissioning: bool = False) -> dict:
             return result
 
         conditions_evaluated: list[dict] = []
+        safety_interventions: list[dict] = []
         pending_commands = list(reversed(commands))
+
+        def safe_mode_arm_block_reason() -> str | None:
+            for sector, sample_reader in (
+                ("front", get_front_distance_sample),
+                ("rear", get_rear_distance_sample),
+            ):
+                try:
+                    sample = sample_reader()
+                    if obstacle_within_margin(sample, float(safe_mode_stop_margin_m)):
+                        distance = sample.get("distance_m")
+                        return (
+                            f"{sector} obstacle is within the "
+                            f"{float(safe_mode_stop_margin_m):.2f} m Safe Mode margin "
+                            f"({distance:.2f} m)."
+                        )
+                except DistanceSensorError as error:
+                    return f"{sector} obstacle sensing is unavailable: {error}"
+            try:
+                obstacle = registered_arm_obstacle(current_navigation_safety_snapshot())
+            except DistanceSensorError as error:
+                return f"Registered arm-envelope sensing is unavailable: {error}"
+            if obstacle:
+                return obstacle["reason"]
+            return None
+
+        def safe_mode_movement_block_reason(
+            vx_mps: float,
+            vy_mps: float,
+            yaw_rate_rps: float,
+            horizon_s: float = 0.2,
+        ) -> str | None:
+            if abs(vx_mps) > 0.001:
+                sector = "front" if vx_mps > 0 else "rear"
+                sample_reader = get_front_distance_sample if vx_mps > 0 else get_rear_distance_sample
+                try:
+                    sample = sample_reader()
+                    if obstacle_within_margin(sample, float(safe_mode_stop_margin_m)):
+                        distance = sample.get("distance_m")
+                        return (
+                            f"{sector} clearance {distance:.2f} m reached the "
+                            f"{float(safe_mode_stop_margin_m):.2f} m stop margin."
+                        )
+                except DistanceSensorError as error:
+                    raise DuetControllerError(
+                        f"Safe Mode {sector} sensing failed during base movement: {error}"
+                    ) from error
+            try:
+                obstacle = registered_base_obstacle(
+                    current_navigation_safety_snapshot(),
+                    vx_mps,
+                    vy_mps,
+                    yaw_rate_rps,
+                    horizon_s,
+                    float(safe_mode_stop_margin_m),
+                )
+            except DistanceSensorError as error:
+                raise DuetControllerError(
+                    f"Safe Mode registered swept-path sensing failed: {error}"
+                ) from error
+            if obstacle:
+                return obstacle["reason"]
+            return None
+
+        def stop_active_safe_mode_command(reason: str, command_type: str) -> None:
+            nonlocal active_arm_command
+            _stop_gateway_leases()
+            active_arm_command = None
+            intervention = {
+                "command": command_type,
+                "status": "stopped",
+                "reason": reason,
+                "physicalStopVerified": False,
+            }
+            safety_interventions.append(intervention)
+
+        def active_safe_mode_block_reason(
+            vx_mps: float,
+            vy_mps: float,
+            yaw_rate_rps: float,
+            arm_active: bool,
+        ) -> str | None:
+            if arm_active:
+                arm_reason = safe_mode_arm_block_reason()
+                if arm_reason:
+                    return arm_reason
+            return safe_mode_movement_block_reason(vx_mps, vy_mps, yaw_rate_rps)
+
         while pending_commands:
             command = pending_commands.pop()
             if _stop_requested.is_set():
                 break
+            command_arm_commands = _safe_mode_arm_commands(command)
+            if safe_mode and command_arm_commands:
+                arm_block_reason = safe_mode_arm_block_reason()
+                if arm_block_reason:
+                    safety_interventions.append({
+                        "command": command["type"],
+                        "status": "skipped",
+                        "reason": arm_block_reason,
+                    })
+                    if command["type"] == "concurrent":
+                        command = command["movement"]
+                    elif command["type"] == "move_and_arm":
+                        command = {
+                            "type": "move",
+                            "vx_mps": command["vx_mps"],
+                            "vy_mps": command["vy_mps"],
+                            "yaw_rate_rps": command["yaw_rate_rps"],
+                            "duration_s": command["duration_s"],
+                        }
+                    else:
+                        executed += 1
+                        continue
             if command["type"] == "distance_condition":
                 sensor = command["sensor"]
                 try:
@@ -1739,9 +1952,21 @@ def execute_program(code: str, *, commissioning: bool = False) -> dict:
                 continue
             if command["type"] == "move":
                 deadline = time.monotonic() + command["duration_s"]
+                safety_interrupted = False
                 while time.monotonic() < deadline:
                     if _stop_requested.is_set():
                         break
+                    if safe_mode:
+                        reason = active_safe_mode_block_reason(
+                            command["vx_mps"],
+                            command["vy_mps"],
+                            command["yaw_rate_rps"],
+                            active_arm_command is not None,
+                        )
+                        if reason:
+                            stop_active_safe_mode_command(reason, command["type"])
+                            safety_interrupted = True
+                            break
                     request = (
                         f"MOVE {command['vx_mps']:.6f} {command['vy_mps']:.6f} "
                         f"{command['yaw_rate_rps']:.6f} {COMMAND_LEASE_MS}"
@@ -1761,6 +1986,8 @@ def execute_program(code: str, *, commissioning: bool = False) -> dict:
                     remaining = deadline - time.monotonic()
                     if remaining > 0 and _stop_requested.wait(min(COMMAND_REFRESH_SECONDS, remaining)):
                         break
+                if safety_interrupted:
+                    continue
                 if active_arm_command and active_arm_command.get("type") != "arm_pose":
                     _validate_controller_status(_gateway_request(f"MOVE 0 0 0 {COMMAND_LEASE_MS}"))
                     refresh_arm_command()
@@ -1790,10 +2017,22 @@ def execute_program(code: str, *, commissioning: bool = False) -> dict:
 
                 pose_index = 0
                 next_pose_at = started_at + arm_durations[0]
+                safety_interrupted = False
                 while time.monotonic() < max(move_deadline, arm_deadline):
                     if _stop_requested.is_set():
                         _stop_gateway_command()
                         break
+                    if safe_mode:
+                        reason = active_safe_mode_block_reason(
+                            movement["vx_mps"],
+                            movement["vy_mps"],
+                            movement["yaw_rate_rps"],
+                            True,
+                        )
+                        if reason:
+                            stop_active_safe_mode_command(reason, command["type"])
+                            safety_interrupted = True
+                            break
 
                     now = time.monotonic()
                     while pose_index + 1 < len(arm_commands) and now >= next_pose_at:
@@ -1857,6 +2096,8 @@ def execute_program(code: str, *, commissioning: bool = False) -> dict:
                     if remaining > 0 and _stop_requested.wait(remaining):
                         _stop_gateway_command()
                         break
+                if safety_interrupted:
+                    continue
                 else:
                     if persistent_hold:
                         status = _validate_controller_status(_gateway_request(
@@ -1888,9 +2129,21 @@ def execute_program(code: str, *, commissioning: bool = False) -> dict:
                 arm_deadline = started_at + command["arm_duration_s"]
                 send_arm_command(arm_command)
 
+                safety_interrupted = False
                 while time.monotonic() < move_deadline:
                     if _stop_requested.is_set():
                         break
+                    if safe_mode:
+                        reason = active_safe_mode_block_reason(
+                            command["vx_mps"],
+                            command["vy_mps"],
+                            command["yaw_rate_rps"],
+                            True,
+                        )
+                        if reason:
+                            stop_active_safe_mode_command(reason, command["type"])
+                            safety_interrupted = True
+                            break
                     request = (
                         f"MOVE {command['vx_mps']:.6f} {command['vy_mps']:.6f} "
                         f"{command['yaw_rate_rps']:.6f} {COMMAND_LEASE_MS}"
@@ -1912,6 +2165,8 @@ def execute_program(code: str, *, commissioning: bool = False) -> dict:
                     remaining = move_deadline - time.monotonic()
                     if remaining > 0 and _stop_requested.wait(min(COMMAND_REFRESH_SECONDS, remaining)):
                         break
+                if safety_interrupted:
+                    continue
                 if _stop_requested.is_set():
                     break
 
@@ -1933,6 +2188,12 @@ def execute_program(code: str, *, commissioning: bool = False) -> dict:
                 while time.monotonic() < arm_deadline:
                     if _stop_requested.is_set():
                         break
+                    if safe_mode:
+                        reason = active_safe_mode_block_reason(0.0, 0.0, 0.0, True)
+                        if reason:
+                            stop_active_safe_mode_command(reason, command["type"])
+                            safety_interrupted = True
+                            break
                     status = _validate_controller_status(_gateway_request(
                         f"MOVE 0 0 0 {COMMAND_LEASE_MS}"
                     ))
@@ -1950,6 +2211,8 @@ def execute_program(code: str, *, commissioning: bool = False) -> dict:
                     remaining = arm_deadline - time.monotonic()
                     if remaining > 0 and _stop_requested.wait(min(COMMAND_REFRESH_SECONDS, remaining)):
                         break
+                if safety_interrupted:
+                    continue
                 if _stop_requested.is_set():
                     break
                 _validate_controller_status(_gateway_request(
@@ -1958,22 +2221,42 @@ def execute_program(code: str, *, commissioning: bool = False) -> dict:
                 capture_arm_measurement(arm_command)
                 reset_arms()
             elif command["type"] == "wait":
-                if wait_with_arm_refresh(command["duration_s"]):
+                wait_result = wait_with_arm_refresh(command["duration_s"])
+                if wait_result == "safe_mode":
+                    continue
+                if wait_result:
                     break
             elif command["type"] == "arm_trajectory":
+                safety_interrupted = False
                 for arm_command in command["arm_commands"]:
+                    if safe_mode:
+                        reason = safe_mode_arm_block_reason()
+                        if reason:
+                            stop_active_safe_mode_command(reason, command["type"])
+                            safety_interrupted = True
+                            break
                     active_arm_command = arm_command
                     send_arm_command(arm_command)
-                    if wait_with_arm_refresh(arm_command["duration_s"]):
+                    wait_result = wait_with_arm_refresh(arm_command["duration_s"])
+                    if wait_result == "safe_mode":
+                        safety_interrupted = True
+                        break
+                    if wait_result:
                         break
                     capture_arm_measurement(arm_command)
+                if safety_interrupted:
+                    continue
                 if _stop_requested.is_set():
                     break
             elif command["type"] == "arm_target_hold":
                 active_arm_command = command
                 send_arm_command(command)
-                if not command["until_reset"] and wait_with_arm_refresh(command["duration_s"]):
-                    break
+                if not command["until_reset"]:
+                    wait_result = wait_with_arm_refresh(command["duration_s"])
+                    if wait_result == "safe_mode":
+                        continue
+                    if wait_result:
+                        break
                 if not command["until_reset"]:
                     capture_arm_measurement(command)
                 if not command["until_reset"]:
@@ -1993,7 +2276,10 @@ def execute_program(code: str, *, commissioning: bool = False) -> dict:
                         "DUET gateway did not confirm the requested arm pose, acceptance gate, and active lease."
                     )
                 active_arm_command = command
-                if wait_with_arm_refresh(command["duration_s"]):
+                wait_result = wait_with_arm_refresh(command["duration_s"])
+                if wait_result == "safe_mode":
+                    continue
+                if wait_result:
                     break
                 if "arm_feedback" in status["capabilities"]:
                     pose_status = _validate_controller_status(_gateway_request("STATUS"))
@@ -2025,7 +2311,7 @@ def execute_program(code: str, *, commissioning: bool = False) -> dict:
                 _stop_gateway_command()
             else:
                 reset_arms()
-        return {
+        response = {
             "status": "stopped" if _stop_requested.is_set() else "completed",
             "programId": program_id,
             "commandsExecuted": executed,
@@ -2033,9 +2319,15 @@ def execute_program(code: str, *, commissioning: bool = False) -> dict:
             "conditionsEvaluated": conditions_evaluated,
             "armTelemetry": arm_telemetry,
         }
+        if safety_interventions:
+            response["safetyInterventions"] = safety_interventions
+        return response
     except DuetControllerError as error:
         try:
-            _stop_gateway_command()
+            if safe_mode:
+                _stop_gateway_leases()
+            else:
+                _stop_gateway_command()
         except DuetControllerError as stop_error:
             raise DuetControllerError(
                 f"{error} A stop could not be confirmed: {stop_error}"

@@ -16,8 +16,22 @@ from fastapi import HTTPException
 
 try:
     from .lidar_distance import DistanceSensorError, distance_sensor_status, get_front_distance_sample, get_rear_distance_sample
+    from .safe_mode import (
+        SAFE_MODE_STOP_MARGIN_METERS,
+        current_navigation_safety_snapshot,
+        obstacle_within_margin,
+        registered_arm_obstacle,
+        registered_base_obstacle,
+    )
 except ImportError:
     from lidar_distance import DistanceSensorError, distance_sensor_status, get_front_distance_sample, get_rear_distance_sample
+    from safe_mode import (
+        SAFE_MODE_STOP_MARGIN_METERS,
+        current_navigation_safety_snapshot,
+        obstacle_within_margin,
+        registered_arm_obstacle,
+        registered_base_obstacle,
+    )
 
 _client = None
 _arm_client = None
@@ -33,6 +47,7 @@ _CONTINUOUS_MOVE_DURATION = 864000.0
 _STEP_METERS = 0.345
 _FORWARD_METERS_PER_SECOND = 0.4
 _TURN_RADIANS_PER_SECOND = 0.6
+_SAFE_MODE_POLL_INTERVAL_SECONDS = 0.1
 _POSTURE_TRANSITION_FSM_IDS = {
     "squat_to_stand": 706,
     "lie_to_stand": 702,
@@ -192,6 +207,10 @@ def _validate_call(node: ast.AST) -> dict[str, Any]:
         if len(args) != 1:
             raise CommandValidationError("robot.wait() expects a whole number duration from 1 to 10 seconds.")
         return {"method": method, "seconds": _integer(args[0], "seconds", 1, 10)}
+    if method == "turn_around_180":
+        if args:
+            raise CommandValidationError("robot.turn_around_180() takes no arguments.")
+        return {"method": method, "direction": "left", "degrees": 180}
     if method == "turn":
         if len(args) not in {1, 2}:
             raise CommandValidationError('robot.turn() expects a direction and optional angle, e.g. robot.turn("left", 90).')
@@ -220,8 +239,8 @@ def _validate_call(node: ast.AST) -> dict[str, Any]:
         }
     if method == "setvolume":
         if len(args) != 1:
-            raise CommandValidationError("robot.setvolume() expects a volume from 0 to 70.")
-        return {"method": method, "volume": _integer(args[0], "volume", 0, 70)}
+            raise CommandValidationError("robot.setvolume() expects a volume from 0 to 100.")
+        return {"method": method, "volume": _integer(args[0], "volume", 0, 100)}
     if method == "led":
         if len(args) != 3:
             raise CommandValidationError("robot.led() expects red, green, and blue values from 0 to 255.")
@@ -470,7 +489,7 @@ def _estimated_duration(command: dict[str, Any]) -> float:
         return _ARM_ACTION_REQUEST_SPACING_SECONDS
     if method == "hold_arm":
         return max(_ARM_ACTION_REQUEST_SPACING_SECONDS, command["seconds"])
-    if method == "turn":
+    if method in {"turn", "turn_around_180"}:
         return math.radians(command["degrees"]) / _TURN_RADIANS_PER_SECOND
     if method == "sidestep":
         return command["steps"] * _STEP_METERS / 0.2
@@ -574,10 +593,94 @@ def _sdk_result(result: Any, operation: str) -> None:
         raise RuntimeError(f"G1 SDK operation {operation} failed with code {result}.")
 
 
-def _move(vx: float, vy: float, vyaw: float, seconds: float) -> None:
+def _validate_safe_mode_commands(nodes: list[dict[str, Any]]) -> None:
+    for node in nodes:
+        if node.get("type") == "repeat":
+            _validate_safe_mode_commands(node["body"])
+        elif node.get("type") == "condition" or node.get("variable") is not None:
+            _validate_safe_mode_commands(node["then"])
+            _validate_safe_mode_commands(node["else"])
+
+
+def _safe_mode_arm_block_reason(margin_m: float) -> str | None:
+    for sector, sample_reader in (
+        ("front", get_front_distance_sample),
+        ("rear", get_rear_distance_sample),
+    ):
+        try:
+            sample = sample_reader()
+            if obstacle_within_margin(sample, margin_m):
+                clearance = sample.get("distance_m")
+                return f"{sector} obstacle is within the {margin_m:.2f} m Safe Mode margin ({clearance:.2f} m)."
+        except DistanceSensorError as error:
+            return f"{sector} obstacle sensing is unavailable: {error}"
+    try:
+        obstacle = registered_arm_obstacle(current_navigation_safety_snapshot())
+    except DistanceSensorError as error:
+        return f"Registered arm-envelope sensing is unavailable: {error}"
+    if obstacle:
+        return obstacle["reason"]
+    return None
+
+
+def _safe_mode_movement_obstacle(
+    vx: float,
+    vy: float,
+    vyaw: float,
+    margin_m: float,
+    horizon_s: float,
+) -> dict[str, Any] | None:
+    if abs(vx) > 0.001:
+        sector = "front" if vx > 0 else "rear"
+        sample_reader = get_front_distance_sample if vx > 0 else get_rear_distance_sample
+        sample = sample_reader()
+        if obstacle_within_margin(sample, margin_m):
+            return {
+                "sector": sector,
+                "distance_m": sample.get("distance_m"),
+                "stop_margin_m": margin_m,
+                "reason": (
+                    f"{sector} clearance {sample.get('distance_m'):.2f} m "
+                    f"reached the {margin_m:.2f} m stop margin."
+                ),
+            }
+    obstacle = registered_base_obstacle(
+        current_navigation_safety_snapshot(),
+        vx,
+        vy,
+        vyaw,
+        horizon_s,
+        margin_m,
+    )
+    if not obstacle:
+        return None
+    return {
+        "sector": "registered",
+        "distance_m": obstacle["distance_m"],
+        "stop_margin_m": margin_m,
+        "reason": obstacle["reason"],
+    }
+
+
+def _move(
+    vx: float,
+    vy: float,
+    vyaw: float,
+    seconds: float,
+    *,
+    safe_mode: bool = False,
+    safe_mode_stop_margin_m: float = SAFE_MODE_STOP_MARGIN_METERS,
+) -> dict[str, Any] | None:
     if _client is None:
         raise HTTPException(status_code=409, detail="Connect the G1 SDK before running a robot program.")
     try:
+        if safe_mode:
+            initial_obstacle = _safe_mode_movement_obstacle(
+                vx, vy, vyaw, safe_mode_stop_margin_m, min(seconds, 0.2)
+            )
+            if initial_obstacle:
+                _log_event("safe_mode_motion_stopped", **initial_obstacle)
+                return initial_obstacle
         _sdk_result(
             _client.SetVelocity(vx, vy, vyaw, _CONTINUOUS_MOVE_DURATION),
             "SetVelocity",
@@ -586,7 +689,27 @@ def _move(vx: float, vy: float, vyaw: float, seconds: float) -> None:
         while time.monotonic() < deadline:
             if _stop_requested.is_set():
                 break
-            time.sleep(min(0.05, max(0, deadline - time.monotonic())))
+            if safe_mode:
+                obstacle = _safe_mode_movement_obstacle(
+                    vx,
+                    vy,
+                    vyaw,
+                    safe_mode_stop_margin_m,
+                    min(0.2, max(0, deadline - time.monotonic())),
+                )
+                if obstacle:
+                    _log_event("safe_mode_motion_stopped", **obstacle)
+                    return obstacle
+            time.sleep(min(
+                _SAFE_MODE_POLL_INTERVAL_SECONDS if safe_mode else 0.05,
+                max(0, deadline - time.monotonic()),
+            ))
+    except DistanceSensorError as error:
+        _log_event("safe_mode_sensor_failed", error=str(error))
+        raise HTTPException(
+            status_code=503,
+            detail=f"Safe Mode stopped the G1 because live distance sensing failed: {error}",
+        ) from error
     finally:
         _sdk_result(_client.SetVelocity(0.0, 0.0, 0.0, 1.0), "StopMove")
     if _stop_requested.is_set():
@@ -654,11 +777,22 @@ def execute_robot_program(
     *,
     reset_stop_request: bool = True,
     clear_stop_request: bool = True,
+    safe_mode: bool = False,
+    safe_mode_stop_margin_m: float = SAFE_MODE_STOP_MARGIN_METERS,
 ) -> dict[str, Any]:
     try:
         commands = parse_robot_program(code)
     except CommandValidationError as error:
         raise HTTPException(status_code=400, detail=str(error)) from error
+    if safe_mode:
+        if (
+            isinstance(safe_mode_stop_margin_m, bool)
+            or not isinstance(safe_mode_stop_margin_m, (int, float))
+            or not math.isfinite(float(safe_mode_stop_margin_m))
+            or not 0 < float(safe_mode_stop_margin_m) <= 5
+        ):
+            raise HTTPException(status_code=503, detail="Safe Mode stop margin is invalid.")
+        _validate_safe_mode_commands(commands)
     if _client is None:
         raise HTTPException(status_code=409, detail="Connect the G1 SDK before running a robot program.")
     if not _run_lock.acquire(blocking=False):
@@ -670,6 +804,7 @@ def execute_robot_program(
     conditions_evaluated: list[dict[str, Any]] = []
     boolean_variables: dict[str, bool] = {}
     executed_count = 0
+    safety_interventions: list[dict[str, Any]] = []
     try:
         _log_event("program_started", command_count=len(commands), commands=commands)
 
@@ -694,11 +829,36 @@ def execute_robot_program(
                     detail="Stop requested after the arm preset was accepted. The SDK has no verified way to cancel the active arm motion.",
                 )
 
+        def execute_locomotion(vx: float, vy: float, vyaw: float, duration: float) -> dict[str, Any] | None:
+            if safe_mode:
+                return _move(
+                    vx,
+                    vy,
+                    vyaw,
+                    duration,
+                    safe_mode=True,
+                    safe_mode_stop_margin_m=float(safe_mode_stop_margin_m),
+                )
+            _move(vx, vy, vyaw, duration)
+            return None
+
         def execute_command(command: dict[str, Any]) -> None:
             nonlocal executed_count
+            method = command["method"]
+            if safe_mode and method in {"arm_action", "hold_arm"}:
+                blocked_reason = _safe_mode_arm_block_reason(float(safe_mode_stop_margin_m))
+                if blocked_reason:
+                    intervention = {
+                        "command": method,
+                        "status": "skipped",
+                        "reason": blocked_reason,
+                    }
+                    safety_interventions.append(intervention)
+                    _log_event("safe_mode_arm_skipped", **intervention)
+                    results.append(intervention)
+                    return
             executed_count += 1
             index = executed_count
-            method = command["method"]
             _log_event("command_started", index=index, command=command)
             try:
                 if method == "stand":
@@ -744,21 +904,47 @@ def execute_robot_program(
                     if _audio_client is None:
                         raise HTTPException(status_code=409, detail="Connect the G1 audio SDK before stopping audio playback.")
                     _sdk_result(_audio_client.PlayStop(command["app_name"]), "PlayStop")
-                elif method == "turn":
+                elif method in {"turn", "turn_around_180"}:
                     yaw = _TURN_RADIANS_PER_SECOND * (1 if command["direction"] == "left" else -1)
                     _require_locomotion_ready()
-                    _move(0, 0, yaw, math.radians(command["degrees"]) / _TURN_RADIANS_PER_SECOND)
+                    execute_locomotion(
+                        0,
+                        0,
+                        yaw,
+                        math.radians(command["degrees"]) / _TURN_RADIANS_PER_SECOND,
+                    )
                 elif method == "sidestep":
                     lateral_speed = 0.2 * (1 if command["direction"] == "left" else -1)
                     _require_locomotion_ready()
-                    _move(0, lateral_speed, 0, command["steps"] * _STEP_METERS / abs(lateral_speed))
+                    execute_locomotion(
+                        0,
+                        lateral_speed,
+                        0,
+                        command["steps"] * _STEP_METERS / abs(lateral_speed),
+                    )
                 else:
                     speed = 0.2 if method.startswith("slow") else 0.8 if method.startswith("fast") else _FORWARD_METERS_PER_SECOND
                     if method in {"backward", "backwardtime"}:
                         speed *= -1
                     duration = command["seconds"] if method.endswith("time") else command["steps"] * _STEP_METERS / abs(speed)
                     _require_locomotion_ready()
-                    _move(speed, 0, 0, duration)
+                    obstacle = execute_locomotion(
+                        speed,
+                        0,
+                        0,
+                        duration,
+                    )
+                    if obstacle:
+                        intervention = {
+                            "command": method,
+                            "status": "stopped",
+                            "reason": obstacle.get("reason") or (
+                                f"{obstacle['sector']} clearance {obstacle['distance_m']:.2f} m "
+                                f"reached the {obstacle['stop_margin_m']:.2f} m stop margin."
+                            ),
+                        }
+                        safety_interventions.append(intervention)
+                        results.append(intervention)
             except Exception as error:
                 _log_event("command_failed", index=index, command=command, error=str(error))
                 raise
@@ -869,6 +1055,8 @@ def execute_robot_program(
         }
         if conditions_evaluated:
             response["conditionsEvaluated"] = conditions_evaluated
+        if safety_interventions:
+            response["safetyInterventions"] = safety_interventions
         return response
     except HTTPException as error:
         _log_event("program_failed", error=str(error.detail))

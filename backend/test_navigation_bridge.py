@@ -12,6 +12,7 @@ try:
         navigation_cancel_route,
         navigation_map_snapshot,
         navigation_plan_route,
+        navigation_safety_snapshot,
         navigation_start_route,
     )
 except ImportError:
@@ -22,6 +23,7 @@ except ImportError:
         navigation_cancel_route,
         navigation_map_snapshot,
         navigation_plan_route,
+        navigation_safety_snapshot,
         navigation_start_route,
     )
 
@@ -154,6 +156,28 @@ class NavigationBridgeTests(unittest.TestCase):
             result = navigation_bridge_status(now=self.now)
         self.assertFalse(result["liveAvoidanceReady"])
         self.assertEqual(result["liveObstacles"]["points"], [])
+
+    def test_registered_safety_snapshot_keeps_stale_points_for_relevance_checks(self):
+        status = {
+            **self.status,
+            "registered_obstacles": {
+                "ready": True,
+                "frame_id": "map",
+                "age_ms": 80,
+                "points": [
+                    {"x": 1.0, "y": -0.5, "z": 0.8, "age_ms": 1_700},
+                    {"x": 2.0, "y": 0.5, "z": 0.9, "age_ms": 60},
+                ],
+            },
+        }
+
+        with self.mock_bridge(status=status):
+            result = navigation_safety_snapshot(now=self.now)
+
+        self.assertTrue(result["ready"])
+        self.assertTrue(result["registeredObstacles"]["ready"])
+        self.assertEqual(result["registeredObstacles"]["points"][0]["age_ms"], 1_700)
+        self.assertEqual(result["registeredObstacles"]["points"][1]["z"], 0.9)
 
     def test_unconfirmed_or_competing_controller_ownership_disables_motion(self):
         for controller in (

@@ -15,6 +15,7 @@ class CameraDiscoveryTests(unittest.TestCase):
         self.addCleanup(self.temp_dir.cleanup)
         self.now = 1_800_000_000.0
         self.echo_commands = []
+        self.ros_timeouts = []
 
     def write_usb_device(self, path_name, fields):
         device_dir = os.path.join(self.temp_dir.name, path_name)
@@ -31,10 +32,12 @@ class CameraDiscoveryTests(unittest.TestCase):
             "frame_id: camera_optical_frame\n"
         )
 
-        def runner(command, **_options):
+        def runner(command, **options):
             if command[1:4] == ["topic", "list", "-t"]:
+                self.ros_timeouts.append(("list", options.get("timeout")))
                 stdout = topics
             elif "echo" in command:
+                self.ros_timeouts.append(("sample", options.get("timeout")))
                 self.echo_commands.append(command)
                 self.assertNotIn("--once", command)
                 self.assertNotIn("--field", command)
@@ -61,6 +64,14 @@ class CameraDiscoveryTests(unittest.TestCase):
             usb_root=self.temp_dir.name,
             ros2_executable="/usr/bin/ros2",
         )
+
+    def test_camera_discovery_uses_extended_bounded_timeouts(self):
+        self.run_discovery(
+            "/camera/color/image_raw [sensor_msgs/msg/Image]\n"
+        )
+
+        self.assertIn(("list", 10.0), self.ros_timeouts)
+        self.assertIn(("sample", 5.0), self.ros_timeouts)
 
     def test_detects_unitree_and_realsense_streams_independently(self):
         self.write_usb_device(

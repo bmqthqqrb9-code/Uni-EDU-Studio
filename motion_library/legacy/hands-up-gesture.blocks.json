@@ -1,0 +1,16 @@
+{
+  "format": "uni-edu-studio-block-example-v1",
+  "controller_version": "legacy",
+  "name": "hands-up-gesture",
+  "title": "Hands Up Gesture",
+  "blocks": [
+    {
+      "type": "g1_command_hold_arm",
+      "method": "hold_arm",
+      "inputs": [
+        "\"hands up\"",
+        "2"
+      ]
+    }
+  ]
+}

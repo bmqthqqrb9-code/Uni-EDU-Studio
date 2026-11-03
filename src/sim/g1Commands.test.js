@@ -16,6 +16,7 @@ test('G1 command catalog emits matching bounded Blockly commands', () => {
     [
       ...G1_EXECUTABLE_COMMANDS.filter((command) => command.method !== 'arm_action')
         .slice(0, 12).map((command) => command.blockType),
+      'g1_command_turn_around_180',
       'g1_command_squat_to_stand',
       'g1_command_lie_to_stand',
       'g1_command_stand_to_squat',
@@ -35,12 +36,10 @@ test('G1 command catalog emits matching bounded Blockly commands', () => {
       'g1_command_arm_action_face_wave',
       'g1_command_arm_action_high_wave',
       'g1_command_arm_action_shake_hand',
-      'g1_command_hold_arm',
       'g1_command_getfsm',
       'g1_command_getactions',
       'g1_command_say',
       'g1_command_getvolume',
-      'g1_command_setvolume',
       'g1_command_led',
       'g1_command_playstop',
     ],
@@ -49,6 +48,9 @@ test('G1 command catalog emits matching bounded Blockly commands', () => {
     command.blockType === block.type
     || (command.method === 'arm_action' && block.armPreset && command.args[0].choices.some(([, preset]) => preset === block.armPreset))
   ))));
+  assert.ok(G1_COMMANDS.some((command) => command.method === 'hold_arm'));
+  assert.ok(!G1_EXECUTABLE_COMMANDS.some((command) => command.method === 'hold_arm'));
+  assert.ok(getG1BlocklyCommandBlocks(G1_COMMANDS).some((block) => block.type === 'g1_command_hold_arm'));
   assert.ok(G1_EXECUTABLE_COMMANDS.some((command) => command.method === 'arm_action' && command.category === 'Gestures'));
   assert.ok(getG1BlocklyCommandBlocks(G1_COMMANDS).some((block) => block.type === 'g1_command_kickleftDegrees'));
   assert.deepEqual(
@@ -71,12 +73,15 @@ test('G1 command catalog emits matching bounded Blockly commands', () => {
   assert.match(G1_EXECUTABLE_COMMANDS.find((command) => command.method === 'walk').description, /may vary/);
   assert.ok(G1_EXECUTABLE_COMMANDS.some((command) => command.method === 'getactions' && command.sdkMethod === 'G1ArmActionClient.GetActionList'));
   assert.ok(G1_EXECUTABLE_COMMANDS.some((command) => command.method === 'say' && command.sdkMethod === 'AudioClient.TtsMaker'));
-  const audioMethods = ['say', 'getvolume', 'setvolume', 'led', 'playstop'];
+  const audioMethods = ['say', 'getvolume', 'led', 'playstop'];
   assert.deepEqual(
     G1_EXECUTABLE_COMMANDS.filter((command) => command.category === 'Audio').map(({ method }) => method),
     audioMethods,
   );
   assert.ok(audioMethods.every((method) => blocks.some((block) => block.type === `g1_command_${method}`)));
+  assert.ok(G1_COMMANDS.some((command) => command.method === 'setvolume'));
+  assert.ok(!G1_EXECUTABLE_COMMANDS.some((command) => command.method === 'setvolume'));
+  assert.ok(!blocks.some((block) => block.type === 'g1_command_setvolume'));
   const sayBlock = blocks.find((block) => block.type === 'g1_command_say');
   assert.deepEqual(sayBlock.stringFields, ['TEXT']);
   assert.equal(sayBlock.args0[0].type, 'field_input');
@@ -456,7 +461,7 @@ test('G1 parser safely normalizes SDK diagnostics and audio arguments', () => {
   );
   assert.deepEqual(nodes.map(({ method, values, code }) => ({ method, values, code })), [
     { method: 'say', values: ['Hello, "G1"!', 1], code: 'robot.say("Hello, \\"G1\\"!", 1)' },
-    { method: 'setvolume', values: [70], code: 'robot.setvolume(70)' },
+    { method: 'setvolume', values: [100], code: 'robot.setvolume(100)' },
     { method: 'led', values: [10, 20, 255], code: 'robot.led(10, 20, 255)' },
     { method: 'playstop', values: ['classroom-audio'], code: 'robot.playstop("classroom-audio")' },
     { method: 'getactions', values: [], code: 'robot.getactions()' },

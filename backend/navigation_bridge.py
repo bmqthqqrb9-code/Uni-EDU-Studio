@@ -17,6 +17,8 @@ SCAN_POINTCLOUD_TIMEOUT_SECONDS = 15.0
 NAVIGATION_PLAN_TIMEOUT_SECONDS = 65.0
 MAX_LOCALIZATION_AGE_SECONDS = 1.0
 MAX_POINTCLOUD_AGE_SECONDS = 1.5
+MAX_REGISTERED_OBSTACLE_POINTS = 5_000
+MAX_REGISTERED_OBSTACLE_AGE_MS = 2_000
 MAX_ESTOP_AGE_MS = 5_000
 MAX_MAP_CELLS = 100_000_000
 MAX_PREVIEW_MAP_CELLS = 250_000
@@ -326,6 +328,11 @@ def _validate_status(payload: dict[str, Any], now: datetime) -> dict[str, Any]:
     x = _finite_number(pose.get("x"), "localization pose x")
     y = _finite_number(pose.get("y"), "localization pose y")
     yaw = _finite_number(pose.get("yaw_rad"), "localization pose yaw_rad")
+    z = (
+        _finite_number(pose.get("z"), "localization pose z")
+        if pose.get("z") is not None
+        else None
+    )
     timestamp = _timestamp(localization.get("timestamp"), "localization timestamp")
     age_seconds = (now.astimezone(timezone.utc) - timestamp).total_seconds()
     if age_seconds < -0.1:
@@ -379,6 +386,42 @@ def _validate_status(payload: dict[str, Any], now: datetime) -> dict[str, Any]:
             axis: _finite_number(point.get(axis), f"live obstacle point {index + 1} {axis}")
             for axis in ("x", "y")
         })
+    raw_registered = payload.get("registered_obstacles")
+    if not isinstance(raw_registered, dict):
+        raw_registered = {}
+    registered_frame = raw_registered.get("frame_id")
+    registered_age_ms = raw_registered.get("age_ms")
+    valid_registered_age = (
+        isinstance(registered_age_ms, (int, float))
+        and not isinstance(registered_age_ms, bool)
+        and math.isfinite(float(registered_age_ms))
+        and 0 <= registered_age_ms <= MAX_POINTCLOUD_AGE_SECONDS * 1000
+    )
+    raw_registered_points = raw_registered.get("points", [])
+    if (
+        not isinstance(raw_registered_points, list)
+        or len(raw_registered_points) > MAX_REGISTERED_OBSTACLE_POINTS
+    ):
+        raise NavigationBridgeError("Navigation bridge registered obstacle list is invalid or oversized.")
+    registered_points = []
+    for index, point in enumerate(raw_registered_points):
+        if not isinstance(point, dict):
+            raise NavigationBridgeError(f"Registered obstacle point {index + 1} is invalid.")
+        age_ms = _finite_number(point.get("age_ms"), f"registered obstacle point {index + 1} age_ms")
+        if not 0 <= age_ms <= MAX_REGISTERED_OBSTACLE_AGE_MS:
+            raise NavigationBridgeError(f"Registered obstacle point {index + 1} age_ms is out of range.")
+        registered_points.append({
+            "x": _finite_number(point.get("x"), f"registered obstacle point {index + 1} x"),
+            "y": _finite_number(point.get("y"), f"registered obstacle point {index + 1} y"),
+            "z": _finite_number(point.get("z"), f"registered obstacle point {index + 1} z"),
+            "age_ms": round(age_ms),
+        })
+    registered_obstacle_ready = (
+        raw_registered.get("ready") is True
+        and registered_frame == frame_id
+        and valid_registered_age
+        and pointcloud_ready
+    )
     estop = payload.get("estop")
     estop_age_ms = estop.get("age_ms") if isinstance(estop, dict) else None
     valid_estop_age = (
@@ -435,7 +478,10 @@ def _validate_status(payload: dict[str, Any], now: datetime) -> dict[str, Any]:
         "localization": {
             "ready": localization_ready,
             "frame_id": frame_id,
-            "pose": {"x": x, "y": y, "yaw_rad": yaw},
+            "pose": {
+                **{"x": x, "y": y, "yaw_rad": yaw},
+                **({"z": z} if z is not None else {}),
+            },
             "timestamp": timestamp.isoformat(),
             "age_ms": max(0, round(age_seconds * 1000)),
         },
@@ -453,6 +499,18 @@ def _validate_status(payload: dict[str, Any], now: datetime) -> dict[str, Any]:
                 if isinstance(raw_live_obstacles.get("error"), str)
                 else None if obstacle_ready
                 else "Nav2 local costmap is missing, stale, or not aligned to the map frame."
+            ),
+        },
+        "registeredObstacles": {
+            "ready": registered_obstacle_ready,
+            "frame_id": registered_frame if isinstance(registered_frame, str) else None,
+            "age_ms": round(float(registered_age_ms)) if valid_registered_age else None,
+            "points": registered_points,
+            "error": (
+                raw_registered.get("error")
+                if isinstance(raw_registered.get("error"), str)
+                else None if registered_obstacle_ready
+                else "Registered LiDAR obstacle coverage is missing, stale, or not aligned to localization."
             ),
         },
         "diagnostics": diagnostics,
@@ -1021,3 +1079,44 @@ def navigation_map_snapshot(now: datetime | None = None) -> dict[str, Any]:
         }
     except NavigationBridgeError as error:
         return {"ready": False, "map": None, "data": [], "error": str(error)}
+
+
+def navigation_safety_snapshot(now: datetime | None = None) -> dict[str, Any]:
+    """Return fresh localized obstacle data without fetching the full occupancy grid."""
+    try:
+        base_url, token = _bridge_credentials()
+        current_time = now or datetime.now(timezone.utc)
+        if current_time.tzinfo is None:
+            raise ValueError("Navigation bridge validation time must include a timezone.")
+        status = _validate_status(
+            _get_json(base_url, token, "/api/v1/status"),
+            current_time,
+        )
+        if not status["ready"] or not status["localization"]["ready"]:
+            raise NavigationBridgeError("Fresh localization and navigation status are required for Safe Mode coverage.")
+        return {
+            "ready": True,
+            "localization": status["localization"],
+            "registeredObstacles": status["registeredObstacles"],
+            "liveObstacles": status["liveObstacles"],
+        }
+    except NavigationBridgeError as error:
+        return {
+            "ready": False,
+            "localization": None,
+            "registeredObstacles": {
+                "ready": False,
+                "frame_id": None,
+                "age_ms": None,
+                "points": [],
+                "error": str(error),
+            },
+            "liveObstacles": {
+                "ready": False,
+                "frame_id": None,
+                "age_ms": None,
+                "points": [],
+                "error": str(error),
+            },
+            "error": str(error),
+        }
