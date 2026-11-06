@@ -1,0 +1,81 @@
+@page {
+  size: A4 portrait;
+  margin: 8mm;
+}
+
+@media print {
+  html,
+  body {
+    width: auto !important;
+    height: auto !important;
+    overflow: visible !important;
+  }
+
+  body > * {
+    display: none !important;
+  }
+
+  body > #guest-login-cards,
+  body > #guest-login-cards * {
+    visibility: visible !important;
+  }
+
+  body > #guest-login-cards {
+    display: block !important;
+    position: static !important;
+    width: 194mm !important;
+    height: auto !important;
+    overflow: visible !important;
+    background: white !important;
+    padding: 0 !important;
+    margin: 0 !important;
+  }
+
+  body > #guest-login-cards > div {
+    width: 194mm !important;
+    max-width: none !important;
+    margin: 0 !important;
+    padding: 0 !important;
+    border-radius: 0 !important;
+    box-shadow: none !important;
+  }
+
+  body > #guest-login-cards .guest-card-toolbar {
+    display: none !important;
+  }
+
+  body > #guest-login-cards .guest-card-page {
+    display: grid !important;
+    grid-template-columns: repeat(2, 85.6mm) !important;
+    grid-template-rows: repeat(5, 54mm) !important;
+    column-gap: 8mm !important;
+    row-gap: 1.5mm !important;
+    align-content: start !important;
+    justify-content: center !important;
+    box-sizing: border-box !important;
+    width: 194mm !important;
+    height: 276mm !important;
+    margin: 0 !important;
+    padding: 0 !important;
+    break-inside: avoid !important;
+    page-break-inside: avoid !important;
+    break-after: page !important;
+    page-break-after: always !important;
+  }
+
+  body > #guest-login-cards .guest-card-page:last-child {
+    break-after: auto;
+    page-break-after: auto;
+  }
+
+  body > #guest-login-cards .guest-login-card {
+    width: 85.6mm !important;
+    height: 54mm !important;
+    box-sizing: border-box !important;
+    break-inside: avoid;
+    border: 0.35mm dashed #475569 !important;
+    border-radius: 2mm !important;
+    color: #0f172a !important;
+    background: white !important;
+  }
+}

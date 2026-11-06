@@ -1,3 +1,3 @@
 robot.stand()
 robot.wait(2)
-robot.backward(1)
+robot.backward(2)

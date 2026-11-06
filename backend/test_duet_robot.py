@@ -1483,6 +1483,8 @@ class DuetOwnershipTests(unittest.TestCase):
         self.assertFalse(status["connected"])
         self.assertEqual(status["motionOwner"], "none")
         self.assertFalse(duet_robot.controller_owns_motion()[0])
+        self.assertIn("DUET_GATEWAY_ENABLED=true", status["error"])
+        self.assertIn("DUET_CONTROL_DIR", status["error"])
 
     def test_controller_status_requires_exact_protocol_policy_and_capabilities(self):
         disconnected = {

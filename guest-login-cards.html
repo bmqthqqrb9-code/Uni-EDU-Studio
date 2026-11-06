@@ -1,0 +1,226 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>Guest Student Login Cards 001–025</title>
+    <style>
+      @page {
+        size: A4 portrait;
+        margin: 8mm;
+      }
+
+      * {
+        box-sizing: border-box;
+      }
+
+      body {
+        margin: 0;
+        color: #0f172a;
+        font-family: Arial, Helvetica, sans-serif;
+      }
+
+      .toolbar {
+        position: sticky;
+        top: 0;
+        z-index: 1;
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        gap: 1rem;
+        padding: 1rem;
+        background: #f1f5f9;
+      }
+
+      .toolbar p {
+        margin: 0.25rem 0 0;
+        color: #475569;
+        font-size: 0.875rem;
+      }
+
+      .toolbar button {
+        border: 0;
+        border-radius: 0.5rem;
+        padding: 0.75rem 1rem;
+        background: #1d4ed8;
+        color: white;
+        font: inherit;
+        font-weight: 700;
+        cursor: pointer;
+      }
+
+      #sheets {
+        padding: 1rem;
+      }
+
+      .sheet {
+        display: grid;
+        grid-template-columns: repeat(2, 85.6mm);
+        grid-template-rows: repeat(5, 54mm);
+        justify-content: center;
+        align-content: start;
+        column-gap: 8mm;
+        row-gap: 1.5mm;
+        width: 194mm;
+        height: 276mm;
+        margin: 0 auto 1rem;
+      }
+
+      .card {
+        display: flex;
+        flex-direction: column;
+        justify-content: space-between;
+        width: 85.6mm;
+        height: 54mm;
+        padding: 5mm;
+        border: 0.35mm dashed #475569;
+        border-radius: 2mm;
+        background: white;
+      }
+
+      .card-heading {
+        display: flex;
+        align-items: flex-start;
+        justify-content: space-between;
+        gap: 3mm;
+      }
+
+      .eyebrow,
+      .field-label {
+        margin: 0;
+        font-size: 8pt;
+        font-weight: 700;
+        letter-spacing: 0.12em;
+        text-transform: uppercase;
+      }
+
+      .eyebrow {
+        color: #1e40af;
+      }
+
+      .subheading,
+      .card-footer {
+        margin: 1mm 0 0;
+        color: #475569;
+        font-size: 8pt;
+      }
+
+      .badge {
+        border-radius: 10mm;
+        padding: 1.5mm 3mm;
+        background: #eff6ff;
+        color: #1e40af;
+        font-size: 8pt;
+        font-weight: 700;
+      }
+
+      .credentials {
+        display: grid;
+        grid-template-columns: 1fr 1fr;
+        gap: 3mm;
+      }
+
+      .field-label {
+        color: #64748b;
+      }
+
+      .credential {
+        margin: 1mm 0 0;
+        font-family: "Courier New", monospace;
+        font-size: 20pt;
+        font-weight: 700;
+        letter-spacing: 0.08em;
+      }
+
+      .password {
+        font-size: 16pt;
+      }
+
+      @media print {
+        .toolbar {
+          display: none;
+        }
+
+        #sheets {
+          padding: 0;
+        }
+
+        .sheet {
+          margin: 0;
+          break-inside: avoid;
+          break-after: page;
+          page-break-after: always;
+        }
+
+        .sheet:last-child {
+          break-after: auto;
+          page-break-after: auto;
+        }
+      }
+
+      @media screen {
+        body {
+          background: #e2e8f0;
+        }
+
+        .sheet {
+          padding: 2.5mm 0;
+          background: white;
+          box-shadow: 0 2px 12px #0f172a22;
+        }
+      }
+    </style>
+  </head>
+  <body>
+    <header class="toolbar">
+      <div>
+        <strong>Guest student login cards</strong>
+        <p>25 reusable accounts · shared password: 12345678 · print on A4 portrait</p>
+      </div>
+      <button type="button" onclick="window.print()">Print cards</button>
+    </header>
+    <main id="sheets" aria-label="Printable guest login cards"></main>
+    <script>
+      const password = '12345678';
+      const sheetContainer = document.getElementById('sheets');
+
+      for (let sheetNumber = 0; sheetNumber < 3; sheetNumber += 1) {
+        const sheet = document.createElement('section');
+        sheet.className = 'sheet';
+        sheet.setAttribute('aria-label', `Page ${sheetNumber + 1}`);
+
+        for (let offset = 0; offset < 10; offset += 1) {
+          const accountNumber = sheetNumber * 10 + offset + 1;
+          if (accountNumber > 25) break;
+
+          const username = String(accountNumber).padStart(3, '0');
+          const card = document.createElement('article');
+          card.className = 'card';
+          card.innerHTML = `
+            <div class="card-heading">
+              <div>
+                <p class="eyebrow">Student login</p>
+                <p class="subheading">Reusable classroom account</p>
+              </div>
+              <span class="badge">GUEST</span>
+            </div>
+            <div class="credentials">
+              <div>
+                <p class="field-label">Username</p>
+                <p class="credential">${username}</p>
+              </div>
+              <div>
+                <p class="field-label">Password</p>
+                <p class="credential password">${password}</p>
+              </div>
+            </div>
+            <p class="card-footer">Keep this card for future classroom use.</p>
+          `;
+          sheet.appendChild(card);
+        }
+
+        sheetContainer.appendChild(sheet);
+      }
+    </script>
+  </body>
+</html>

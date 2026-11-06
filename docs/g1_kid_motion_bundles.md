@@ -6,6 +6,17 @@ the robot, submits a classroom queue item, or starts motion. Inspect the selecte
 controller version and program. Students still submit for teacher approval, and a
 teacher must explicitly choose to run an approved program.
 
+Signed-in users can save a named project from the editor's **Project** menu.
+Projects include the current project/environment state; student saves are private
+until explicitly named for sharing, then remain pending until a teacher approves
+them. Teachers can save named projects and controller-specific starter motions.
+Starter motions contain only the sequence, and teachers can edit, duplicate, rename,
+or delete shared entries. Legacy and DUET motions remain separate and are expanded
+only when their matching controller is used. In the IDE, use the categorized
+command reference to search and expand a shared motion's sequence without inserting
+it into the program. Blockly users can add a shared-motion command and preview its
+sequence in the library.
+
 The ready-to-share ZIP deliverables are:
 
 - `deliverables/legacy-g1-edu-motion-activities.zip`

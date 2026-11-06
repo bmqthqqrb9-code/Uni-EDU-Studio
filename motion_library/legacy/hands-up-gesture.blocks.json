@@ -5,11 +5,22 @@
   "title": "Hands Up Gesture",
   "blocks": [
     {
-      "type": "g1_command_hold_arm",
-      "method": "hold_arm",
+      "type": "g1_command_stand",
+      "method": "stand",
+      "inputs": []
+    },
+    {
+      "type": "g1_command_wait",
+      "method": "wait",
       "inputs": [
-        "\"hands up\"",
         "2"
+      ]
+    },
+    {
+      "type": "g1_command_arm_action_hands_up",
+      "method": "arm_action",
+      "inputs": [
+        "\"hands up\""
       ]
     }
   ]

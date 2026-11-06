@@ -1,0 +1,28 @@
+{
+  "format": "uni-edu-studio-block-example-v1",
+  "controller_version": "legacy",
+  "name": "sidestep-right",
+  "title": "Sidestep Right",
+  "blocks": [
+    {
+      "type": "g1_command_stand",
+      "method": "stand",
+      "inputs": []
+    },
+    {
+      "type": "g1_command_wait",
+      "method": "wait",
+      "inputs": [
+        "2"
+      ]
+    },
+    {
+      "type": "g1_command_sidestep",
+      "method": "sidestep",
+      "inputs": [
+        "\"right\"",
+        "2"
+      ]
+    }
+  ]
+}

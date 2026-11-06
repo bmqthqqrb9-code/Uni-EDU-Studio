@@ -34,6 +34,7 @@ test('DUET command catalog contains no legacy robot commands', () => {
     'hold_pose_until_reset',
     'reset_arms',
     'saved_motion',
+    'shared_motion',
     'reach_and_return',
     'receive_and_hold',
     'hold_and_return',
@@ -94,6 +95,7 @@ test('DUET command catalog contains no legacy robot commands', () => {
   assert.equal(getDuetBlocklyCommandBlocks().find(({ type }) => type === 'duet_command_arm_carry').category, 'Arm poses');
   assert.equal(getDuetBlocklyCommandBlocks().find(({ type }) => type === 'duet_command_wave_left_mid').category, 'Arm gestures');
   assert.equal(getDuetBlocklyCommandBlocks().find(({ type }) => type === 'duet_command_gesture_kiss_both').category, 'Arm gestures');
+  assert.equal(getDuetBlocklyCommandBlocks().find(({ type }) => type === 'duet_command_shared_motion').category, 'Shared motions');
   assert.ok(getDuetBlocklyCommandBlocks().some(({ type, output }) => (
     type === 'duet_pose_target_both_overhead' && output === 'String'
   )));
@@ -127,11 +129,25 @@ test('named DUET motions compile as one validated call and populate the toolbox'
     getDuetCommandExamples(savedMotions).find(({ key }) => key === 'saved_motion_class_wave_1234abcd'),
     {
       key: 'saved_motion_class_wave_1234abcd',
+      category: 'Saved motions',
       label: 'Saved motion: Class wave',
       code: 'duet.saved_motion("class_wave_1234abcd")',
     },
   );
   assert.throws(() => parseDuetProgram('duet.saved_motion("__import__")'), /ID.*invalid/);
+
+  const sharedMotions = [{ id: 'sm_0123456789abcdef', name: 'Ready walk' }];
+  const sharedCall = parseDuetProgram('duet.shared_motion("sm_0123456789abcdef")')[0];
+  assert.equal(sharedCall.method, 'shared_motion');
+  assert.equal(sharedCall.values[0], sharedMotions[0].id);
+  const sharedBlock = getDuetBlocklyCommandBlocks([], sharedMotions)
+    .find(({ type }) => type === 'duet_command_shared_motion');
+  assert.deepEqual(sharedBlock.args0[0].options, [['Ready walk', sharedMotions[0].id]]);
+  assert.ok(getDuetCommandExamples([], sharedMotions).some((example) => (
+    example.key === 'shared_motion_sm_0123456789abcdef'
+    && example.category === 'Shared motions'
+    && example.code === 'duet.shared_motion("sm_0123456789abcdef")'
+  )));
 });
 
 test('DUET preset commands have one bounded duration and parse as DUET-only syntax', () => {

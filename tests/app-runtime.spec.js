@@ -2,6 +2,10 @@ import { test, expect } from '@playwright/test';
 import { getG1BlocklyCommandBlocks, parseG1Program } from '../src/sim/g1Commands.js';
 import { getDuetBlocklyCommandBlocks, parseDuetProgram } from '../src/sim/duetCommands.js';
 
+async function openConnectionPanel(page) {
+  await page.getByRole('button', { name: 'Open robot connection' }).click();
+}
+
 test('legacy and DUET expose the same approximate in-place 180-degree turn name', () => {
   const legacy = parseG1Program('robot.turn_around_180()');
   const duet = parseDuetProgram('duet.turn_around_180()');
@@ -10,6 +14,178 @@ test('legacy and DUET expose the same approximate in-place 180-degree turn name'
   expect(duet[0].code).toBe('duet.turn_around_180()');
   expect(getG1BlocklyCommandBlocks().some((block) => block.type === 'g1_command_turn_around_180')).toBe(true);
   expect(getDuetBlocklyCommandBlocks().some((block) => block.type === 'duet_command_turn_around_180')).toBe(true);
+});
+
+test('teacher robot connection opens from the top bar beside Settings', async ({ page }) => {
+  await page.route('**/api/**', async (route) => {
+    const path = new URL(route.request().url()).pathname;
+    await route.fulfill({
+      status: 200,
+      contentType: 'application/json',
+      body: JSON.stringify(path === '/api/classroom/login'
+        ? {
+          token: 'teacher-connection-panel-token',
+          user: { role: 'teacher', username: 'teacher-connection-panel-test' },
+        }
+        : {}),
+    });
+  });
+  await page.goto('/');
+  await page.getByRole('button', { name: 'Log In' }).click();
+  await expect(page.getByRole('button', { name: 'Open robot connection' })).toBeVisible();
+  await expect(page.getByRole('button', { name: 'Open app settings' })).toBeVisible();
+  const toolbarOrder = await page.getByRole('button', { name: 'Open robot connection' }).evaluate((button) => (
+    Array.from(button.parentElement.children, (item) => item.textContent.trim())
+  ));
+  expect(toolbarOrder).toEqual(['Connection', 'Objects', 'Project', 'Settings', 'Configure', 'Logout']);
+  await openConnectionPanel(page);
+
+  await expect(page.getByRole('dialog', { name: 'Robot connection panel' })).toBeVisible();
+  await expect(page.getByTestId('teacher-robot-settings')).toBeVisible();
+  await expect(page.getByRole('heading', { name: 'Teacher Queue' })).toHaveCount(0);
+  await expect(page.getByRole('heading', { name: /Internal Simulator/ })).toHaveCount(0);
+});
+
+test('simulation preview controls are in app Settings, not the G1 simulator', async ({ page }) => {
+  await page.route('**/api/**', async (route) => {
+    const path = new URL(route.request().url()).pathname;
+    await route.fulfill({
+      status: 200,
+      contentType: 'application/json',
+      body: JSON.stringify(path === '/api/classroom/login'
+        ? {
+          token: 'teacher-preview-settings-token',
+          user: { role: 'teacher', username: 'teacher-preview-settings-test' },
+        }
+        : {}),
+    });
+  });
+
+  await page.goto('/');
+  await page.getByRole('button', { name: 'Log In' }).click();
+  await page.getByRole('button', { name: 'Open app settings' }).click();
+
+  const previewSettings = page.getByRole('group', { name: 'Simulation preview' });
+  await expect(previewSettings.getByRole('button', { name: 'Kid preview' })).toHaveAttribute('aria-pressed', 'true');
+  await previewSettings.getByRole('button', { name: 'Advanced physics' }).click();
+  await expect(previewSettings.getByRole('button', { name: 'Advanced physics' })).toHaveAttribute('aria-pressed', 'true');
+  await expect(previewSettings.getByText('20 m x 20 m')).toBeVisible();
+  await expect(previewSettings.getByText('1.0x')).toBeVisible();
+  await expect(previewSettings.getByText('Speed changes timing only. Distances remain in meters.')).toBeVisible();
+  await page.getByRole('button', { name: 'Close', exact: true }).click();
+
+  await page.getByRole('button', { name: 'Open queue' }).click();
+  await expect(page.getByRole('heading', { name: /Internal Simulator/ })).toHaveCount(0);
+  await expect(page.getByRole('button', { name: 'Open simulator settings panel' })).toHaveCount(0);
+  await expect(page.getByRole('button', { name: 'Kid preview' })).toHaveCount(0);
+  await expect(page.getByRole('slider', { name: 'Simulation grid size' })).toHaveCount(0);
+  await expect(page.getByRole('slider', { name: 'Simulation speed' })).toHaveCount(0);
+  await page.getByRole('button', { name: 'Close queue' }).click();
+
+  await page.getByRole('button', { name: 'Open objects area' }).click();
+  const objectArea = page.getByRole('dialog', { name: 'Objects area' });
+  await expect(objectArea).toBeVisible();
+  await expect(objectArea.getByRole('button', { name: 'Box' })).toBeVisible();
+  await objectArea.getByRole('button', { name: 'Box' }).click();
+  await objectArea.getByRole('button', { name: 'Scene Objects' }).click();
+  await expect(objectArea.getByText('Box', { exact: true })).toBeVisible();
+  await expect(objectArea.getByRole('button', { name: 'Delete' })).toBeVisible();
+  await expect(objectArea.getByRole('heading', { name: /Internal Simulator/ })).toHaveCount(0);
+});
+
+test('only teachers can hide the simulation from Settings', async ({ page }) => {
+  const visibilityUpdates = [];
+  let showSimulation = true;
+  await page.addInitScript(() => {
+    localStorage.setItem('edu-classroom-session', JSON.stringify({
+      token: 'teacher-simulation-visibility-token',
+      user: { role: 'teacher', username: 'teacher-simulation-visibility-test' },
+    }));
+  });
+  await page.route('**/api/**', async (route) => {
+    const request = route.request();
+    const path = new URL(request.url()).pathname;
+    if (path === '/api/classroom/simulation-visibility') {
+      if (request.method() === 'PUT') {
+        showSimulation = request.postDataJSON().show_simulation;
+        visibilityUpdates.push(showSimulation);
+      }
+      await route.fulfill({
+        status: 200,
+        contentType: 'application/json',
+        body: JSON.stringify({ show_simulation: showSimulation }),
+      });
+      return;
+    }
+    await route.fulfill({
+      status: 200,
+      contentType: 'application/json',
+      body: JSON.stringify(path === '/api/classroom/login'
+        ? { token: 'teacher-simulation-visibility-token', user: { role: 'teacher', username: 'teacher-simulation-visibility-test' } }
+        : {}),
+    });
+  });
+
+  await page.goto('/');
+  await expect(page.locator('canvas')).toBeVisible();
+  await expect(page.getByRole('button', { name: 'Hide simulation' })).toHaveCount(0);
+  await page.getByRole('button', { name: 'Open app settings' }).click();
+  const visibilityToggle = page.getByRole('checkbox', { name: 'Show 3D simulation in the workspace' });
+  await expect(visibilityToggle).toBeChecked();
+  await expect(visibilityToggle).toBeEnabled();
+  await visibilityToggle.uncheck();
+  await expect.poll(() => visibilityUpdates).toEqual([false]);
+  await expect(page.getByTestId('simulation-view')).toHaveCount(0);
+  const workspacePanel = page.getByTestId('workspace-panel');
+  const expandedWorkspace = await workspacePanel.evaluate((panel) => ({
+    position: getComputedStyle(panel).position,
+    width: panel.getBoundingClientRect().width,
+    height: panel.getBoundingClientRect().height,
+    sceneWidth: panel.parentElement.getBoundingClientRect().width,
+    sceneHeight: panel.parentElement.getBoundingClientRect().height,
+  }));
+  expect(expandedWorkspace.position).toBe('relative');
+  expect(expandedWorkspace.width).toBeCloseTo(expandedWorkspace.sceneWidth);
+  expect(expandedWorkspace.height).toBeCloseTo(expandedWorkspace.sceneHeight);
+  await visibilityToggle.check();
+  await expect.poll(() => visibilityUpdates).toEqual([false, true]);
+  await expect(page.getByTestId('simulation-view')).toBeVisible();
+});
+
+test('student accounts follow the teacher saved simulation visibility', async ({ page }) => {
+  await page.addInitScript(() => {
+    localStorage.setItem('edu-classroom-session', JSON.stringify({
+      token: 'student-simulation-visibility-token',
+      user: { role: 'student', username: 'student-simulation-visibility-test' },
+    }));
+  });
+  let visibilityRead = false;
+  let showSimulation = true;
+  await page.route('**/api/**', async (route) => {
+    const path = new URL(route.request().url()).pathname;
+    if (path === '/api/classroom/simulation-visibility') {
+      visibilityRead = true;
+      await route.fulfill({
+        status: 200,
+        contentType: 'application/json',
+        body: JSON.stringify({ show_simulation: showSimulation }),
+      });
+      return;
+    }
+    await route.fulfill({
+      status: 200,
+      contentType: 'application/json',
+      body: JSON.stringify({}),
+    });
+  });
+
+  await page.goto('/');
+  await expect(page.getByTestId('simulation-view')).toBeVisible();
+  expect(visibilityRead).toBe(true);
+  showSimulation = false;
+  await expect(page.getByTestId('simulation-view')).toHaveCount(0, { timeout: 10000 });
+  await page.getByRole('button', { name: 'Open app settings' }).click();
+  await expect(page.getByRole('checkbox', { name: 'Show 3D simulation in the workspace' })).toHaveCount(0);
 });
 
 test('App loads without runtime initialization errors', async ({ page }) => {
@@ -88,6 +264,7 @@ test('starter motion library is visible to students and loading an example does 
         contentType: 'application/json',
         body: JSON.stringify({
           codes: [],
+          shared_motions: [],
           starter_codes: [{
             name: 'walk-forward',
             title: 'Walk Forward',
@@ -116,7 +293,173 @@ test('starter motion library is visible to students and loading an example does 
   await expect(page.getByText('Starter motion library')).toBeVisible();
   await expect(page.getByText('walk-forward', { exact: true })).toBeVisible();
   await page.getByRole('button', { name: 'Load into editor' }).click();
+  await expect(page.getByRole('heading', { name: 'Library', exact: true })).toHaveCount(0);
   expect(loadRequests).toEqual([]);
+});
+
+test('shared motion preview loads the sequence and closes Library without running it', async ({ page }) => {
+  const loadRequests = [];
+  const sequence = 'robot.stand()\nrobot.walk(1)';
+  await page.addInitScript(() => {
+    localStorage.setItem('edu-classroom-session', JSON.stringify({
+      token: 'shared-motion-student-token',
+      user: { role: 'student', username: 'motion_student' },
+    }));
+  });
+  await page.route('**/api/**', async (route) => {
+    const request = route.request();
+    const path = new URL(request.url()).pathname;
+    if (['/api/run', '/api/duet/run', '/api/classroom/submit-code'].includes(path)) {
+      loadRequests.push(path);
+    }
+    await route.fulfill({
+      status: 200,
+      contentType: 'application/json',
+      body: JSON.stringify(path === '/api/classroom/codes'
+        ? {
+          codes: [],
+          starter_codes: [],
+          shared_motions: [{
+            id: 'sm_0123456789abcdef',
+            name: 'Ready walk',
+            controller_version: 'legacy',
+            code: sequence,
+          }],
+        }
+        : {}),
+    });
+  });
+
+  await page.goto('/');
+  await page.getByRole('button', { name: 'Library', exact: true }).click();
+  await page.getByText('Preview sequence').click();
+  await expect(page.getByText(sequence)).toBeVisible();
+  await page.getByRole('button', { name: 'Load sequence' }).click();
+  await expect(page.getByRole('heading', { name: 'Library', exact: true })).toHaveCount(0);
+  await page.getByRole('button', { name: 'IDE', exact: true }).click();
+  const ide = page.locator('textarea:visible').first();
+  await expect(ide).toHaveValue(sequence);
+  expect(loadRequests).toEqual([]);
+});
+
+test('student can name a project save and is told that teacher approval is required', async ({ page }) => {
+  const namedSaves = [];
+  await page.addInitScript(() => {
+    localStorage.setItem('edu-classroom-session', JSON.stringify({
+      token: 'named-project-student-token',
+      user: { role: 'student', username: 'student1' },
+    }));
+  });
+  await page.route('**/api/**', async (route) => {
+    const request = route.request();
+    const path = new URL(request.url()).pathname;
+    if (path === '/api/classroom/project/save-named' && request.method() === 'POST') {
+      namedSaves.push(request.postDataJSON());
+      await route.fulfill({
+        status: 200,
+        contentType: 'application/json',
+        body: JSON.stringify({
+          status: 'pending',
+          project: {
+            id: 21,
+            username: 'student1',
+            name: 'Named route',
+            status: 'pending',
+            sceneObjects: [{ id: 'box-1' }],
+            plannerWaypoints: [],
+            generatedCode: 'robot.walk(1)',
+            duetCode: '',
+          },
+        }),
+      });
+      return;
+    }
+    await route.fulfill({
+      status: 200,
+      contentType: 'application/json',
+      body: JSON.stringify(path === '/api/classroom/codes'
+        ? { codes: [], starter_codes: [], shared_motions: [] }
+        : path === '/api/classroom/projects'
+          ? { projects: [] }
+          : path === '/api/classroom/project'
+            ? { project: { name: 'default', sceneObjects: [], plannerWaypoints: [], generatedCode: '' } }
+            : {}),
+    });
+  });
+
+  await page.goto('/');
+  const alertMessages = [];
+  page.once('dialog', async (dialog) => {
+    await dialog.accept('Named route');
+    page.once('dialog', async (alertDialog) => {
+      alertMessages.push(alertDialog.message());
+      await alertDialog.accept();
+    });
+  });
+  await page.getByRole('button', { name: 'Open project actions' }).click();
+  await page.getByRole('button', { name: 'Save as Project', exact: true }).click();
+  await expect.poll(() => namedSaves.length).toBe(1);
+  expect(namedSaves[0].name).toBe('Named route');
+  expect(namedSaves[0].sceneObjects).toEqual([]);
+  await expect.poll(() => alertMessages.length).toBe(1);
+  expect(alertMessages[0]).toContain('for teacher approval');
+});
+
+test('teacher Save as Starter Motion stores only the named controller sequence', async ({ page }) => {
+  const motionSaves = [];
+  const sequence = 'robot.stand()\nrobot.walk(1)';
+  await page.addInitScript(() => {
+    localStorage.setItem('edu-classroom-session', JSON.stringify({
+      token: 'starter-motion-teacher-token',
+      user: { role: 'teacher', username: 'teacher' },
+    }));
+  });
+  await page.route('**/api/**', async (route) => {
+    const request = route.request();
+    const path = new URL(request.url()).pathname;
+    if (path === '/api/classroom/starter-motions' && request.method() === 'POST') {
+      const payload = request.postDataJSON();
+      motionSaves.push(payload);
+      await route.fulfill({
+        status: 200,
+        contentType: 'application/json',
+        body: JSON.stringify({
+          status: 'saved',
+          motion: {
+            id: 'sm_0123456789abcdef',
+            name: payload.name,
+            controller_version: payload.controller_version,
+            code: payload.code,
+          },
+        }),
+      });
+      return;
+    }
+    await route.fulfill({
+      status: 200,
+      contentType: 'application/json',
+      body: JSON.stringify(path === '/api/classroom/codes'
+        ? { codes: [], starter_codes: [], shared_motions: [] }
+        : path === '/api/classroom/projects'
+          ? { projects: [] }
+          : path === '/api/classroom/project'
+            ? { project: { name: 'default', sceneObjects: [], plannerWaypoints: [], generatedCode: '' } }
+            : {}),
+    });
+  });
+
+  await page.goto('/');
+  await page.getByRole('button', { name: 'IDE', exact: true }).click();
+  await page.locator('textarea:visible').first().fill(sequence);
+  page.once('dialog', (dialog) => dialog.accept('Ready walk'));
+  await page.getByRole('button', { name: 'Open project actions' }).click();
+  await page.getByRole('button', { name: 'Save as Starter Motion', exact: true }).click();
+  await expect.poll(() => motionSaves.length).toBe(1);
+  expect(motionSaves[0]).toEqual({
+    name: 'Ready walk',
+    code: sequence,
+    controller_version: 'legacy',
+  });
 });
 
 test('teacher can create and delete student accounts from the classroom panel', async ({ page }) => {
@@ -163,7 +506,7 @@ test('teacher can create and delete student accounts from the classroom panel', 
 
   await page.goto('/');
   await expect(page.locator('canvas')).toBeVisible();
-  await page.getByRole('button', { name: 'Open queue' }).click();
+  await page.getByRole('button', { name: 'Open app settings' }).click();
   await expect(page.getByText('Manage classroom accounts')).toBeVisible();
   await expect(page.getByRole('button', { name: 'Delete account teacher' })).toHaveCount(0);
 
@@ -183,6 +526,263 @@ test('teacher can create and delete student accounts from the classroom panel', 
   page.once('dialog', (dialog) => dialog.accept());
   await page.getByRole('button', { name: 'Delete account classroom_24' }).click();
   await expect(page.getByRole('button', { name: 'Delete account classroom_24' })).toHaveCount(0);
+});
+
+test('teacher can create a class, print its cards, and clear only its data', async ({ page }) => {
+  test.setTimeout(60000);
+  await page.addInitScript(() => {
+    localStorage.setItem('edu-classroom-session', JSON.stringify({
+      token: 'teacher-guest-account-test-token',
+      user: { role: 'teacher', username: 'teacher' },
+    }));
+  });
+  let users = [{ username: 'teacher', role: 'teacher' }];
+  let groups = [];
+  await page.route('**/api/**', async (route) => {
+    const request = route.request();
+    const url = new URL(request.url());
+    const method = request.method();
+    let response = { status: 200, body: {} };
+
+    if (url.pathname === '/api/classroom/me') response.body = { data_revision: 0 };
+    else if (url.pathname === '/api/classroom/codes') response.body = { codes: [] };
+    else if (url.pathname === '/api/classroom/queue') response.body = { items: [] };
+    else if (url.pathname === '/api/classroom/users' && method === 'GET') response.body = { users };
+    else if (url.pathname === '/api/classroom/groups' && method === 'GET') response.body = { groups };
+    else if (url.pathname === '/api/classroom/groups' && method === 'POST') {
+      const requestBody = request.postDataJSON();
+      const accounts = Array.from({ length: requestBody.size }, (_, index) => ({
+        username: `1${String(index + 1).padStart(2, '0')}`,
+        account_number: index + 1,
+        password: String(10203040 + index),
+      }));
+      groups = [{ group_number: 1, name: requestBody.name || 'Class 1', accounts }];
+      users = [...users, ...accounts.map(({ username }) => ({ username, role: 'student' }))];
+      response.body = { status: 'created', group: groups[0] };
+    } else if (url.pathname === '/api/classroom/groups/1/clear-data' && method === 'POST') {
+      response.body = { status: 'cleared', group_number: 1, accounts: 25, total_deleted: 25 };
+    } else if (url.pathname === '/api/classroom/status') response.body = { status: 'idle' };
+    else if (url.pathname === '/api/classroom/projects/all') response.body = { projects: [] };
+    else if (url.pathname === '/api/classroom/project') {
+      response.body = { project: { name: 'default', sceneObjects: [], plannerWaypoints: [], generatedCode: '' } };
+    } else if (url.pathname === '/api/robot/status') {
+      response.body = { sdkAvailable: false, running: false };
+    }
+    await route.fulfill({
+      status: response.status,
+      contentType: 'application/json',
+      body: JSON.stringify(response.body),
+    });
+  });
+
+  await page.goto('/');
+  await expect(page.locator('canvas')).toBeVisible();
+  await page.getByRole('button', { name: 'Open app settings' }).click();
+  await page.getByLabel(/Class name/).fill('Room A');
+  await page.getByLabel('Number of students').fill('25');
+  await page.getByRole('button', { name: 'Create class' }).click();
+  await expect(page.locator('p[role="status"]').filter({ hasText: 'Room A created with 25' })).toBeVisible();
+  await expect(page.getByText('Class 1 · 25 students · usernames 101–125')).toBeVisible();
+  await expect(page.getByText('Password: 10203040').first()).toBeVisible();
+
+  await page.getByRole('button', { name: 'Print login cards' }).click();
+  const cardsDialog = page.getByRole('dialog', { name: 'Guest account login cards' });
+  await expect(cardsDialog.locator('.guest-login-card')).toHaveCount(25);
+  await expect(cardsDialog.getByText('10203040').first()).toBeVisible();
+  const downloadPromise = page.waitForEvent('download');
+  await cardsDialog.getByRole('button', { name: 'Download PDF' }).click();
+  const pdfDownload = await downloadPromise;
+  expect(pdfDownload.suggestedFilename()).toBe('class-1-login-cards.pdf');
+  const pdfStream = await pdfDownload.createReadStream();
+  const pdfChunks = [];
+  for await (const chunk of pdfStream) pdfChunks.push(chunk);
+  const pdf = Buffer.concat(pdfChunks).toString('latin1');
+  expect(pdf.startsWith('%PDF-1.4')).toBe(true);
+  expect(pdf).toContain('/Count 3');
+  expect(pdf).toContain('(101) Tj');
+  expect(pdf).toContain('(10203040) Tj');
+
+  await page.emulateMedia({ media: 'print' });
+  const printLayout = await cardsDialog.evaluate((dialog) => {
+    const sheet = dialog.querySelector('.guest-card-page');
+    const wrapper = dialog.querySelector(':scope > div');
+    const sheetBounds = sheet.getBoundingClientRect();
+    const cards = [...dialog.querySelectorAll('.guest-login-card')];
+    return {
+      portalIsDirectBodyChild: dialog.parentElement === document.body,
+      dialogPosition: getComputedStyle(dialog).position,
+      dialogOverflow: getComputedStyle(dialog).overflowY,
+      sheetWidth: sheetBounds.width,
+      sheetHeight: sheetBounds.height,
+      wrapperPadding: getComputedStyle(wrapper).padding,
+      breakAfter: getComputedStyle(sheet).breakAfter,
+      cardsPerSheet: [...dialog.querySelectorAll('.guest-card-page')].map(
+        (pageSheet) => pageSheet.querySelectorAll('.guest-login-card').length,
+      ),
+      firstCardHeight: cards[0].getBoundingClientRect().height,
+    };
+  });
+  expect(printLayout.portalIsDirectBodyChild).toBe(true);
+  expect(printLayout.dialogPosition).toBe('static');
+  expect(printLayout.dialogOverflow).toBe('visible');
+  expect(printLayout.sheetWidth).toBeGreaterThan(730);
+  expect(printLayout.sheetHeight).toBeGreaterThan(1040);
+  expect(printLayout.wrapperPadding).toBe('0px');
+  expect(printLayout.breakAfter).toBe('page');
+  expect(printLayout.cardsPerSheet).toEqual([10, 10, 5]);
+  expect(printLayout.firstCardHeight).toBeGreaterThan(200);
+  const printPdf = await page.pdf({ format: 'A4', printBackground: true });
+  expect(printPdf.toString('latin1')).toContain('/Count 3');
+  await page.emulateMedia({ media: 'screen' });
+  await cardsDialog.getByRole('button', { name: 'Close guest login cards' }).click();
+
+  page.once('dialog', (dialog) => dialog.accept());
+  await page.getByRole('button', { name: 'Clear class data' }).click();
+  await expect(page.locator('p[role="status"]').filter({ hasText: 'Cleared 25 saved records from Room A' })).toBeVisible();
+  await expect(page.getByText('Class 1 · 25 students · usernames 101–125')).toBeVisible();
+});
+
+test('existing student classes persist and their cards can be reopened', async ({ page }) => {
+  await page.addInitScript(() => {
+    localStorage.setItem('edu-classroom-session', JSON.stringify({
+      token: 'teacher-persistent-guests-token',
+      user: { role: 'teacher', username: 'teacher' },
+    }));
+  });
+  const accounts = Array.from({ length: 25 }, (_, index) => ({
+    username: `1${String(index + 1).padStart(2, '0')}`,
+    account_number: index + 1,
+    password: String(10203040 + index),
+  }));
+  const users = [{ username: 'teacher', role: 'teacher' }, ...accounts.map(({ username }) => ({
+    username,
+    role: 'student',
+  }))];
+  await page.route('**/api/**', async (route) => {
+    const request = route.request();
+    const url = new URL(request.url());
+    const method = request.method();
+    let body = {};
+    if (url.pathname === '/api/classroom/me') body = { data_revision: 0 };
+    else if (url.pathname === '/api/classroom/codes') body = { codes: [] };
+    else if (url.pathname === '/api/classroom/queue') body = { items: [] };
+    else if (url.pathname === '/api/classroom/users' && method === 'GET') body = { users };
+    else if (url.pathname === '/api/classroom/groups' && method === 'GET') {
+      body = { groups: [{ group_number: 1, name: 'Room A', accounts }] };
+    } else if (url.pathname === '/api/classroom/status') body = { status: 'idle' };
+    else if (url.pathname === '/api/classroom/projects/all') body = { projects: [] };
+    else if (url.pathname === '/api/classroom/project') {
+      body = { project: { name: 'default', sceneObjects: [], plannerWaypoints: [], generatedCode: '' } };
+    } else if (url.pathname === '/api/robot/status') {
+      body = { sdkAvailable: false, running: false };
+    }
+    await route.fulfill({
+      status: 200,
+      contentType: 'application/json',
+      body: JSON.stringify(body),
+    });
+  });
+
+  await page.goto('/');
+  await expect(page.locator('canvas')).toBeVisible();
+  await page.getByRole('button', { name: 'Open app settings' }).click();
+  await expect(page.getByText('Room A', { exact: true })).toBeVisible();
+  await expect(page.getByRole('button', { name: 'Create class' })).toBeEnabled();
+  await page.getByRole('button', { name: 'Print login cards' }).click();
+  await expect(page.getByRole('dialog', { name: 'Guest account login cards' }).locator('.guest-login-card')).toHaveCount(25);
+  await expect(page.getByText('101–125')).toBeVisible();
+});
+
+test('guest data revision clears a cached workspace after a teacher reset', async ({ page }) => {
+  await page.addInitScript(() => {
+    localStorage.setItem('edu-classroom-session', JSON.stringify({
+      token: 'guest-reset-revision-token',
+      user: { role: 'student', username: '101' },
+    }));
+    localStorage.setItem('edu-classroom-data-revision:101', '0');
+    localStorage.setItem('edu-scene-objects:101', JSON.stringify([{ id: 'old-guest-object' }]));
+    localStorage.setItem('uni-edu-duet-arm-motions:101', '[]');
+  });
+  await page.route('**/api/**', async (route) => {
+    const url = new URL(route.request().url());
+    let body = {};
+    if (url.pathname === '/api/classroom/me') body = { data_revision: 1 };
+    else if (url.pathname === '/api/classroom/codes') body = { codes: [] };
+    else if (url.pathname === '/api/classroom/status') body = { status: 'idle' };
+    else if (url.pathname === '/api/classroom/projects') body = { projects: [] };
+    else if (url.pathname === '/api/classroom/project') body = { project: null };
+    await route.fulfill({
+      status: 200,
+      contentType: 'application/json',
+      body: JSON.stringify(body),
+    });
+  });
+
+  await page.goto('/');
+  await expect(page.locator('canvas')).toBeVisible();
+  await expect.poll(() => page.evaluate(() => {
+    const saved = localStorage.getItem('edu-scene-objects:101');
+    return saved ? JSON.parse(saved).length : null;
+  })).toBe(0);
+  await expect.poll(() => page.evaluate(
+    () => localStorage.getItem('edu-classroom-data-revision:101'),
+  )).toBe('1');
+  await expect.poll(() => page.evaluate(
+    () => localStorage.getItem('uni-edu-duet-arm-motions:101'),
+  )).toBeNull();
+});
+
+test('teacher can hide Blocks and IDE tabs and restore them from settings', async ({ page }) => {
+  let lockedPanels = [];
+  await page.addInitScript(() => {
+    localStorage.setItem('edu-classroom-session', JSON.stringify({
+      token: 'teacher-core-tabs-token',
+      user: { role: 'teacher', username: 'teacher-core-tabs-test' },
+    }));
+  });
+  await page.route('**/api/**', async (route) => {
+    const url = new URL(route.request().url());
+    if (url.pathname === '/api/classroom/sidebar-settings') {
+      if (route.request().method() === 'PUT') {
+        lockedPanels = route.request().postDataJSON().locked_panels;
+      }
+      await route.fulfill({
+        status: 200,
+        contentType: 'application/json',
+        body: JSON.stringify({ locked_panels: lockedPanels, configured: true }),
+      });
+      return;
+    }
+    await route.fulfill({
+      status: 200,
+      contentType: 'application/json',
+      body: JSON.stringify({}),
+    });
+  });
+
+  await page.goto('/');
+  await expect(page.locator('canvas')).toBeVisible();
+  await page.getByRole('button', { name: 'Open app settings' }).click();
+  const blocksToggle = page.getByRole('checkbox', { name: 'Hide Blocks tab from sidebar' });
+  const ideToggle = page.getByRole('checkbox', { name: 'Hide IDE tab from sidebar' });
+  await expect(blocksToggle).toBeVisible();
+  await expect(ideToggle).toBeVisible();
+  await blocksToggle.check();
+  await expect(page.getByRole('button', { name: 'Blocks', exact: true })).toHaveCount(0);
+  await expect(page.getByRole('button', { name: 'IDE', exact: true })).toBeVisible();
+  await ideToggle.check();
+  await expect(page.getByRole('button', { name: 'Blocks', exact: true })).toHaveCount(0);
+  await expect(page.getByRole('button', { name: 'IDE', exact: true })).toHaveCount(0);
+  await expect(page.getByRole('button', { name: 'Path Planner', exact: true })).toBeVisible();
+  await expect.poll(() => lockedPanels).toEqual(['blocks', 'ide']);
+
+  await ideToggle.uncheck();
+  await expect(page.getByRole('button', { name: 'IDE', exact: true })).toBeVisible();
+  await expect(page.getByRole('button', { name: 'Blocks', exact: true })).toHaveCount(0);
+  await blocksToggle.uncheck();
+  await expect(page.getByRole('button', { name: 'Blocks', exact: true })).toBeVisible();
+  await expect(page.getByRole('button', { name: 'IDE', exact: true })).toBeVisible();
+  await expect.poll(() => lockedPanels).toEqual([]);
 });
 
 test('teacher can hide locked sidebar panels and restore them from settings', async ({ page }) => {
@@ -274,6 +874,8 @@ test('teacher can hide locked sidebar panels and restore them from settings', as
   await expect(page.getByRole('button', { name: 'Path Planner', exact: true })).toHaveCount(0);
   await expect(page.getByRole('button', { name: 'Vision to Motion', exact: true })).toHaveCount(0);
   await expect(page.getByRole('button', { name: 'Prompt to Motion', exact: true })).toBeVisible();
+  await expect(page.getByRole('button', { name: 'Blocks', exact: true })).toBeVisible();
+  await expect(page.getByRole('button', { name: 'IDE', exact: true })).toBeVisible();
   await page.getByRole('button', { name: 'Open app settings' }).click();
   await expect(page.getByRole('checkbox', { name: 'Enable Safe Mode spatial guards' })).toBeChecked();
 });
@@ -476,7 +1078,8 @@ test('student can open a shared mode-2 project as a private copy with its origin
   await expect(page.getByText('teacher', { exact: true })).toBeVisible();
   await expect(page.getByRole('button', { name: 'Rename' })).toHaveCount(0);
   await expect(page.getByRole('button', { name: 'Delete', exact: true })).toHaveCount(0);
-  await page.getByRole('button', { name: 'Open project' }).click();
+  await page.getByRole('button', { name: 'Open project', exact: true }).click();
+  await expect(page.getByRole('heading', { name: 'Library', exact: true })).toHaveCount(0);
   await expect(page.getByText('Original route · read only').last()).toBeVisible();
   await expect(page.getByText('robot.walktime(1)', { exact: true })).toBeVisible();
   await expect(page.getByText('robot.walktime(1.2)', { exact: true })).toBeVisible();
@@ -540,6 +1143,10 @@ test('teacher can rename and delete another owner project from the shared librar
 
   await page.goto('/');
   await page.getByRole('button', { name: 'Open queue' }).click();
+  await expect(page.getByText('Shared project library')).toHaveCount(0);
+  await page.getByRole('button', { name: 'Close queue' }).click();
+  await page.getByRole('button', { name: 'Library', exact: true }).click();
+  await expect(page.getByText('Shared project library')).toBeVisible();
   await expect(page.getByText('student-route', { exact: true })).toBeVisible();
   page.once('dialog', (dialog) => dialog.accept('reviewed-route'));
   await page.getByRole('button', { name: 'Rename' }).click();
@@ -748,8 +1355,9 @@ test('teacher can preview one explicitly selected fresh robot camera topic', asy
   });
 
   await page.goto('/');
-  await page.getByRole('button', { name: 'Open queue' }).click();
+  await openConnectionPanel(page);
   await page.getByRole('button', { name: 'Discover sensors' }).click();
+  await page.getByRole('button', { name: 'Close connection panel' }).click();
   await page.getByRole('button', { name: 'Vision to Motion' }).click();
   await page.getByLabel('Camera source').selectOption('robot');
   await page.getByLabel('Robot camera topic').selectOption(topic);
@@ -834,7 +1442,7 @@ test('student view hides legacy arm holds and diagnostics without exposing senso
   await expect(page.getByRole('button', { name: 'Set Origin' })).toHaveCount(0);
   await expect(page.getByRole('button', { name: 'Return to Origin' })).toHaveCount(0);
   expect(sensorRequests).toEqual([]);
-  await page.getByRole('button', { name: 'Close simulator' }).click();
+  await page.getByRole('button', { name: 'Close' }).click();
   await expect(page.getByRole('button', { name: 'Open robot configuration' })).toHaveCount(0);
   await expect(page.getByRole('button', { name: 'Open app settings' })).toBeVisible();
   await page.getByRole('button', { name: 'Open app settings' }).click();
@@ -1006,7 +1614,8 @@ test('teacher sensor diagnostics label model-derived distance readings as provis
   });
 
   await page.goto('/');
-  await page.getByRole('button', { name: 'Open queue' }).click();
+  await expect(page.getByTestId('teacher-robot-settings')).toHaveCount(0);
+  await openConnectionPanel(page);
   const robotSettings = page.getByTestId('teacher-robot-settings');
   await expect(robotSettings.getByRole('button', { name: 'Connect', exact: true })).toBeVisible();
   await expect(robotSettings.getByRole('button', { name: 'Set Origin' })).toBeVisible();
@@ -1019,26 +1628,11 @@ test('teacher sensor diagnostics label model-derived distance readings as provis
   await expect(page.getByText('joint state: /joint_states · fresh · frame pelvis · 40 ms old')).toBeVisible();
   await expect(page.getByText('local costmap: /local_costmap/costmap · unavailable · frame map · 1800 ms old · OccupancyGrid sample is stale.')).toBeVisible();
   await expect(page.getByText(/Forward distance: ready.*Rear distance: ready/)).toBeVisible();
-  await expect(page.getByText('forward · /mid360/livox/lidar · contributing · frame mid360_link · 42 ms old · forward/rear')).toBeVisible();
+  await expect(page.getByText(/forward · \/mid360\/livox\/lidar · contributing · frame mid360_link · 42 ms old/)).toBeVisible();
   await expect(page.getByText(/forward · \/mid360\/livox\/lidar .*receive 4 ms · stamp 42 ms/)).toBeVisible();
   await expect(page.getByText(/forward · \/camera\/depth\/points · timestamp_skew/)).toBeVisible();
-  await expect(page.getByText(/Unverified model mount candidate/)).toBeVisible();
+  await expect(page.getByText(/Nominal model mount \(torso_link → mid360_link; physical fit not independently checked\)/)).toBeVisible();
   await expect(page.getByRole('button', { name: 'Restart managed LiDAR driver' })).toBeVisible();
-
-  await page.getByRole('button', { name: 'Settings', exact: true }).click();
-  const duetToggle = page.getByRole('checkbox', { name: 'Enable DUET version two' });
-  await duetToggle.check();
-  await expect(duetToggle).toBeChecked();
-  await page.getByRole('button', { name: 'Close', exact: true }).click();
-  await expect(page.getByText('/lidar/front · fresh · frame front_lidar · 42 ms old')).toBeVisible();
-  await expect(page.getByText('/lidar/rear · unavailable · frame rear_lidar · 1800 ms old · PointCloud2 sample is stale.')).toBeVisible();
-
-  await page.getByRole('button', { name: 'Settings', exact: true }).click();
-  await duetToggle.uncheck();
-  await expect(duetToggle).not.toBeChecked();
-  await page.getByRole('button', { name: 'Close', exact: true }).click();
-  await expect(page.getByText('/lidar/front · fresh · frame front_lidar · 42 ms old')).toBeVisible();
-  await expect(page.getByText('/lidar/rear · unavailable · frame rear_lidar · 1800 ms old · PointCloud2 sample is stale.')).toBeVisible();
   expect(sensorDiscoveryRequests).toBe(1);
 });
 
@@ -2291,11 +2885,10 @@ test('teacher can test LiDAR status without issuing a robot motion command', asy
       user: { role: 'teacher', username: 'teacher-lidar-test' },
     }));
   });
-  await page.route('**/api/robot/status', async (route) => {
-    await route.fulfill({
-      status: 200,
-      contentType: 'application/json',
-      body: JSON.stringify({
+  await page.route('**/api/**', async (route) => {
+    const path = new URL(route.request().url()).pathname;
+    const body = path === '/api/robot/status'
+      ? {
         sdkAvailable: false,
         distanceSensor: {
           ready: true,
@@ -2318,12 +2911,29 @@ test('teacher can test LiDAR status without issuing a robot motion command', asy
             sensor_frame_id: 'livox_frame',
           },
         },
-      }),
+      }
+      : path === '/api/classroom/codes'
+        ? { codes: [], starter_codes: [], shared_motions: [] }
+        : path === '/api/classroom/queue'
+          ? { items: [] }
+          : path === '/api/classroom/users'
+            ? { users: [] }
+            : path === '/api/classroom/status'
+              ? { status: 'idle' }
+              : path === '/api/classroom/projects/all'
+                ? { projects: [] }
+                : path === '/api/classroom/project'
+                  ? { project: { name: 'default', sceneObjects: [], plannerWaypoints: [], generatedCode: '' } }
+                  : {};
+    await route.fulfill({
+      status: 200,
+      contentType: 'application/json',
+      body: JSON.stringify(body),
     });
   });
 
   await page.goto('/');
-  await page.getByRole('button', { name: 'Open queue' }).click();
+  await openConnectionPanel(page);
   await expect(page.getByRole('button', { name: 'Test LiDAR' })).toBeVisible();
   await page.getByRole('button', { name: 'Test LiDAR' }).click();
   await expect(page.getByRole('status').filter({
@@ -2353,9 +2963,8 @@ test('teacher LiDAR status distinguishes disabled distance conditions from senso
       }),
     });
   });
-
   await page.goto('/');
-  await page.getByRole('button', { name: 'Open queue' }).click();
+  await openConnectionPanel(page);
   await page.getByRole('button', { name: 'Test LiDAR' }).click();
   const status = page.getByRole('status').filter({
     hasText: 'Front distance conditions disabled',
@@ -2666,36 +3275,36 @@ test('teacher DUET commissioning supports retry, review, failure, and copyable e
   });
 
   await page.goto('/');
-  await page.getByRole('button', { name: 'Open queue' }).click();
-  const robotSettings = page.getByTestId('teacher-robot-settings');
-  await page.getByRole('button', { name: 'Settings', exact: true }).nth(1).click();
+  await page.getByRole('button', { name: 'Open app settings' }).click();
   await page.getByRole('checkbox', { name: 'Enable DUET version two' }).check();
   await page.getByRole('button', { name: 'Close', exact: true }).click();
-  await expect(robotSettings.getByText('Teacher-only DUET commissioning')).toBeVisible();
-  await robotSettings.getByRole('button', { name: 'Connect', exact: true }).click();
-  await robotSettings.getByRole('button', { name: 'Start full test sequence' }).click();
-  await robotSettings.getByRole('button', { name: 'Run test 1' }).click();
-  await robotSettings.getByRole('button', { name: 'Run again' }).click();
+  await openConnectionPanel(page);
+  const connectionPanel = page.getByRole('dialog', { name: 'Robot connection panel' });
+  await expect(connectionPanel.getByText('Teacher-only DUET commissioning')).toBeVisible();
+  await connectionPanel.getByRole('button', { name: 'Connect', exact: true }).click();
+  await connectionPanel.getByRole('button', { name: 'Start full test sequence' }).click();
+  await connectionPanel.getByRole('button', { name: 'Run test 1' }).click();
+  await connectionPanel.getByRole('button', { name: 'Run again' }).click();
 
-  const observedResult = robotSettings.getByLabel('DUET commissioning observed result');
+  const observedResult = connectionPanel.getByLabel('DUET commissioning observed result');
   await observedResult.fill('Observed the test response and confirmed the expected direction.');
-  const nextButton = robotSettings.getByRole('button', { name: 'Next', exact: true });
+  const nextButton = connectionPanel.getByRole('button', { name: 'Next', exact: true });
   await expect(nextButton).toBeDisabled();
-  await robotSettings.getByLabel('I physically observed the expected robot response for this test.').check();
+  await connectionPanel.getByLabel('I physically observed the expected robot response for this test.').check();
   await expect(nextButton).toBeEnabled();
   await nextButton.click();
 
-  await robotSettings.getByRole('button', { name: 'Run test 2' }).click();
-  await robotSettings.getByLabel('DUET commissioning observed result').fill('Observed a discrepancy; stopping this commissioning run.');
-  await robotSettings.getByRole('button', { name: 'Fail and stop sequence' }).click();
-  await expect(robotSettings.getByText('failed', { exact: true })).toBeVisible();
-  await robotSettings.getByRole('button', { name: 'Copy evidence' }).click();
-  await expect(robotSettings.getByLabel('Selectable DUET commissioning report and event log')).toHaveValue(/commissioning-e2e/);
+  await connectionPanel.getByRole('button', { name: 'Run test 2' }).click();
+  await connectionPanel.getByLabel('DUET commissioning observed result').fill('Observed a discrepancy; stopping this commissioning run.');
+  await connectionPanel.getByRole('button', { name: 'Fail and stop sequence' }).click();
+  await expect(connectionPanel.getByText('failed', { exact: true })).toBeVisible();
+  await connectionPanel.getByRole('button', { name: 'Copy evidence' }).click();
+  await expect(connectionPanel.getByLabel('Selectable DUET commissioning report and event log')).toHaveValue(/commissioning-e2e/);
   await expect.poll(() => page.evaluate(() => window.__copiedCommissioningEvidence)).toContain('"event_log"');
 
-  await robotSettings.getByRole('button', { name: 'Start a new full test' }).click();
-  await robotSettings.getByRole('button', { name: 'Abort and request STOP' }).click();
-  await expect(robotSettings.getByText('aborted', { exact: true })).toBeVisible();
+  await connectionPanel.getByRole('button', { name: 'Start a new full test' }).click();
+  await connectionPanel.getByRole('button', { name: 'Abort and request STOP' }).click();
+  await expect(connectionPanel.getByText('aborted', { exact: true })).toBeVisible();
   expect(abortRequests).toHaveLength(1);
 
   const reviewRequests = requests.filter((request) => request.path === '/api/duet/commissioning/review');
@@ -2761,10 +3370,10 @@ test('teacher commissioning controls stay disabled when the backend feature gate
   });
 
   await page.goto('/');
-  await page.getByRole('button', { name: 'Open queue' }).click();
-  await page.getByRole('button', { name: 'Settings', exact: true }).nth(1).click();
+  await page.getByRole('button', { name: 'Open app settings' }).click();
   await page.getByRole('checkbox', { name: 'Enable DUET version two' }).check();
   await page.getByRole('button', { name: 'Close', exact: true }).click();
+  await openConnectionPanel(page);
   const robotSettings = page.getByTestId('teacher-robot-settings');
   await robotSettings.getByRole('button', { name: 'Connect', exact: true }).click();
   await expect(robotSettings.getByText('Guided commissioning is disabled.')).toBeVisible();

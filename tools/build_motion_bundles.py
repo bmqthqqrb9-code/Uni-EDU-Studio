@@ -23,8 +23,8 @@ LEGACY = [
     {
         "name": "walk-backward",
         "title": "Walk Backward",
-        "description": "Get ready, then take one small backward step.",
-        "code": "robot.stand()\nrobot.wait(2)\nrobot.backward(1)",
+        "description": "Get ready, then take two small backward steps.",
+        "code": "robot.stand()\nrobot.wait(2)\nrobot.backward(2)",
     },
     {
         "name": "turn-around-180",
@@ -36,7 +36,43 @@ LEGACY = [
         "name": "hands-up-gesture",
         "title": "Hands Up Gesture",
         "description": "Run a fixed, teacher-supervised G1 arm preset.",
-        "code": 'robot.hold_arm("hands up", 2)',
+        "code": 'robot.stand()\nrobot.wait(2)\nrobot.arm_action("hands up")',
+    },
+    {
+        "name": "turn-left-90",
+        "title": "Turn Left 90 Degrees",
+        "description": "Get ready, pause, then make an approximate quarter turn to the left.",
+        "code": 'robot.stand()\nrobot.wait(2)\nrobot.turn("left", 90)',
+    },
+    {
+        "name": "sidestep-right",
+        "title": "Sidestep Right",
+        "description": "Get ready, pause, then take two small steps to the right.",
+        "code": 'robot.stand()\nrobot.wait(2)\nrobot.sidestep("right", 2)',
+    },
+    {
+        "name": "walk-backward-then-clap",
+        "title": "Walk Backwards Then Clap",
+        "description": "Walk backward, pause, then run the fixed clap arm preset.",
+        "code": 'robot.stand()\nrobot.backward(2)\nrobot.wait(2)\nrobot.arm_action("clap")\nrobot.wait(2)',
+    },
+    {
+        "name": "high-five-turn-around-walk-forward",
+        "title": "High Five, Turn Around, Walk Forward",
+        "description": "Run a fixed high-five preset, pause, turn approximately 180 degrees, then walk forward.",
+        "code": 'robot.stand()\nrobot.arm_action("high five")\nrobot.wait(2)\nrobot.turn_around_180()\nrobot.walk(2)',
+    },
+    {
+        "name": "walk-forward-turn-around-walk-back",
+        "title": "Walk Forward, Turn Around, Walk Back",
+        "description": "Walk forward, turn approximately 180 degrees, walk back, then stand.",
+        "code": "robot.stand()\nrobot.wait(2)\nrobot.walk(2)\nrobot.turn_around_180()\nrobot.backward(2)\nrobot.stand()",
+    },
+    {
+        "name": "walk-in-a-square-looped",
+        "title": "Walk in a Square",
+        "description": "Repeat a short forward walk, left quarter-turn, and pause four times.",
+        "code": 'robot.stand()\nfor _ in range(4):\n    robot.walk(2)\n    robot.turn("left", 90)\n    robot.wait(2)',
     },
     {
         "name": "follow-along-walk-and-wave",
@@ -166,6 +202,17 @@ def parse_blocks(code: str, prefix: str) -> list[dict]:
                 break
             if depth > indent:
                 raise ValueError(f"Unexpected indentation in {code!r} at line {index + 1}")
+            loop = re.fullmatch(r"for\s+([A-Za-z_]\w*)\s+in\s+range\(\s*(\d+)\s*\):", text)
+            if loop:
+                body, next_index = parse(index + 1, indent + 4)
+                nodes.append({
+                    "type": "controls_repeat_ext",
+                    "method": "repeat",
+                    "times": int(loop.group(2)),
+                    "body": body,
+                })
+                index = next_index
+                continue
             condition = re.fullmatch(rf"if {prefix}\.(front|rear)_distance_m\(\) (<=|>=|==|!=|<|>) ([0-9.]+):", text)
             if condition:
                 body, next_index = parse(index + 1, indent + 4)

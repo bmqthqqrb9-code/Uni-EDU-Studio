@@ -43,6 +43,21 @@ _run_lock = threading.Lock()
 _stop_requested = threading.Event()
 _MAX_EXPANDED_COMMANDS = 400
 _ARM_ACTION_REQUEST_SPACING_SECONDS = 2.0
+_DURABLE_LOG_EVENTS = {
+    "connection_attempt",
+    "connection_failed",
+    "connected",
+    "program_started",
+    "program_completed",
+    "program_failed",
+    "command_failed",
+    "safe_mode_motion_stopped",
+    "safe_mode_sensor_failed",
+    "safety_stop_failed",
+    "safety_stop_requested",
+    "stop_requested",
+    "stop_failed",
+}
 _CONTINUOUS_MOVE_DURATION = 864000.0
 _STEP_METERS = 0.345
 _FORWARD_METERS_PER_SECOND = 0.4
@@ -105,7 +120,8 @@ def _log_event(event: str, **details: Any) -> None:
         with _connection_log_path.open("a", encoding="utf-8") as log_file:
             log_file.write(json.dumps(record, separators=(",", ":")) + "\n")
             log_file.flush()
-            os.fsync(log_file.fileno())
+            if event in _DURABLE_LOG_EVENTS:
+                os.fsync(log_file.fileno())
 
 
 def _start_connection_log(interface: str, domain: int) -> None:

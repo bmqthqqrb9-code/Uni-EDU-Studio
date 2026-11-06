@@ -302,6 +302,18 @@ class DuetRouteTests(unittest.TestCase):
         self.assertIn("gateway is unreachable", response.json()["detail"])
         connect_sdk.assert_not_called()
 
+    def test_duet_status_explains_when_the_local_gateway_is_not_running(self):
+        with patch.dict(os.environ, {
+            "DUET_CONTROL_DIR": os.path.join(self.temp_dir.name, "duet-control"),
+        }):
+            response = self.client.get("/api/duet/status", headers=self.teacher)
+
+        self.assertEqual(response.status_code, 200)
+        self.assertFalse(response.json()["connected"])
+        self.assertEqual(response.json()["motionOwner"], "none")
+        self.assertIn("DUET_GATEWAY_ENABLED=true", response.json()["error"])
+        self.assertIn("DUET_CONTROL_DIR", response.json()["error"])
+
     def test_duet_connect_is_available_before_motion_acceptance_without_using_sdk(self):
         connected = {
             "status": "connected",

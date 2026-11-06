@@ -14,8 +14,8 @@ import * as Zh from 'blockly/msg/zh-hans';
 import 'blockly/blocks';
 import g1BasicConfigZh from '../block_configurations/g1_basic/g1_basic.json';
 import g1BasicConfigEn from '../block_configurations/g1_basic/g1_basic_en.json';
-import { G1_EDU_23_ENV, SIMULATOR_MODES, buildPlannerMotionCommands, clampScenePoint, createEmptyG1Edu23State, simulateG1Edu23Program } from './sim/g1Edu23Env';
-import { getSceneObjectBaseDimensions, getSceneObjectDimensions } from './sim/sceneObjects';
+import { SIMULATOR_MODES, buildPlannerMotionCommands, clampScenePoint, createEmptyG1Edu23State, simulateG1Edu23Program } from './sim/g1Edu23Env';
+import { getSceneObjectDimensions } from './sim/sceneObjects';
 import G1Simulation3D from './components/G1Simulation3D';
 import {
   isWorldPointInKnownFreeSpace,
@@ -81,6 +81,82 @@ function parsePlannerProjectMeta(code = '') {
   } catch {
     return null;
   }
+}
+
+function createLoginCardsPdf(accounts) {
+  const mmToPoints = (millimeters) => millimeters * 72 / 25.4;
+  const pageWidth = mmToPoints(210);
+  const pageHeight = mmToPoints(297);
+  const cardWidth = mmToPoints(85.6);
+  const cardHeight = mmToPoints(54);
+  const columnGap = mmToPoints(8);
+  const rowGap = mmToPoints(1.5);
+  const pageObjects = [];
+  const pdfObjects = [];
+  const escapePdfText = (value) => String(value).replace(/[\\()]/g, '\\$&');
+  const drawText = (font, size, x, y, value) => (
+    `BT /${font} ${size} Tf ${x.toFixed(2)} ${y.toFixed(2)} Td (${escapePdfText(value)}) Tj ET\n`
+  );
+
+  for (let pageIndex = 0; pageIndex * 10 < accounts.length; pageIndex += 1) {
+    let content = '';
+    const pageAccounts = accounts.slice(pageIndex * 10, pageIndex * 10 + 10);
+    const gridWidth = cardWidth * 2 + columnGap;
+    const left = (pageWidth - gridWidth) / 2;
+    pageAccounts.forEach(({ username, password }, cardIndex) => {
+      const column = cardIndex % 2;
+      const row = Math.floor(cardIndex / 2);
+      const x = left + column * (cardWidth + columnGap);
+      const y = pageHeight - mmToPoints(8) - cardHeight - row * (cardHeight + rowGap);
+      content += `q 0.35 0.42 0.52 RG 0.8 w [3 3] 0 d ${x.toFixed(2)} ${y.toFixed(2)} ${cardWidth.toFixed(2)} ${cardHeight.toFixed(2)} re S Q\n`;
+      content += `0.05 0.22 0.48 rg\n`;
+      content += drawText('F2', 9, x + 12, y + cardHeight - 22, 'STUDENT LOGIN');
+      content += `0.38 0.42 0.48 rg\n`;
+      content += drawText('F1', 7, x + 12, y + cardHeight - 35, 'Reusable classroom account');
+      content += drawText('F2', 7, x + 12, y + 67, 'USERNAME');
+      content += drawText('F2', 18, x + 12, y + 43, username);
+      content += drawText('F2', 7, x + 135, y + 67, 'PASSWORD');
+      content += drawText('F2', 15, x + 135, y + 43, password);
+      content += drawText('F1', 7, x + 12, y + 18, 'Keep this card for future classroom use.');
+    });
+
+    const pageObjectNumber = 5 + pageIndex * 2;
+    const streamObjectNumber = pageObjectNumber + 1;
+    pageObjects.push(`${pageObjectNumber} 0 R`);
+    pdfObjects[pageObjectNumber] = `<< /Type /Page /Parent 2 0 R /MediaBox [0 0 ${pageWidth.toFixed(2)} ${pageHeight.toFixed(2)}] /Resources << /Font << /F1 3 0 R /F2 4 0 R >> >> /Contents ${streamObjectNumber} 0 R >>`;
+    pdfObjects[streamObjectNumber] = `<< /Length ${content.length} >>\nstream\n${content}endstream`;
+  }
+
+  pdfObjects[1] = '<< /Type /Catalog /Pages 2 0 R >>';
+  pdfObjects[2] = `<< /Type /Pages /Kids [${pageObjects.join(' ')}] /Count ${pageObjects.length} >>`;
+  pdfObjects[3] = '<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>';
+  pdfObjects[4] = '<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica-Bold >>';
+
+  let pdf = '%PDF-1.4\n';
+  const offsets = [0];
+  for (let objectNumber = 1; objectNumber < pdfObjects.length; objectNumber += 1) {
+    offsets[objectNumber] = pdf.length;
+    pdf += `${objectNumber} 0 obj\n${pdfObjects[objectNumber]}\nendobj\n`;
+  }
+  const crossReferenceOffset = pdf.length;
+  pdf += `xref\n0 ${pdfObjects.length}\n0000000000 65535 f \n`;
+  for (let objectNumber = 1; objectNumber < pdfObjects.length; objectNumber += 1) {
+    pdf += `${String(offsets[objectNumber]).padStart(10, '0')} 00000 n \n`;
+  }
+  pdf += `trailer\n<< /Size ${pdfObjects.length} /Root 1 0 R >>\nstartxref\n${crossReferenceOffset}\n%%EOF`;
+  return pdf;
+}
+
+function downloadLoginCardsPdf(group) {
+  const blob = new Blob([createLoginCardsPdf(group.accounts)], { type: 'application/pdf' });
+  const url = URL.createObjectURL(blob);
+  const link = document.createElement('a');
+  link.href = url;
+  link.download = `class-${group.group_number}-login-cards.pdf`;
+  document.body.appendChild(link);
+  link.click();
+  link.remove();
+  window.setTimeout(() => URL.revokeObjectURL(url), 1000);
 }
 
 function buildSdkCommandsFromTrace(pathTrace = []) {
@@ -338,76 +414,7 @@ const OBJECT_LIBRARY = [
   { id: 'table', label: 'Table', icon: '◫', defaultRadius: 16, color: '#94a3b8' },
   { id: 'terrain', label: 'Terrain', icon: '◌', defaultRadius: 15, color: '#86efac' },
 ];
-
-function SceneObstacleShape({ obstacle, centerX, centerY, size, color, opacity, stroke, strokeWidth, strokeDasharray }) {
-  const common = { fill: color, fillOpacity: opacity, stroke, strokeWidth, strokeDasharray };
-  switch (obstacle.type) {
-    case 'box':
-      return (
-        <g>
-          <polygon {...common} points={`${centerX - size * 0.68},${centerY - size * 0.42} ${centerX},${centerY - size * 0.78} ${centerX + size * 0.68},${centerY - size * 0.42} ${centerX},${centerY - size * 0.06}`} />
-          <polygon {...common} points={`${centerX - size * 0.68},${centerY - size * 0.42} ${centerX},${centerY - size * 0.06} ${centerX},${centerY + size * 0.72} ${centerX - size * 0.68},${centerY + size * 0.36}`} />
-          <polygon {...common} points={`${centerX},${centerY - size * 0.06} ${centerX + size * 0.68},${centerY - size * 0.42} ${centerX + size * 0.68},${centerY + size * 0.36} ${centerX},${centerY + size * 0.72}`} />
-        </g>
-      );
-    case 'wall':
-      return (
-        <g>
-          <rect {...common} x={centerX - size * 1.2} y={centerY - size * 0.34} width={size * 2.4} height={size * 0.68} rx="2" />
-          <path d={`M ${centerX - size * 0.6} ${centerY - size * 0.3} v ${size * 0.6} M ${centerX} ${centerY - size * 0.3} v ${size * 0.6} M ${centerX + size * 0.6} ${centerY - size * 0.3} v ${size * 0.6}`} fill="none" stroke={stroke} strokeWidth={Math.max(1, strokeWidth * 0.7)} />
-        </g>
-      );
-    case 'platform':
-      return (
-        <g>
-          <rect {...common} x={centerX - size * 0.88} y={centerY - size * 0.62} width={size * 1.76} height={size * 1.24} rx={size * 0.28} />
-          <rect x={centerX - size * 0.58} y={centerY - size * 0.34} width={size * 1.16} height={size * 0.68} rx={size * 0.18} fill="none" stroke={stroke} strokeWidth={Math.max(1, strokeWidth * 0.65)} />
-        </g>
-      );
-    case 'ramp':
-      return (
-        <g>
-          <polygon {...common} points={`${centerX - size},${centerY + size * 0.7} ${centerX + size},${centerY + size * 0.7} ${centerX + size},${centerY - size * 0.7}`} />
-          <path d={`M ${centerX - size * 0.52} ${centerY + size * 0.38} L ${centerX + size * 0.48} ${centerY - size * 0.42}`} fill="none" stroke={stroke} strokeWidth={Math.max(1, strokeWidth * 0.8)} strokeDasharray="3 2" />
-        </g>
-      );
-    case 'stairs':
-      return <path {...common} d={`M ${centerX - size} ${centerY + size * 0.65} v ${-size * 0.4} h ${size * 0.65} v ${-size * 0.4} h ${size * 0.7} v ${-size * 0.4} h ${size * 0.65} v ${size * 1.2} Z`} />;
-    case 'sphere':
-      return (
-        <g>
-          <circle {...common} cx={centerX} cy={centerY} r={size * 0.72} />
-          <circle cx={centerX - size * 0.2} cy={centerY - size * 0.2} r={size * 0.14} fill="white" fillOpacity="0.65" />
-        </g>
-      );
-    case 'cylinder':
-      return (
-        <g>
-          <circle {...common} cx={centerX} cy={centerY} r={size * 0.72} />
-          <ellipse cx={centerX} cy={centerY} rx={size * 0.42} ry={size * 0.2} fill="none" stroke={stroke} strokeWidth={Math.max(1, strokeWidth * 0.75)} />
-          <path d={`M ${centerX - size * 0.5} ${centerY} h ${size}`} fill="none" stroke={stroke} strokeWidth={Math.max(1, strokeWidth * 0.65)} />
-        </g>
-      );
-    case 'table':
-      return (
-        <g>
-          <rect {...common} x={centerX - size * 0.82} y={centerY - size * 0.62} width={size * 1.64} height={size * 1.24} rx="3" />
-          {[-1, 1].flatMap((xSign) => [-1, 1].map((ySign) => (
-            <circle key={`${xSign}-${ySign}`} cx={centerX + xSign * size * 0.58} cy={centerY + ySign * size * 0.43} r={size * 0.1} fill={stroke} />
-          )))}
-        </g>
-      );
-    case 'terrain':
-      return (
-        <g>
-          <polygon {...common} points={`${centerX - size},${centerY + size * 0.35} ${centerX - size * 0.65},${centerY - size * 0.35} ${centerX - size * 0.1},${centerY - size * 0.1} ${centerX + size * 0.25},${centerY - size * 0.7} ${centerX + size},${centerY + size * 0.35}`} />
-          <path d={`M ${centerX - size * 0.45} ${centerY + size * 0.1} Q ${centerX - size * 0.1} ${centerY - size * 0.35} ${centerX + size * 0.5} ${centerY - size * 0.05}`} fill="none" stroke={stroke} strokeWidth={Math.max(1, strokeWidth * 0.7)} />
-        </g>
-      );
-    default:
-      return <circle {...common} cx={centerX} cy={centerY} r={size} />;
-  }
-}
+const SIDEBAR_PANEL_IDS = ['blocks', 'ide', 'planner', 'prompt', 'camera'];
 
 function removeBlocklyVariableInitializers(code, initializers) {
   const lines = code.split('\n');
@@ -854,6 +861,7 @@ export default function App() {
   const syncBlocksFromGeneratedCodeRef = useRef(null);
   const processedAutonomousOperationRef = useRef(null);
   const sceneShellRef = useRef(null);
+  const workspacePanelRef = useRef(null);
   
   const [lang, setLang] = useState('en');
   const [robotConfig, setRobotConfig] = useState(DEFAULT_ROBOT_CONFIG_EN);
@@ -879,8 +887,13 @@ export default function App() {
   // 运行状态管理
   const [isRunning, setIsRunning] = useState(false);
   const [mainTab, setMainTab] = useState('blocks');
+  const [ideCommandSearch, setIdeCommandSearch] = useState('');
   const [toolPanelRect, setToolPanelRect] = useState({ top: 12, right: 16, width: 520, height: 760 });
   const [toolPanelCollapsed, setToolPanelCollapsed] = useState(false);
+  const [isSimulationVisible, setIsSimulationVisible] = useState(true);
+  const [isSimulationVisibilityLoading, setIsSimulationVisibilityLoading] = useState(true);
+  const [isSimulationVisibilitySaving, setIsSimulationVisibilitySaving] = useState(false);
+  const [simulationVisibilityError, setSimulationVisibilityError] = useState('');
   const toolPanelInteractionRef = useRef(null);
   const [lockedSidebarPanels, setLockedSidebarPanels] = useState(() => {
     try {
@@ -888,7 +901,7 @@ export default function App() {
       if (savedSession?.user?.role !== 'teacher') return [];
       const savedPanels = JSON.parse(localStorage.getItem(`edu-locked-sidebar-panels:${savedSession.user.username}`) || '[]');
       return Array.isArray(savedPanels)
-        ? savedPanels.filter((id) => ['planner', 'prompt', 'camera'].includes(id))
+        ? savedPanels.filter((id) => SIDEBAR_PANEL_IDS.includes(id))
         : [];
     } catch (error) {
       console.warn('Unable to initialize locked sidebar panels.', error);
@@ -941,7 +954,10 @@ export default function App() {
       window.removeEventListener('resize', keepToolPanelInViewport);
     };
   }, [toolPanelCollapsed]);
-  const [isSimulatorOpen, setIsSimulatorOpen] = useState(false);
+  const [isQueueOpen, setIsQueueOpen] = useState(false);
+  const [isConnectionPanelOnly, setIsConnectionPanelOnly] = useState(false);
+  const [isObjectPanelOpen, setIsObjectPanelOpen] = useState(false);
+  const [isLibraryOpen, setIsLibraryOpen] = useState(false);
   const [motionPrompt, setMotionPrompt] = useState('Walk forward 3 steps, turn left 90 degrees, then wave');
   const [motionPromptResult, setMotionPromptResult] = useState(null);
   const [motionPromptStatus, setMotionPromptStatus] = useState('local');
@@ -959,12 +975,15 @@ export default function App() {
   const [motionVideoUrl, setMotionVideoUrl] = useState('');
   const motionVideoRef = useRef(null);
   const [simulatorMode, setSimulatorMode] = useState('kid-preview');
-  const [simulatorSidebarTab, setSimulatorSidebarTab] = useState('add-object');
+  const [objectPanelTab, setObjectPanelTab] = useState('add-object');
+  const [connectionTabTarget, setConnectionTabTarget] = useState(null);
   const [sceneObjects, setSceneObjects] = useState([]);
   const [selectedSceneObjectId, setSelectedSceneObjectId] = useState(null);
-  const [activeDragItem, setActiveDragItem] = useState(null);
   const [projectName, setProjectName] = useState('default');
   const [projectLibrary, setProjectLibrary] = useState([]);
+  const [editingProjectId, setEditingProjectId] = useState(null);
+  const [sharedMotions, setSharedMotions] = useState([]);
+  const [starterMotionEditor, setStarterMotionEditor] = useState(null);
   const [isPreviewPlaying, setIsPreviewPlaying] = useState(false);
   const [playbackProgress, setPlaybackProgress] = useState(0);
   const [playbackSpeed, setPlaybackSpeed] = useState(1);
@@ -985,6 +1004,7 @@ export default function App() {
       return null;
     }
   });
+  const [classroomDataReady, setClassroomDataReady] = useState(false);
   const currentUser = session?.user ?? { role: 'student', username: 'guest' };
   const legacyCommandsForCurrentUser = useMemo(
     () => G1_EXECUTABLE_COMMANDS.filter((command) => (
@@ -992,6 +1012,45 @@ export default function App() {
     )),
     [currentUser.role],
   );
+  const ideCommandEntries = useMemo(() => {
+    if (controllerVersion === 'duet') {
+      return getDuetCommandExamples(savedDuetMotions).map((example) => ({
+        ...example,
+        category: example.category || 'Commands',
+        script: example.code,
+        description: example.label,
+      }));
+    }
+    return legacyCommandsForCurrentUser.flatMap((command) => {
+      if (command.method === 'arm_action') {
+        return command.args[0].choices.map(([presetLabel, preset]) => ({
+          key: `arm_action_${preset}`,
+          category: command.category,
+          method: 'arm_action',
+          script: `robot.arm_action(${JSON.stringify(preset)})`,
+          label: `Arm preset: ${presetLabel.replace(/ \(\d+\)$/, '')}`,
+          description: G1_ARM_PRESET_DESCRIPTIONS[preset],
+          sdkMethod: command.sdkMethod,
+          adapters: command.adapters,
+        }));
+      }
+      const args = command.args.map((argument) => argument.kind === 'choice'
+        ? JSON.stringify(argument.value)
+        : argument.kind === 'text'
+          ? JSON.stringify(argument.value)
+          : String(argument.value));
+      return [{
+        key: command.method,
+        category: command.category,
+        method: command.method,
+        script: `robot.${command.method}(${args.join(', ')})`,
+        label: command.label,
+        description: command.description,
+        sdkMethod: command.sdkMethod,
+        adapters: command.adapters,
+      }];
+    });
+  }, [controllerVersion, legacyCommandsForCurrentUser, savedDuetMotions]);
   const [savedDuetArmMotions, setSavedDuetArmMotions] = useState([]);
   const [duetArmMotionName, setDuetArmMotionName] = useState('');
   const [duetArmMotionError, setDuetArmMotionError] = useState('');
@@ -1014,6 +1073,19 @@ export default function App() {
   const [accountManagementError, setAccountManagementError] = useState('');
   const [isCreatingStudent, setIsCreatingStudent] = useState(false);
   const [deletingUsername, setDeletingUsername] = useState('');
+  const [classroomGroups, setClassroomGroups] = useState([]);
+  const classroomPasswordsByUsername = useMemo(
+    () => new Map(classroomGroups.flatMap((group) => (
+      group.accounts.map((account) => [account.username, account.password])
+    ))),
+    [classroomGroups],
+  );
+  const [newClassGroup, setNewClassGroup] = useState({ name: '', size: '25' });
+  const [isCreatingClassGroup, setIsCreatingClassGroup] = useState(false);
+  const [isClearingGuestData, setIsClearingGuestData] = useState(false);
+  const [deletingClassGroup, setDeletingClassGroup] = useState(null);
+  const [guestAccountStatus, setGuestAccountStatus] = useState('');
+  const [guestCardGroup, setGuestCardGroup] = useState(null);
   const [classroomStatus, setClassroomStatus] = useState('idle');
   const [robotConnectionStatus, setRobotConnectionStatus] = useState('Not connected');
   const [lidarTestStatus, setLidarTestStatus] = useState('Not tested');
@@ -1137,9 +1209,7 @@ export default function App() {
     { id: 'prompt', label: 'Prompt to Motion' },
     { id: 'camera', label: 'Vision to Motion' },
   ];
-  const configurableSidebarPanels = overlayTabs.filter(({ id }) => (
-    ['planner', 'prompt', 'camera'].includes(id)
-  ));
+  const configurableSidebarPanels = overlayTabs;
   const unlockedOverlayTabs = overlayTabs.filter(({ id }) => !lockedSidebarPanels.includes(id));
   const sidebarPanelIsLocked = (id) => lockedSidebarPanels.includes(id);
 
@@ -1155,12 +1225,58 @@ export default function App() {
     const data = text ? JSON.parse(text) : {};
 
     if (!res.ok) {
+      if (res.status === 401 && data.detail === 'Invalid token' && session?.token) {
+        localStorage.removeItem('edu-classroom-session');
+        setSession(null);
+        throw new Error('Your session expired. Please sign in again.');
+      }
       const error = new Error(data.detail || data.message || 'Request failed');
       error.status = res.status;
       throw error;
     }
     return data;
   }, [session?.token]);
+
+  useEffect(() => {
+    if (!session?.token) {
+      setClassroomDataReady(false);
+      return undefined;
+    }
+
+    let active = true;
+    setClassroomDataReady(false);
+    apiFetch('/api/classroom/me')
+      .then(({ data_revision: dataRevision = 0 }) => {
+        if (!active) return;
+        const revision = String(dataRevision);
+        const revisionKey = `edu-classroom-data-revision:${session.user.username}`;
+        const savedRevision = localStorage.getItem(revisionKey);
+        if ((savedRevision ?? '0') !== revision) {
+          localStorage.removeItem(sceneObjectsKey);
+          localStorage.removeItem(duetArmMotionsKey);
+          setSceneObjects([]);
+          setSavedDuetArmMotions([]);
+          setPlannerWaypoints([]);
+          setProjectName('default');
+          setEditingProjectId(null);
+          generatedCodeRef.current = '';
+          setGeneratedCode('');
+          codeByVersionRef.current.legacy = '';
+          codeByVersionRef.current.duet = '';
+        }
+        localStorage.setItem(revisionKey, revision);
+        setClassroomDataReady(true);
+      })
+      .catch((error) => {
+        if (!active) return;
+        console.error('Unable to verify classroom account data revision.', error);
+        setSession(null);
+      });
+
+    return () => {
+      active = false;
+    };
+  }, [apiFetch, duetArmMotionsKey, sceneObjectsKey, session?.token, session?.user?.username]);
 
   useEffect(() => {
     if (currentUser.role !== 'teacher' || !session?.token) {
@@ -1180,7 +1296,7 @@ export default function App() {
           const legacyValue = localStorage.getItem(`edu-locked-sidebar-panels:${currentUser.username}`);
           const legacyPanels = legacyValue ? JSON.parse(legacyValue) : [];
           const validLegacyPanels = Array.isArray(legacyPanels)
-            ? [...new Set(legacyPanels.filter((panel) => ['planner', 'prompt', 'camera'].includes(panel)))]
+            ? [...new Set(legacyPanels.filter((panel) => SIDEBAR_PANEL_IDS.includes(panel)))]
             : [];
           if (validLegacyPanels.length > 0) {
             settings = await apiFetch('/api/classroom/sidebar-settings', {
@@ -1189,11 +1305,15 @@ export default function App() {
             });
           }
         }
-        const validPanels = ['planner', 'prompt', 'camera'];
+        const validPanels = SIDEBAR_PANEL_IDS;
         const nextPanels = settings.locked_panels.filter((panel) => validPanels.includes(panel));
+        const visiblePanelIds = SIDEBAR_PANEL_IDS.filter((panel) => !nextPanels.includes(panel));
         if (!active) return;
         setLockedSidebarPanels(nextPanels);
-        setMainTab((tab) => nextPanels.includes(tab) ? 'blocks' : tab);
+        setMainTab((tab) => {
+          if (visiblePanelIds.includes(tab)) return tab;
+          return visiblePanelIds[0] || tab;
+        });
         setLockedSidebarPanelsError('');
         setIsSidebarSettingsLoading(false);
         try {
@@ -1244,6 +1364,43 @@ export default function App() {
     };
   }, [apiFetch, currentUser.role, session?.token]);
 
+  useEffect(() => {
+    if (!session?.token) {
+      setIsSimulationVisible(true);
+      setIsSimulationVisibilityLoading(false);
+      return undefined;
+    }
+
+    let active = true;
+    setIsSimulationVisibilityLoading(true);
+    const loadSimulationVisibility = async () => {
+      try {
+        const settings = await apiFetch('/api/classroom/simulation-visibility');
+        if (typeof settings.show_simulation !== 'boolean') {
+          throw new Error('Simulation visibility response is invalid.');
+        }
+        if (!active) return;
+        setIsSimulationVisible(settings.show_simulation);
+        setSimulationVisibilityError('');
+      } catch (error) {
+        if (!active) return;
+        console.error('Unable to load shared simulation visibility.', error);
+        setSimulationVisibilityError(`Simulation visibility could not be loaded: ${error.message}`);
+      } finally {
+        if (active) setIsSimulationVisibilityLoading(false);
+      }
+    };
+
+    void loadSimulationVisibility();
+    const refreshInterval = currentUser.role === 'student'
+      ? window.setInterval(() => void loadSimulationVisibility(), 5000)
+      : null;
+    return () => {
+      active = false;
+      if (refreshInterval !== null) window.clearInterval(refreshInterval);
+    };
+  }, [apiFetch, currentUser.role, session?.token]);
+
   const handleSafeModeToggle = async (enabled) => {
     const previousValue = safeModeEnabled;
     setSafeModeEnabled(enabled);
@@ -1264,14 +1421,36 @@ export default function App() {
     }
   };
 
+  const handleSimulationVisibilityToggle = async (showSimulation) => {
+    const previousValue = isSimulationVisible;
+    setIsSimulationVisible(showSimulation);
+    if (!showSimulation) setToolPanelCollapsed(false);
+    setIsSimulationVisibilitySaving(true);
+    try {
+      const settings = await apiFetch('/api/classroom/simulation-visibility', {
+        method: 'PUT',
+        body: JSON.stringify({ show_simulation: showSimulation }),
+      });
+      setIsSimulationVisible(settings.show_simulation);
+      setSimulationVisibilityError('');
+    } catch (error) {
+      setIsSimulationVisible(previousValue);
+      console.error('Unable to save shared simulation visibility.', error);
+      setSimulationVisibilityError(`Simulation visibility could not be saved: ${error.message}`);
+    } finally {
+      setIsSimulationVisibilitySaving(false);
+    }
+  };
+
   const handleSidebarPanelLockChange = async (panelId, isLocked) => {
     const previousPanels = lockedSidebarPanels;
     const nextPanels = isLocked
       ? [...new Set([...previousPanels, panelId])]
       : previousPanels.filter((id) => id !== panelId);
+    const visiblePanelIds = SIDEBAR_PANEL_IDS.filter((id) => !nextPanels.includes(id));
     setLockedSidebarPanels(nextPanels);
     setIsSidebarSettingsSaving(true);
-    if (isLocked && mainTab === panelId) setMainTab('blocks');
+    setMainTab((tab) => visiblePanelIds.includes(tab) ? tab : visiblePanelIds[0] || tab);
     try {
       const settings = await apiFetch('/api/classroom/sidebar-settings', {
         method: 'PUT',
@@ -1374,22 +1553,28 @@ export default function App() {
   const refreshClassroomData = useCallback(async () => {
     if (!session?.token) return;
     try {
-      const [codesRes, queueRes, usersRes, statusRes, projectsRes] = await Promise.all([
+      const [codesRes, queueRes, usersRes, groupsRes, statusRes, projectsRes] = await Promise.all([
         apiFetch('/api/classroom/codes'),
         session.user.role === 'teacher' ? apiFetch('/api/classroom/queue') : Promise.resolve({ items: [] }),
         session.user.role === 'teacher' ? apiFetch('/api/classroom/users') : Promise.resolve({ users: [] }),
+        session.user.role === 'teacher' ? apiFetch('/api/classroom/groups') : Promise.resolve({ groups: [] }),
         apiFetch('/api/classroom/status'),
         apiFetch('/api/classroom/projects')
       ]);
       setSavedCodes(codesRes.codes || []);
       setStarterCodes(codesRes.starter_codes || []);
+      setSharedMotions(codesRes.shared_motions || []);
       setQueueItems(queueRes.items || []);
       setTeacherRoster(usersRes.users || []);
+      setClassroomGroups(groupsRes.groups || []);
       setClassroomStatus(statusRes.status || 'idle');
       setProjectLibrary(projectsRes.projects || []);
       return queueRes.items || [];
     } catch (err) {
       console.error('Failed to refresh classroom data:', err);
+      if (session.user.role === 'teacher') {
+        setAccountManagementError(`Could not load classroom data: ${err.message}`);
+      }
       return [];
     }
   }, [session, apiFetch]);
@@ -1408,7 +1593,7 @@ export default function App() {
   }, [session?.token, apiFetch]);
 
   useEffect(() => {
-    if (session) {
+    if (session && classroomDataReady) {
       localStorage.setItem('edu-classroom-session', JSON.stringify(session));
       const savedSceneObjects = localStorage.getItem(sceneObjectsKey);
       if (savedSceneObjects) {
@@ -1480,10 +1665,10 @@ export default function App() {
         .catch(() => {
           // fallback to local storage only if no backend project exists
         });
-    } else {
+    } else if (!session) {
       localStorage.removeItem('edu-classroom-session');
     }
-  }, [session, refreshClassroomData, sceneObjectsKey, robotConnection, apiFetch]);
+  }, [session, classroomDataReady, refreshClassroomData, sceneObjectsKey, robotConnection, apiFetch]);
 
   useEffect(() => {
     if (controllerVersion !== 'duet' || !isDuetProgramActive) return undefined;
@@ -1521,13 +1706,13 @@ export default function App() {
   }, [controllerVersion, duetRobotConnection, isDuetProgramActive]);
 
   useEffect(() => {
-    if (session?.user?.username) {
+    if (session?.user?.username && classroomDataReady) {
       localStorage.setItem(sceneObjectsKey, JSON.stringify(sceneObjects));
     }
-  }, [sceneObjects, sceneObjectsKey, session]);
+  }, [sceneObjects, sceneObjectsKey, session, classroomDataReady]);
 
   useEffect(() => {
-    if (!session?.user?.username) return;
+    if (!session?.user?.username || !classroomDataReady) return;
     const timer = setTimeout(() => {
       apiFetch('/api/classroom/project/save', {
         method: 'POST',
@@ -1552,7 +1737,7 @@ export default function App() {
       });
     }, 250);
     return () => clearTimeout(timer);
-  }, [session, projectName, sceneObjects, plannerWaypoints, generatedCode, controllerVersion, pathPlannerMode, plannerProjectLabel, plannerRouteVariants, selectedPlannerVariant, apiFetch]);
+  }, [session, classroomDataReady, projectName, sceneObjects, plannerWaypoints, generatedCode, controllerVersion, pathPlannerMode, plannerProjectLabel, plannerRouteVariants, selectedPlannerVariant, apiFetch]);
 
   useEffect(() => {
     if (!session?.token) {
@@ -1758,8 +1943,12 @@ export default function App() {
     setSession(null);
     setSavedCodes([]);
     setStarterCodes([]);
+    setSharedMotions([]);
+    setProjectLibrary([]);
+    setEditingProjectId(null);
     setQueueItems([]);
     setTeacherRoster([]);
+    setClassroomGroups([]);
     setClassroomStatus('idle');
   };
 
@@ -1794,6 +1983,82 @@ export default function App() {
       setAccountManagementError(error.message);
     } finally {
       setDeletingUsername('');
+    }
+  };
+
+  const handleCreateClassGroup = async (event) => {
+    event.preventDefault();
+    setAccountManagementError('');
+    setIsCreatingClassGroup(true);
+    try {
+      const response = await apiFetch('/api/classroom/groups', {
+        method: 'POST',
+        body: JSON.stringify({
+          name: newClassGroup.name,
+          size: Number(newClassGroup.size),
+        }),
+      });
+      setGuestAccountStatus(
+        `${response.group.name} created with ${response.group.accounts.length} student accounts.`,
+      );
+      setNewClassGroup({ name: '', size: '25' });
+      await refreshClassroomData();
+    } catch (error) {
+      setAccountManagementError(error.message);
+    } finally {
+      setIsCreatingClassGroup(false);
+    }
+  };
+
+  const handleRenameClassGroup = async (group) => {
+    const name = window.prompt('Name this class', group.name);
+    if (name === null || !name.trim()) return;
+    setAccountManagementError('');
+    try {
+      await apiFetch(`/api/classroom/groups/${group.group_number}`, {
+        method: 'PUT',
+        body: JSON.stringify({ name: name.trim() }),
+      });
+      setGuestAccountStatus(`Class renamed to ${name.trim()}.`);
+      await refreshClassroomData();
+    } catch (error) {
+      setAccountManagementError(error.message);
+    }
+  };
+
+  const handleClearClassData = async (group) => {
+    if (!window.confirm(
+      `Clear saved programs, projects, submissions, and operation records for ${group.name}? This affects only this class. Student accounts and their passwords will remain. Active sessions for this class will be signed out.`,
+    )) return;
+    setAccountManagementError('');
+    setIsClearingGuestData(true);
+    try {
+      const response = await apiFetch(`/api/classroom/groups/${group.group_number}/clear-data`, { method: 'POST' });
+      setGuestAccountStatus(
+        `Cleared ${response.total_deleted} saved records from ${group.name}. Accounts and passwords are unchanged.`,
+      );
+      await refreshClassroomData();
+    } catch (error) {
+      setAccountManagementError(error.message);
+    } finally {
+      setIsClearingGuestData(false);
+    }
+  };
+
+  const handleDeleteClassGroup = async (group) => {
+    if (!window.confirm(
+      `Delete ${group.name} and its ${group.accounts.length} student accounts? Their saved work will also be deleted. Recreating the same class number and account positions will reuse the same passwords.`,
+    )) return;
+    setAccountManagementError('');
+    setDeletingClassGroup(group.group_number);
+    try {
+      await apiFetch(`/api/classroom/groups/${group.group_number}`, { method: 'DELETE' });
+      setGuestAccountStatus(`${group.name} and its accounts were deleted. Account passwords are saved for reuse.`);
+      await refreshClassroomData();
+    } catch (error) {
+      setAccountManagementError(error.message);
+    } finally {
+      setDeletingClassGroup(null);
     }
   };
 
@@ -2046,7 +2311,10 @@ export default function App() {
         method: 'POST',
         body: JSON.stringify({ owner: project.username, name: project.name, new_name: newName }),
       });
-      if (project.username === currentUser.username && projectName === project.name) {
+      if (editingProjectId === project.id) {
+        setProjectName(newName);
+        setPlannerProjectLabel(newName);
+      } else if (project.username === currentUser.username && projectName === project.name) {
         setProjectName(newName);
         setPlannerProjectLabel(newName);
       }
@@ -2063,12 +2331,127 @@ export default function App() {
         method: 'POST',
         body: JSON.stringify({ owner: project.username, name: project.name }),
       });
-      if (project.username === currentUser.username && projectName === project.name) {
+      if (editingProjectId === project.id) {
+        setEditingProjectId(null);
+        setProjectName('default');
+      } else if (project.username === currentUser.username && projectName === project.name) {
         setProjectName('default');
       }
       await refreshClassroomData();
     } catch (error) {
       alert(`Could not delete project: ${error.message}`);
+    }
+  };
+
+  const approveSharedProject = async (project) => {
+    try {
+      await apiFetch(`/api/classroom/project/${project.id}/approve`, { method: 'POST' });
+      await refreshClassroomData();
+    } catch (error) {
+      alert(`Could not approve project: ${error.message}`);
+    }
+  };
+
+  const saveNamedProject = async (name, projectId = null) => {
+    const trimmedName = name.trim();
+    if (!trimmedName) return;
+    try {
+      const response = await apiFetch('/api/classroom/project/save-named', {
+        method: 'POST',
+        body: JSON.stringify({
+          ...buildProjectSnapshot(),
+          name: trimmedName,
+          project_id: currentUser.role === 'teacher' ? projectId : null,
+        }),
+      });
+      setProjectName(response.project.name);
+      setPlannerProjectLabel(response.project.plannerLabel || response.project.name);
+      setEditingProjectId(currentUser.role === 'teacher' ? response.project.id : null);
+      await refreshClassroomData();
+      alert(response.project.status === 'pending'
+        ? `Saved “${response.project.name}” for teacher approval. It will appear in the shared Projects library after approval.`
+        : `Saved project “${response.project.name}”.`);
+    } catch (error) {
+      alert(`Could not save project: ${error.message}`);
+    }
+  };
+
+  const promptSaveNamedProject = () => {
+    const enteredName = window.prompt('Name this project', projectName === 'default' ? '' : projectName);
+    if (enteredName?.trim()) {
+      void saveNamedProject(enteredName, currentUser.role === 'teacher' ? editingProjectId : null);
+    }
+  };
+
+  const saveAsStarterMotion = async () => {
+    const name = window.prompt('Name this starter motion');
+    if (!name?.trim()) return;
+    try {
+      const response = await apiFetch('/api/classroom/starter-motions', {
+        method: 'POST',
+        body: JSON.stringify({
+          name: name.trim(),
+          code: generatedCode,
+          controller_version: controllerVersion,
+        }),
+      });
+      setSharedMotions((motions) => [...motions, response.motion]);
+      await refreshClassroomData();
+      alert(`Saved “${response.motion.name}” as a ${controllerVersion.toUpperCase()} starter motion.`);
+    } catch (error) {
+      alert(`Could not save starter motion: ${error.message}`);
+    }
+  };
+
+  const openStarterMotionEditor = (motion) => {
+    setStarterMotionEditor({ ...motion });
+  };
+
+  const saveStarterMotionEdit = async () => {
+    if (!starterMotionEditor) return;
+    try {
+      const response = await apiFetch(
+        `/api/classroom/starter-motions/${encodeURIComponent(starterMotionEditor.id)}`,
+        {
+          method: 'PUT',
+          body: JSON.stringify({
+            name: starterMotionEditor.name,
+            code: starterMotionEditor.code,
+          }),
+        },
+      );
+      setSharedMotions((motions) => motions.map((motion) => (
+        motion.id === response.motion.id ? response.motion : motion
+      )));
+      setStarterMotionEditor(null);
+      await refreshClassroomData();
+    } catch (error) {
+      alert(`Could not save starter motion: ${error.message}`);
+    }
+  };
+
+  const duplicateStarterMotion = async (motion) => {
+    try {
+      await apiFetch(`/api/classroom/starter-motions/${encodeURIComponent(motion.id)}/duplicate`, {
+        method: 'POST',
+        body: JSON.stringify({}),
+      });
+      await refreshClassroomData();
+    } catch (error) {
+      alert(`Could not duplicate starter motion: ${error.message}`);
+    }
+  };
+
+  const deleteStarterMotion = async (motion) => {
+    if (!window.confirm(`Delete the shared ${motion.controller_version.toUpperCase()} motion “${motion.name}”?`)) return;
+    try {
+      await apiFetch(`/api/classroom/starter-motions/${encodeURIComponent(motion.id)}`, {
+        method: 'DELETE',
+      });
+      setSharedMotions((motions) => motions.filter((entry) => entry.id !== motion.id));
+      await refreshClassroomData();
+    } catch (error) {
+      alert(`Could not delete starter motion: ${error.message}`);
     }
   };
 
@@ -2644,15 +3027,18 @@ export default function App() {
     if (!entry || !['legacy', 'duet'].includes(entry.controller_version)) return;
     if (entry.controller_version === controllerVersion) {
       updateGeneratedCode(entry.code);
+      setIsLibraryOpen(false);
       return;
     }
     codeByVersionRef.current[entry.controller_version] = entry.code;
     await handleControllerVersionChange(entry.controller_version === 'duet');
+    setIsLibraryOpen(false);
   };
 
   const renderStarterMotionLibrary = () => (
     <div className="rounded-xl border border-blue-200 bg-blue-50 p-3">
       <p className="text-[10px] uppercase tracking-wide text-blue-800 font-semibold">Starter motion library</p>
+      <p className="mt-1 text-[9px] font-semibold uppercase tracking-wide text-blue-700">Built-in examples</p>
       <p className="mt-1 text-[10px] leading-relaxed text-blue-900">
         Examples load into the editor only. Check the controller mode, inspect the code, and require teacher approval before any physical run.
       </p>
@@ -2668,6 +3054,94 @@ export default function App() {
           </div>
         ))}
         {starterCodes.length === 0 && <p className="text-xs text-slate-500">Starter motion examples are unavailable.</p>}
+      </div>
+      <div className="mt-4 border-t border-blue-200 pt-3">
+        <div className="flex items-center justify-between gap-2">
+          <p className="text-[10px] uppercase tracking-wide text-blue-800 font-semibold">
+            Shared {controllerVersion.toUpperCase()} motions
+          </p>
+          <span className="text-[9px] text-blue-700">{sharedMotions.filter((motion) => motion.controller_version === controllerVersion).length} available</span>
+        </div>
+        <div className="mt-2 space-y-2">
+          {sharedMotions
+            .filter((motion) => motion.controller_version === controllerVersion)
+            .map((motion) => (
+              <div key={motion.id} className="rounded-lg border border-blue-100 bg-white p-2">
+                <div className="flex items-start justify-between gap-2">
+                  <span className="min-w-0 break-words text-xs font-semibold text-slate-800">{motion.name}</span>
+                  <span className="shrink-0 rounded-full bg-slate-100 px-2 py-0.5 text-[9px] uppercase text-slate-600">{motion.controller_version}</span>
+                </div>
+                <details className="mt-2">
+                  <summary className="cursor-pointer text-[10px] font-semibold text-blue-700">Preview sequence</summary>
+                  <pre className="mt-1 max-h-40 overflow-auto whitespace-pre-wrap break-words rounded bg-slate-50 p-2 font-mono text-[10px] text-slate-700">{motion.code}</pre>
+                </details>
+                <div className="mt-2 flex flex-wrap items-center gap-3">
+                  <button
+                    type="button"
+                    onClick={() => handleLoadStarterCode({
+                      name: motion.name,
+                      code: motion.code,
+                      controller_version: motion.controller_version,
+                    })}
+                    className="text-xs font-semibold text-blue-700 hover:text-blue-900"
+                  >
+                    Load sequence
+                  </button>
+                  {currentUser.role === 'teacher' && (
+                    <>
+                      <button type="button" onClick={() => openStarterMotionEditor(motion)} className="text-xs text-slate-600 hover:text-slate-900">Edit</button>
+                      <button type="button" onClick={() => duplicateStarterMotion(motion)} className="text-xs text-slate-600 hover:text-slate-900">Duplicate</button>
+                      <button type="button" onClick={() => deleteStarterMotion(motion)} className="text-xs text-red-600 hover:text-red-700">Delete</button>
+                    </>
+                  )}
+                </div>
+              </div>
+            ))}
+          {sharedMotions.filter((motion) => motion.controller_version === controllerVersion).length === 0 && (
+            <p className="text-xs text-slate-500">No shared motions for this controller yet.</p>
+          )}
+        </div>
+      </div>
+    </div>
+  );
+
+  const renderProjectLibrary = () => (
+    <div className="rounded-xl border border-slate-200 bg-slate-50 p-3">
+      <h3 className="text-sm font-semibold uppercase tracking-wide text-slate-700">Shared project library</h3>
+      <div className="mt-2 space-y-2">
+        {projectLibrary.length === 0 ? (
+          <p className="text-xs text-slate-500">No saved projects yet.</p>
+        ) : projectLibrary.map((project) => (
+          <div key={project.id || `${project.username}-${project.name}`} className="rounded-lg border border-slate-200 bg-white p-3">
+            <div className="flex items-center justify-between gap-2">
+              <span className="min-w-0 truncate text-sm font-medium text-slate-800">{project.name}</span>
+              <div className="flex shrink-0 items-center gap-1">
+                {project.status === 'pending' && (
+                  <span className="rounded-full bg-amber-100 px-2 py-1 text-[9px] uppercase text-amber-800">Pending approval</span>
+                )}
+                {project.plannerMode && (
+                  <span className="rounded-full bg-cyan-100 px-2 py-1 text-[9px] uppercase text-cyan-800">
+                    {PLANNER_MODE_LABELS[project.plannerMode] || project.plannerMode}
+                  </span>
+                )}
+                <span className="rounded-full bg-slate-100 px-2 py-1 text-[10px] uppercase text-slate-600">{project.username}</span>
+              </div>
+            </div>
+            <div className="mt-2 flex flex-wrap items-center gap-3">
+              <button type="button" onClick={() => loadProjectFromLibrary(project)} className="text-xs text-blue-600 hover:text-blue-700">Open project</button>
+              {currentUser.role === 'teacher' && (
+                <>
+                  {project.status === 'pending' && (
+                    <button type="button" onClick={() => approveSharedProject(project)} className="text-xs font-semibold text-emerald-700 hover:text-emerald-900">Approve & share</button>
+                  )}
+                  <button type="button" onClick={() => loadProjectFromLibrary(project, { duplicate: true })} className="text-xs text-slate-600 hover:text-slate-900">Duplicate</button>
+                  <button type="button" onClick={() => handleRenameProject(project)} className="text-xs text-slate-600 hover:text-slate-900">Rename</button>
+                  <button type="button" onClick={() => handleDeleteProject(project)} className="text-xs text-red-600 hover:text-red-700">Delete</button>
+                </>
+              )}
+            </div>
+          </div>
+        ))}
       </div>
     </div>
   );
@@ -3367,12 +3841,33 @@ export default function App() {
     setRobotConfig(targetDefault);
   };
 
+  const legacySharedMotionBlocks = useMemo(
+    () => sharedMotions
+      .filter((motion) => motion.controller_version === 'legacy')
+      .map((motion) => ({
+        type: `g1_shared_motion_${motion.id}`,
+        category: 'Shared motions',
+        message0: `Run shared motion: ${motion.name.replaceAll('%', ' percent ')}`,
+        previousStatement: null,
+        nextStatement: null,
+        colour: 35,
+        tooltip: motion.code,
+        codeTemplate: `robot.shared_motion(${JSON.stringify(motion.id)})\n`,
+      })),
+    [sharedMotions],
+  );
+
+  const getDuetSharedMotions = useCallback(
+    () => sharedMotions.filter((motion) => motion.controller_version === 'duet'),
+    [sharedMotions],
+  );
+
   const generateToolboxXML = useCallback((language) => {
     const cats = UI_TEXT[language].toolbox;
     const isDuetVersion = controllerVersion === 'duet';
     const commandBlocks = isDuetVersion
-      ? getDuetBlocklyCommandBlocks(savedDuetMotions)
-      : getG1BlocklyCommandBlocks(legacyCommandsForCurrentUser);
+      ? getDuetBlocklyCommandBlocks(savedDuetMotions, getDuetSharedMotions())
+      : [...getG1BlocklyCommandBlocks(legacyCommandsForCurrentUser), ...legacySharedMotionBlocks];
     const categories = [...new Set(commandBlocks.map((definition) => definition.category))];
     const commandCategoriesXml = categories.map((category) => {
       const blocks = commandBlocks
@@ -3419,7 +3914,13 @@ export default function App() {
       </category>
     </xml>
     `;
-  }, [controllerVersion, legacyCommandsForCurrentUser, savedDuetMotions]);
+  }, [
+    controllerVersion,
+    getDuetSharedMotions,
+    legacyCommandsForCurrentUser,
+    legacySharedMotionBlocks,
+    savedDuetMotions,
+  ]);
 
   const registerBlocks = useCallback((robotCategories) => {
     if (!Blockly || !pythonGenerator) return;
@@ -3455,8 +3956,9 @@ export default function App() {
     const commandBlocks = [
       ...ROBOT_IDE_COMMAND_BLOCKS,
       ...getG1BlocklyCommandBlocks(G1_COMMANDS),
+      ...legacySharedMotionBlocks,
       ...getG1BlocklyConditionBlocks(),
-      ...getDuetBlocklyCommandBlocks(savedDuetMotions),
+      ...getDuetBlocklyCommandBlocks(savedDuetMotions, getDuetSharedMotions()),
     ];
     const definitions = [...allBlocks, ...commandBlocks].map((blockDef) => {
       const definition = { ...blockDef };
@@ -3521,7 +4023,7 @@ export default function App() {
         return code;
       };
     });
-  }, [lang, controllerVersion, savedDuetMotions]);
+  }, [lang, controllerVersion, savedDuetMotions, legacySharedMotionBlocks, getDuetSharedMotions]);
 
   useEffect(() => {
     if (!isBlocklyLoaded || !blocklyDiv.current) return;
@@ -3768,7 +4270,7 @@ export default function App() {
     }
   };
 
-  const loadProjectFromLibrary = (project) => {
+  const loadProjectFromLibrary = (project, { duplicate = false } = {}) => {
     if (!project) return;
     const legacyCode = typeof project.generatedCode === 'string' ? project.generatedCode : '';
     const meta = parsePlannerProjectMeta(legacyCode) || {
@@ -3791,7 +4293,7 @@ export default function App() {
     const projectOwner = project.username || currentUser.username;
     const sourceName = project.name || meta.plannerLabel || 'default';
     let destinationName = sourceName;
-    if (projectOwner !== currentUser.username) {
+    if (duplicate || currentUser.role === 'student') {
       const ownedNames = new Set(projectLibrary
         .filter((entry) => entry.username === currentUser.username)
         .map((entry) => entry.name));
@@ -3803,6 +4305,9 @@ export default function App() {
       }
     }
     setProjectName(destinationName);
+    setEditingProjectId(
+      currentUser.role === 'teacher' && !duplicate ? project.id : null,
+    );
     setPlannerProjectLabel(projectOwner !== currentUser.username
       ? destinationName
       : meta.plannerLabel || project.name || 'default');
@@ -3823,7 +4328,8 @@ export default function App() {
     compiledPlannerCodeRef.current = nextCode;
     applyGeneratedCode(nextCode, { syncBlocks: true });
     setMainTab('blocks');
-    setIsSimulatorOpen(false);
+    setIsQueueOpen(false);
+    setIsLibraryOpen(false);
   };
 
   const placePlannerWaypoint = ({ x, y }) => {
@@ -4180,9 +4686,11 @@ export default function App() {
           } else {
             block = controllerVersion === 'duet'
               ? workspace.newBlock(`duet_command_${node.method}`)
-              : workspace.newBlock(node.method === 'arm_action'
-                ? getG1BlocklyCommandBlocks().find((definition) => definition.armPreset === node.values[0])?.type || 'g1_command_arm_action'
-                : `g1_command_${node.method}`);
+              : workspace.newBlock(node.method === 'shared_motion'
+                ? `g1_shared_motion_${node.values[0]}`
+                : node.method === 'arm_action'
+                  ? getG1BlocklyCommandBlocks().find((definition) => definition.armPreset === node.values[0])?.type || 'g1_command_arm_action'
+                  : `g1_command_${node.method}`);
           }
           if (node.type === 'repeat') {
             const repeatCount = workspace.newBlock('math_number');
@@ -4808,7 +5316,7 @@ export default function App() {
 
   const selectSceneObject = (id) => {
     setSelectedSceneObjectId(id);
-    setSimulatorSidebarTab('scene-objects');
+    setObjectPanelTab('scene-objects');
   };
 
   const updateStudentObstacle = (id, patch) => {
@@ -4827,9 +5335,6 @@ export default function App() {
     setSelectedSceneObjectId((selectedId) => selectedId === id ? null : selectedId);
   };
 
-  const obstacleDragRef = useRef(null);
-  const plannerDragRef = useRef(null);
-  const sceneOrigin = 110;
   const sharedMapMetadata = sharedLidarMap?.map?.map;
   const mapWidthMeters = sharedMapMetadata ? sharedMapMetadata.width * sharedMapMetadata.resolution_m : 0;
   const mapHeightMeters = sharedMapMetadata ? sharedMapMetadata.height * sharedMapMetadata.resolution_m : 0;
@@ -4848,9 +5353,6 @@ export default function App() {
   const sceneExtent = sharedLidarOverlayEnabled && sharedMapMetadata
     ? Math.max(gridSize, rotatedMapWidth, rotatedMapHeight)
     : gridSize;
-  const sceneScale = 220 / sceneExtent;
-  const sceneX = (meters) => sceneOrigin + (meters - sceneCenterX) * sceneScale;
-  const sceneY = (meters) => sceneOrigin - (meters - sceneCenterY) * sceneScale;
   const clampGridPoint = (x, y) => ({
     x: Math.max(sceneCenterX - sceneExtent / 2, Math.min(sceneCenterX + sceneExtent / 2, x)),
     y: Math.max(sceneCenterY - sceneExtent / 2, Math.min(sceneCenterY + sceneExtent / 2, y)),
@@ -4956,103 +5458,9 @@ export default function App() {
       return [{ ...point, mapX: x, mapY: y }];
     });
   }, [sharedLidarMap]);
-  const sharedGridOverlayPath = useMemo(() => {
-    const snapshot = sharedLidarMap?.map;
-    if (!sharedLidarOverlayEnabled || !snapshot?.data?.length || !snapshot.map) return '';
-    const { data, map } = snapshot;
-    const resolution = map.resolution_m;
-    const cosine = Math.cos(map.origin.yaw_rad);
-    const sine = Math.sin(map.origin.yaw_rad);
-    const halfGrid = sceneExtent / 2;
-    const commands = [];
-    for (let index = 0; index < data.length; index += 1) {
-      if (data[index] < 65) continue;
-      const column = index % map.width;
-      const row = Math.floor(index / map.width);
-      const localX = (column + 0.5) * resolution;
-      const localY = (row + 0.5) * resolution;
-      const centerX = map.origin.x + cosine * localX - sine * localY;
-      const centerY = map.origin.y + sine * localX + cosine * localY;
-      if (
-        centerX < sceneCenterX - halfGrid - resolution || centerX > sceneCenterX + halfGrid + resolution
-        || centerY < sceneCenterY - halfGrid - resolution || centerY > sceneCenterY + halfGrid + resolution
-      ) continue;
-      const corners = [
-        [column * resolution, row * resolution],
-        [(column + 1) * resolution, row * resolution],
-        [(column + 1) * resolution, (row + 1) * resolution],
-        [column * resolution, (row + 1) * resolution],
-      ].map(([x, y]) => {
-        const worldX = map.origin.x + cosine * x - sine * y;
-        const worldY = map.origin.y + sine * x + cosine * y;
-        return `${sceneOrigin + (worldX - sceneCenterX) * sceneScale} ${sceneOrigin - (worldY - sceneCenterY) * sceneScale}`;
-      });
-      commands.push(`M${corners.join('L')}z`);
-    }
-    return commands.join('');
-  }, [sceneCenterX, sceneCenterY, sceneExtent, sceneOrigin, sceneScale, sharedLidarMap, sharedLidarOverlayEnabled]);
-
-  const getSvgCoords = (event) => {
-    const svg = event.currentTarget.ownerSVGElement || event.currentTarget;
-    const screenPoint = svg.createSVGPoint();
-    screenPoint.x = event.clientX;
-    screenPoint.y = event.clientY;
-    const svgPoint = screenPoint.matrixTransform(svg.getScreenCTM().inverse());
-    const worldX = (svgPoint.x - sceneOrigin) / sceneScale + sceneCenterX;
-    const worldY = (sceneOrigin - svgPoint.y) / sceneScale + sceneCenterY;
-    return clampGridPoint(worldX, worldY);
-  };
-
-  const handleObstaclePointerDown = (event, obstacleId) => {
-    selectSceneObject(obstacleId);
-    obstacleDragRef.current = { obstacleId, pointerId: event.pointerId };
-    setActiveDragItem({ kind: 'obstacle', id: obstacleId });
-    event.stopPropagation();
-    event.currentTarget.setPointerCapture?.(event.pointerId);
-  };
-
-  const handlePlannerWaypointPointerDown = (event, waypointId) => {
-    plannerDragRef.current = { waypointId, pointerId: event.pointerId };
-    setActiveDragItem({ kind: 'waypoint', id: waypointId });
-    event.stopPropagation();
-    event.currentTarget.setPointerCapture?.(event.pointerId);
-  };
-
-  const handleObstaclePointerMove = (event) => {
-    if (!obstacleDragRef.current || currentUser.role === 'teacher') return;
-    const { x, y } = getSvgCoords(event);
-    updateStudentObstacle(obstacleDragRef.current.obstacleId, { x, y });
-  };
-
-  const handlePlannerWaypointPointerMove = (event) => {
-    if (!plannerDragRef.current) return;
-    const { x, y } = getSvgCoords(event);
-    updatePlannerWaypoint(plannerDragRef.current.waypointId, { x, y });
-  };
-
-  const handleScenePointerMove = (event) => {
-    if (plannerDragRef.current) {
-      handlePlannerWaypointPointerMove(event);
-      return;
-    }
-    if (obstacleDragRef.current) {
-      handleObstaclePointerMove(event);
-    }
-  };
-
-  const handleObstaclePointerUp = () => {
-    obstacleDragRef.current = null;
-    plannerDragRef.current = null;
-    setActiveDragItem(null);
-  };
-
-  const handleScenePointerUp = () => {
-    handleObstaclePointerUp();
-  };
-
   const handlePromptSubmit = () => { promptState.callback?.(promptState.inputValue); setPromptState({ ...promptState, isOpen: false }); };
   const handlePromptCancel = () => { promptState.callback?.(null); setPromptState({ ...promptState, isOpen: false }); };
-  
+
   const handleSaveCode = () => {
     if (workspaceRef.current && codeEditorState.blockId) {
       const block = workspaceRef.current.getBlockById(codeEditorState.blockId);
@@ -5343,8 +5751,325 @@ export default function App() {
                   {lang === 'zh' ? 'English' : '中文'}
                 </button>
               </div>
+              <fieldset className="rounded-xl border border-slate-200 bg-slate-50 px-5 py-4">
+                <legend className="text-sm font-semibold text-slate-800">Simulation preview</legend>
+                <p className="mb-3 text-xs text-slate-500">Choose the preview mode and adjust its grid and playback speed.</p>
+                <div className="grid gap-2 sm:grid-cols-2">
+                  {Object.entries(SIMULATOR_MODES).map(([key, mode]) => (
+                    <button
+                      key={key}
+                      type="button"
+                      aria-pressed={simulatorMode === key}
+                      onClick={() => setSimulatorMode(key)}
+                      className={`rounded-lg px-3 py-2 text-sm font-semibold transition ${simulatorMode === key ? 'bg-blue-600 text-white' : 'bg-white text-slate-700 hover:bg-slate-100'}`}
+                    >
+                      {mode.label}
+                    </button>
+                  ))}
+                </div>
+                <label className="mt-4 block text-xs font-semibold text-slate-700">
+                  <span className="flex items-center justify-between">
+                    <span>Grid size</span>
+                    <span>{gridSize} m x {gridSize} m</span>
+                  </span>
+                  <input
+                    type="range"
+                    aria-label="Simulation grid size"
+                    min="10"
+                    max="80"
+                    step="1"
+                    value={gridSize}
+                    onChange={(event) => setGridSize(Number(event.target.value))}
+                    className="mt-2 w-full accent-blue-600"
+                  />
+                </label>
+                <label className="mt-3 block text-xs font-semibold text-slate-700">
+                  <span className="flex items-center justify-between">
+                    <span>Simulation speed</span>
+                    <span>{playbackSpeed.toFixed(1)}x</span>
+                  </span>
+                  <input
+                    type="range"
+                    aria-label="Simulation speed"
+                    min="0.1"
+                    max="3"
+                    step="0.1"
+                    value={playbackSpeed}
+                    onChange={(event) => setPlaybackSpeed(Number(event.target.value))}
+                    className="mt-2 w-full accent-cyan-600"
+                  />
+                </label>
+                <p className="mt-2 text-xs text-slate-500">Speed changes timing only. Distances remain in meters.</p>
+                {currentUser.role === 'teacher' && (
+                  <label className="mt-4 flex items-center justify-between gap-3 border-t border-slate-200 pt-3 text-xs font-semibold text-slate-700">
+                    <span>Show 3D simulation in the workspace</span>
+                    <input
+                      type="checkbox"
+                      aria-label="Show 3D simulation in the workspace"
+                      checked={isSimulationVisible}
+                      disabled={isSimulationVisibilityLoading || isSimulationVisibilitySaving}
+                      onChange={(event) => handleSimulationVisibilityToggle(event.target.checked)}
+                      className="h-4 w-4 accent-blue-700"
+                    />
+                  </label>
+                )}
+                {currentUser.role === 'teacher' && simulationVisibilityError && (
+                  <p role="alert" className="mt-2 text-xs text-red-700">{simulationVisibilityError}</p>
+                )}
+              </fieldset>
               {currentUser.role === 'teacher' && (
                 <>
+              <section className="rounded-xl border border-slate-200 bg-slate-50 p-4">
+                <h3 className="text-sm font-semibold uppercase tracking-wide text-slate-700">Manage classroom accounts</h3>
+                <div className="mt-3 rounded-lg border border-emerald-200 bg-emerald-50 p-3">
+                  <h4 className="text-sm font-semibold text-emerald-950">Student classes</h4>
+                  <p className="mt-1 text-xs text-emerald-900">
+                    Create a class of up to 99 accounts. Class numbers are assigned automatically; each account keeps its generated 8-digit password across classes.
+                  </p>
+                  <form onSubmit={handleCreateClassGroup} className="mt-3 grid gap-2 rounded-lg border border-emerald-100 bg-white p-3 sm:grid-cols-[minmax(0,1fr)_8rem_auto]">
+                    <label className="text-xs font-medium text-slate-700">
+                      Class name <span className="font-normal text-slate-500">(optional)</span>
+                      <input
+                        type="text"
+                        value={newClassGroup.name}
+                        onChange={(event) => setNewClassGroup({ ...newClassGroup, name: event.target.value })}
+                        maxLength={60}
+                        className="mt-1 w-full rounded-lg border border-slate-200 px-2 py-1.5 text-sm"
+                        placeholder="Default: Class 1"
+                      />
+                    </label>
+                    <label className="text-xs font-medium text-slate-700">
+                      Number of students
+                      <input
+                        type="number"
+                        min="1"
+                        max="99"
+                        required
+                        value={newClassGroup.size}
+                        onChange={(event) => setNewClassGroup({ ...newClassGroup, size: event.target.value })}
+                        className="mt-1 w-full rounded-lg border border-slate-200 px-2 py-1.5 text-sm"
+                      />
+                    </label>
+                    <button
+                      type="submit"
+                      disabled={isCreatingClassGroup || isClearingGuestData}
+                      className="self-end rounded-lg bg-emerald-700 px-3 py-2 text-xs font-semibold text-white disabled:opacity-50"
+                    >
+                      {isCreatingClassGroup ? 'Creating…' : 'Create class'}
+                    </button>
+                  </form>
+                  {classroomGroups.length ? (
+                    <div className="mt-3 space-y-2">
+                      {classroomGroups.map((group) => {
+                        const accountNumbers = group.accounts.map((account) => Number(account.username));
+                        const range = accountNumbers.length
+                          ? `${accountNumbers[0]}–${accountNumbers[accountNumbers.length - 1]}`
+                          : 'No accounts';
+                        return (
+                          <div key={group.group_number} className="flex flex-wrap items-center justify-between gap-3 rounded-lg border border-emerald-100 bg-white p-3">
+                            <div>
+                              <p className="text-sm font-semibold text-slate-800">{group.name}</p>
+                              <p className="text-xs text-slate-500">
+                                Class {group.group_number} · {group.accounts.length} students · usernames {range}
+                              </p>
+                            </div>
+                            <div className="flex flex-wrap gap-2">
+                              <button
+                                type="button"
+                                onClick={() => setGuestCardGroup(group)}
+                                disabled={!group.accounts.length}
+                                className="rounded-lg border border-emerald-700 bg-white px-3 py-2 text-xs font-semibold text-emerald-900 disabled:opacity-50"
+                              >
+                                Print login cards
+                              </button>
+                              <button
+                                type="button"
+                                onClick={() => handleRenameClassGroup(group)}
+                                className="rounded-lg border border-slate-300 bg-white px-3 py-2 text-xs font-semibold text-slate-700"
+                              >
+                                Rename
+                              </button>
+                              <button
+                                type="button"
+                                onClick={() => handleClearClassData(group)}
+                                disabled={isClearingGuestData || isCreatingClassGroup || deletingClassGroup !== null}
+                                className="rounded-lg border border-red-300 bg-white px-3 py-2 text-xs font-semibold text-red-800 disabled:opacity-50"
+                              >
+                                {isClearingGuestData ? 'Clearing…' : 'Clear class data'}
+                              </button>
+                              <button
+                                type="button"
+                                onClick={() => handleDeleteClassGroup(group)}
+                                disabled={isClearingGuestData || isCreatingClassGroup || deletingClassGroup !== null}
+                                className="rounded-lg border border-red-700 bg-white px-3 py-2 text-xs font-semibold text-red-900 disabled:opacity-50"
+                              >
+                                {deletingClassGroup === group.group_number ? 'Deleting…' : 'Delete class'}
+                              </button>
+                            </div>
+                          </div>
+                        );
+                      })}
+                    </div>
+                  ) : (
+                    <p className="mt-3 text-xs text-slate-600">No student classes yet.</p>
+                  )}
+                  {guestAccountStatus && <p role="status" className="mt-2 text-xs text-emerald-900">{guestAccountStatus}</p>}
+                </div>
+                <form onSubmit={handleCreateStudent} className="mt-3 max-w-lg space-y-2 rounded-lg border border-blue-100 bg-white p-3">
+                  <label className="block text-xs font-medium text-slate-700">
+                    Account type
+                    <select
+                      value={newStudent.role}
+                      onChange={(event) => setNewStudent({ ...newStudent, role: event.target.value })}
+                      className="mt-1 w-full rounded-lg border border-slate-200 px-2 py-1.5 text-sm"
+                    >
+                      <option value="student">Student</option>
+                      <option value="teacher">Teacher</option>
+                    </select>
+                  </label>
+                  <label className="block text-xs font-medium text-slate-700">
+                    New {newStudent.role} username
+                    <input
+                      type="text"
+                      value={newStudent.username}
+                      onChange={(event) => setNewStudent({ ...newStudent, username: event.target.value })}
+                      minLength={3}
+                      maxLength={32}
+                      pattern="[A-Za-z0-9_-]{3,32}"
+                      autoComplete="off"
+                      required
+                      className="mt-1 w-full rounded-lg border border-slate-200 px-2 py-1.5 text-sm"
+                      placeholder="student24"
+                    />
+                  </label>
+                  <label className="block text-xs font-medium text-slate-700">
+                    Initial password
+                    <input
+                      type="password"
+                      value={newStudent.password}
+                      onChange={(event) => setNewStudent({ ...newStudent, password: event.target.value })}
+                      minLength={8}
+                      maxLength={128}
+                      autoComplete="new-password"
+                      required
+                      className="mt-1 w-full rounded-lg border border-slate-200 px-2 py-1.5 text-sm"
+                    />
+                  </label>
+                  <p className="text-[10px] text-slate-500">Username: 3–32 letters, numbers, _ or -. Password: 8–128 characters.</p>
+                  <button
+                    type="submit"
+                    disabled={isCreatingStudent}
+                    className="w-full rounded-lg bg-blue-600 px-2 py-1.5 text-xs font-semibold text-white disabled:opacity-60"
+                  >
+                    {isCreatingStudent ? 'Creating…' : `Create ${newStudent.role} account`}
+                  </button>
+                </form>
+                {accountManagementError && (
+                  <p role="alert" className="mt-2 text-xs text-red-700">{accountManagementError}</p>
+                )}
+                <div className="mt-3 grid gap-2 sm:grid-cols-2">
+                  {teacherRoster.length === 0 ? (
+                    <p className="text-xs text-slate-500">No classroom accounts found.</p>
+                  ) : teacherRoster.map((user) => (
+                    <div key={user.username} className="flex items-center justify-between rounded-lg border border-slate-200 bg-white px-3 py-2">
+                      <div className="min-w-0">
+                        <p className="truncate text-sm text-slate-700">{user.username}</p>
+                        <p className="text-xs text-slate-500">
+                          Password: {classroomPasswordsByUsername.get(user.username) || 'Not available'}
+                        </p>
+                      </div>
+                      <div className="flex shrink-0 items-center gap-2">
+                        <span className="rounded-full bg-slate-100 px-2 py-1 text-[10px] uppercase text-slate-600">{user.role}</span>
+                        {user.username !== currentUser.username && (
+                          <button
+                            type="button"
+                            onClick={() => handleDeleteUser(user.username)}
+                            disabled={deletingUsername === user.username}
+                            aria-label={`Delete account ${user.username}`}
+                            className="rounded px-2 py-1 text-[10px] font-semibold text-red-700 hover:bg-red-50 disabled:opacity-50"
+                          >
+                            {deletingUsername === user.username ? 'Deleting…' : 'Delete'}
+                          </button>
+                        )}
+                      </div>
+                    </div>
+                  ))}
+                </div>
+              </section>
+              {guestCardGroup && createPortal((
+                <div
+                  id="guest-login-cards"
+                  role="dialog"
+                  aria-modal="true"
+                  aria-label="Guest account login cards"
+                  className="fixed inset-0 z-[10000] overflow-y-auto bg-slate-950/70 p-4"
+                >
+                  <div className="mx-auto max-w-5xl rounded-2xl bg-white p-4 shadow-2xl">
+                    <div className="guest-card-toolbar mb-4 flex flex-wrap items-center justify-between gap-3">
+                      <div>
+                        <h3 className="text-lg font-bold text-slate-900">Guest account login cards</h3>
+                        <p className="text-xs text-slate-600">Card-sized, cut along the dashed borders. Print on A4 portrait paper.</p>
+                      </div>
+                      <div className="flex gap-2">
+                        <button
+                          type="button"
+                          onClick={() => downloadLoginCardsPdf(guestCardGroup)}
+                          className="rounded-lg border border-blue-700 px-3 py-2 text-sm font-semibold text-blue-800"
+                        >
+                          Download PDF
+                        </button>
+                        <button
+                          type="button"
+                          onClick={() => window.print()}
+                          className="rounded-lg bg-blue-700 px-3 py-2 text-sm font-semibold text-white"
+                        >
+                          Print
+                        </button>
+                        <button
+                          type="button"
+                          onClick={() => setGuestCardGroup(null)}
+                          aria-label="Close guest login cards"
+                          className="rounded-lg border border-slate-300 px-3 py-2 text-sm font-semibold text-slate-700"
+                        >
+                          Close
+                        </button>
+                      </div>
+                    </div>
+                    {Array.from(
+                      { length: Math.ceil(guestCardGroup.accounts.length / 10) },
+                      (_, pageIndex) => pageIndex,
+                    ).map((pageIndex) => (
+                      <div key={pageIndex} className="guest-card-page mb-4 grid grid-cols-1 justify-center gap-3 sm:grid-cols-2">
+                        {guestCardGroup.accounts.slice(pageIndex * 10, pageIndex * 10 + 10).map(({ username, password }) => (
+                          <article
+                            key={username}
+                            className="guest-login-card flex h-52 w-full max-w-[22rem] flex-col justify-between rounded-xl border-2 border-dashed border-slate-400 bg-white p-5"
+                          >
+                            <div className="flex items-start justify-between gap-3">
+                              <div>
+                                <p className="text-[10px] font-bold uppercase tracking-[0.2em] text-blue-800">Student login</p>
+                                <p className="mt-1 text-xs text-slate-500">Reusable classroom account</p>
+                              </div>
+                              <span className="rounded-full bg-blue-50 px-2 py-1 text-xs font-bold text-blue-800">GUEST</span>
+                            </div>
+                            <div className="grid grid-cols-2 gap-3">
+                              <div>
+                                <p className="text-[10px] font-semibold uppercase tracking-wide text-slate-500">Username</p>
+                                <p className="mt-1 font-mono text-2xl font-bold tracking-wider text-slate-950">{username}</p>
+                              </div>
+                              <div>
+                                <p className="text-[10px] font-semibold uppercase tracking-wide text-slate-500">Password</p>
+                                <p className="mt-1 font-mono text-lg font-bold tracking-wide text-slate-950">{password}</p>
+                              </div>
+                            </div>
+                            <p className="text-[10px] text-slate-500">Keep this card for future classroom use.</p>
+                          </article>
+                        ))}
+                      </div>
+                    ))}
+                  </div>
+                </div>
+              ), document.body)}
               <fieldset className="rounded-xl border border-violet-200 bg-violet-50 px-5 py-4">
                 <legend className="text-sm font-semibold text-violet-950">Robot speaker volume</legend>
                 <p className="mt-1 text-xs text-violet-900">
@@ -5507,17 +6232,142 @@ export default function App() {
         </div>
       )}
 
-      {isSimulatorOpen && (
-      <div className="fixed inset-0 z-50 bg-slate-950/20" onClick={() => setIsSimulatorOpen(false)}>
+      {isLibraryOpen && (
+        <div className="fixed inset-0 z-[60] flex items-center justify-center bg-slate-950/50 p-4" onClick={() => setIsLibraryOpen(false)}>
+          <section
+            aria-label="Project library"
+            className="flex max-h-[90vh] w-full max-w-4xl flex-col overflow-hidden rounded-xl bg-white shadow-2xl"
+            onClick={(event) => event.stopPropagation()}
+          >
+            <header className="flex items-center justify-between border-b border-slate-200 bg-slate-50 px-5 py-4">
+              <div>
+                <h2 className="text-lg font-bold text-slate-800">Library</h2>
+                <p className="mt-1 text-xs text-slate-500">Saved projects, starter examples, and your saved code.</p>
+              </div>
+              <button
+                type="button"
+                onClick={() => setIsLibraryOpen(false)}
+                className="rounded-md px-3 py-1.5 text-sm font-medium text-slate-600 hover:bg-slate-200"
+              >
+                Close
+              </button>
+            </header>
+            <div className="grid gap-4 overflow-y-auto p-5 md:grid-cols-2">
+              {renderProjectLibrary()}
+              {renderStarterMotionLibrary()}
+              {currentUser.role === 'student' && (
+                <section className="rounded-xl border border-slate-200 bg-slate-50 p-3 md:col-span-2">
+                  <h3 className="text-sm font-semibold uppercase tracking-wide text-slate-700">My Saved Code</h3>
+                  <div className="mt-2 grid gap-2 sm:grid-cols-2">
+                    {savedCodes.length === 0 ? (
+                      <p className="text-xs text-slate-500">No saved code yet.</p>
+                    ) : savedCodes.map((code) => (
+                      <div key={code.name} className="rounded-lg border border-slate-200 bg-white p-3">
+                        <p className="text-sm font-medium text-slate-800">{code.name}</p>
+                        <p className="mt-1 text-xs text-slate-500">
+                          {code.code.slice(0, 60)}{code.code.length > 60 ? '...' : ''}
+                        </p>
+                        <button
+                          type="button"
+                          onClick={() => {
+                            updateGeneratedCode(code.code);
+                            setIsLibraryOpen(false);
+                          }}
+                          className="mt-2 text-xs text-blue-600 hover:text-blue-700"
+                        >
+                          Load
+                        </button>
+                      </div>
+                    ))}
+                  </div>
+                </section>
+              )}
+            </div>
+          </section>
+        </div>
+      )}
+
+      {starterMotionEditor && (
+        <div className="fixed inset-0 z-[70] flex items-center justify-center bg-slate-950/60 p-4">
+          <section
+            role="dialog"
+            aria-modal="true"
+            aria-labelledby="starter-motion-editor-title"
+            className="flex max-h-[90vh] w-full max-w-2xl flex-col rounded-xl bg-white shadow-2xl"
+          >
+            <header className="border-b border-slate-200 px-5 py-4">
+              <h2 id="starter-motion-editor-title" className="text-lg font-bold text-slate-800">
+                Edit shared {starterMotionEditor.controller_version.toUpperCase()} motion
+              </h2>
+              <p className="mt-1 text-xs text-slate-500">This stores only the command sequence, not a project environment.</p>
+            </header>
+            <div className="space-y-3 overflow-y-auto p-5">
+              <label className="block text-xs font-semibold text-slate-700">
+                Motion name
+                <input
+                  value={starterMotionEditor.name}
+                  onChange={(event) => setStarterMotionEditor((motion) => ({ ...motion, name: event.target.value }))}
+                  maxLength={80}
+                  className="mt-1 w-full rounded-md border border-slate-300 px-3 py-2 text-sm"
+                />
+              </label>
+              <label className="block text-xs font-semibold text-slate-700">
+                Sequence
+                <textarea
+                  value={starterMotionEditor.code}
+                  onChange={(event) => setStarterMotionEditor((motion) => ({ ...motion, code: event.target.value }))}
+                  rows={12}
+                  spellCheck={false}
+                  className="mt-1 w-full resize-y rounded-md border border-slate-300 bg-slate-950 p-3 font-mono text-xs leading-5 text-slate-100"
+                />
+              </label>
+            </div>
+            <footer className="flex justify-end gap-2 border-t border-slate-200 px-5 py-4">
+              <button type="button" onClick={() => setStarterMotionEditor(null)} className="rounded-md border border-slate-300 px-4 py-2 text-sm text-slate-700">
+                Cancel
+              </button>
+              <button type="button" onClick={saveStarterMotionEdit} className="rounded-md bg-blue-700 px-4 py-2 text-sm font-semibold text-white">
+                Save changes
+              </button>
+            </footer>
+          </section>
+        </div>
+      )}
+
+      {(isQueueOpen || isConnectionPanelOnly || isObjectPanelOpen) && (
+      <div
+        className="fixed inset-0 z-50 bg-slate-950/20"
+        onClick={() => {
+          setIsQueueOpen(false);
+          setIsConnectionPanelOnly(false);
+          setIsObjectPanelOpen(false);
+        }}
+      >
       <div className="absolute right-4 top-24 z-10 flex max-h-[calc(100vh-7rem)] w-[min(360px,calc(100vw-2rem))] flex-col gap-3 overflow-y-auto overscroll-contain pr-1" onClick={(event) => event.stopPropagation()}>
-        <div className="max-h-[420px] overflow-auto rounded-xl border border-slate-200 bg-white shadow-xl">
+        {isConnectionPanelOnly && (
+          <section role="dialog" aria-modal="true" aria-label="Robot connection panel" className="rounded-xl border border-slate-200 bg-white shadow-xl">
+            <header className="flex items-center justify-between border-b border-slate-200 bg-slate-50 p-3">
+              <h2 className="font-semibold text-slate-800">Connection</h2>
+              <button
+                type="button"
+                onClick={() => setIsConnectionPanelOnly(false)}
+                className="rounded-md p-1 text-slate-500 hover:bg-slate-200 hover:text-slate-800"
+                aria-label="Close connection panel"
+              >
+                <X size={16} />
+              </button>
+            </header>
+            <div ref={setConnectionTabTarget} className="p-3" />
+          </section>
+        )}
+        <div className={`max-h-[420px] overflow-auto rounded-xl border border-slate-200 bg-white shadow-xl ${isConnectionPanelOnly || isObjectPanelOpen ? 'hidden' : ''}`}>
           <div className="border-b border-slate-200 p-3 bg-slate-50 flex items-center justify-between">
-            <h3 className="font-semibold text-slate-800">{currentUser.role === 'teacher' ? 'Teacher Queue' : 'My Saved Code'}</h3>
+            <h3 className="font-semibold text-slate-800">Teacher Queue</h3>
             <div className="flex items-center gap-2">
               <span className="text-xs rounded-full bg-blue-100 text-blue-700 px-2 py-1" aria-label={`Classroom queue: ${classroomStatus}`}>
                 Queue: {classroomStatus}
               </span>
-              <button type="button" onClick={() => setIsSimulatorOpen(false)} className="rounded-md p-1 text-slate-500 hover:bg-slate-200 hover:text-slate-800" aria-label="Close simulator">
+              <button type="button" onClick={() => setIsQueueOpen(false)} className="rounded-md p-1 text-slate-500 hover:bg-slate-200 hover:text-slate-800" aria-label="Close queue">
                 <X size={16} />
               </button>
             </div>
@@ -5525,7 +6375,9 @@ export default function App() {
           <div className="p-3 space-y-3">
             {currentUser.role === 'teacher' && (
               <>
-                <div data-testid="teacher-robot-settings" className="rounded-xl border border-blue-200 bg-blue-50 p-3">
+                {connectionTabTarget && createPortal(
+                  <>
+                    <div data-testid="teacher-robot-settings" className="rounded-xl border border-blue-200 bg-blue-50 p-3">
                   <div className="flex items-center justify-between gap-2">
                     <p className="text-[10px] uppercase tracking-wide text-blue-700 font-semibold">Robot connection</p>
                     <span
@@ -5955,85 +6807,9 @@ export default function App() {
                   </p>
                 </div>
 
-                <div className="rounded-xl border border-slate-200 bg-slate-50 p-3">
-                  <p className="text-[10px] uppercase tracking-wide text-slate-600 font-semibold">Manage classroom accounts</p>
-                  <form onSubmit={handleCreateStudent} className="mt-2 space-y-2 rounded-lg border border-blue-100 bg-white p-2">
-                    <label className="block text-xs font-medium text-slate-700">
-                      Account type
-                      <select
-                        value={newStudent.role}
-                        onChange={(event) => setNewStudent({ ...newStudent, role: event.target.value })}
-                        className="mt-1 w-full rounded-lg border border-slate-200 px-2 py-1.5 text-sm"
-                      >
-                        <option value="student">Student</option>
-                        <option value="teacher">Teacher</option>
-                      </select>
-                    </label>
-                    <label className="block text-xs font-medium text-slate-700">
-                      New {newStudent.role} username
-                      <input
-                        type="text"
-                        value={newStudent.username}
-                        onChange={(event) => setNewStudent({ ...newStudent, username: event.target.value })}
-                        minLength={3}
-                        maxLength={32}
-                        pattern="[A-Za-z0-9_-]{3,32}"
-                        autoComplete="off"
-                        required
-                        className="mt-1 w-full rounded-lg border border-slate-200 px-2 py-1.5 text-sm"
-                        placeholder="student24"
-                      />
-                    </label>
-                    <label className="block text-xs font-medium text-slate-700">
-                      Initial password
-                      <input
-                        type="password"
-                        value={newStudent.password}
-                        onChange={(event) => setNewStudent({ ...newStudent, password: event.target.value })}
-                        minLength={8}
-                        maxLength={128}
-                        autoComplete="new-password"
-                        required
-                        className="mt-1 w-full rounded-lg border border-slate-200 px-2 py-1.5 text-sm"
-                      />
-                    </label>
-                    <p className="text-[10px] text-slate-500">Username: 3–32 letters, numbers, _ or -. Password: 8–128 characters.</p>
-                    <button
-                      type="submit"
-                      disabled={isCreatingStudent}
-                      className="w-full rounded-lg bg-blue-600 px-2 py-1.5 text-xs font-semibold text-white disabled:opacity-60"
-                    >
-                      {isCreatingStudent ? 'Creating…' : `Create ${newStudent.role} account`}
-                    </button>
-                  </form>
-                  {accountManagementError && (
-                    <p role="alert" className="mt-2 text-xs text-red-700">{accountManagementError}</p>
-                  )}
-                  <div className="mt-2 space-y-2">
-                    {teacherRoster.length === 0 ? (
-                      <p className="text-xs text-slate-500">No classroom accounts found.</p>
-                    ) : teacherRoster.map((user) => (
-                      <div key={user.username} className="flex items-center justify-between rounded-lg bg-white border border-slate-200 px-2 py-1.5">
-                        <span className="min-w-0 truncate text-sm text-slate-700">{user.username}</span>
-                        <div className="flex shrink-0 items-center gap-2">
-                          <span className="text-[10px] uppercase rounded-full bg-slate-100 text-slate-600 px-2 py-1">{user.role}</span>
-                          {user.username !== currentUser.username && (
-                            <button
-                              type="button"
-                              onClick={() => handleDeleteUser(user.username)}
-                              disabled={deletingUsername === user.username}
-                              aria-label={`Delete account ${user.username}`}
-                              className="rounded px-2 py-1 text-[10px] font-semibold text-red-700 hover:bg-red-50 disabled:opacity-50"
-                            >
-                              {deletingUsername === user.username ? 'Deleting…' : 'Delete'}
-                            </button>
-                          )}
-                        </div>
-                      </div>
-                    ))}
-                  </div>
-                </div>
-
+                  </>,
+                  connectionTabTarget,
+                )}
                 <div className="grid grid-cols-3 gap-2">
                   <button type="button" onClick={handleRunNext} className="rounded-lg bg-blue-600 px-2 py-2 text-[10px] font-semibold text-white hover:bg-blue-700">Run next</button>
                   <button type="button" onClick={handleStopCurrent} className="rounded-lg bg-amber-500 px-2 py-2 text-[10px] font-semibold text-slate-950 hover:bg-amber-400">Pause</button>
@@ -6042,7 +6818,7 @@ export default function App() {
               </>
             )}
 
-            {currentUser.role === 'teacher' ? (
+            {currentUser.role === 'teacher' && (
               <>
                 {queueItems.length === 0 ? <p className="text-sm text-slate-500">No student jobs queued.</p> : queueItems.map((item) => (
                   <div key={item.id} className="rounded-lg border border-slate-200 p-2">
@@ -6084,73 +6860,22 @@ export default function App() {
                     <button onClick={() => handleDeleteQueueItem(item.id)} className="mt-2 text-xs text-red-600 hover:text-red-700">Delete</button>
                   </div>
                 ))}
-
-                <div className="rounded-xl border border-slate-200 bg-slate-50 p-3">
-                  <p className="text-[10px] uppercase tracking-wide text-slate-600 font-semibold">Shared project library</p>
-                  <div className="mt-2 space-y-2">
-                    {projectLibrary.length === 0 ? (
-                      <p className="text-xs text-slate-500">No saved projects yet.</p>
-                    ) : projectLibrary.map((project) => (
-                      <div key={`${project.username}-${project.name}`} className="rounded-lg border border-slate-200 bg-white p-2">
-                        <div className="flex items-center justify-between gap-2">
-                          <span className="text-sm font-medium text-slate-800">{project.name}</span>
-                          <div className="flex shrink-0 items-center gap-1">
-                            {project.plannerMode && <span className="text-[9px] uppercase rounded-full bg-cyan-100 text-cyan-800 px-2 py-1">{PLANNER_MODE_LABELS[project.plannerMode] || project.plannerMode}</span>}
-                            <span className="text-[10px] uppercase rounded-full bg-slate-100 text-slate-600 px-2 py-1">{project.username}</span>
-                          </div>
-                        </div>
-                        <div className="mt-2 flex flex-wrap items-center gap-3">
-                          <button type="button" onClick={() => loadProjectFromLibrary(project)} className="text-xs text-blue-600 hover:text-blue-700">Open project</button>
-                          <button type="button" onClick={() => handleRenameProject(project)} className="text-xs text-slate-600 hover:text-slate-900">Rename</button>
-                          <button type="button" onClick={() => handleDeleteProject(project)} className="text-xs text-red-600 hover:text-red-700">Delete</button>
-                        </div>
-                      </div>
-                    ))}
-                  </div>
-                </div>
-                {renderStarterMotionLibrary()}
-              </>
-            ) : (
-              <>
-                <div className="rounded-xl border border-slate-200 bg-slate-50 p-3">
-                  <p className="text-[10px] uppercase tracking-wide text-slate-600 font-semibold">Shared project library</p>
-                  <div className="mt-2 space-y-2">
-                    {projectLibrary.length === 0 ? (
-                      <p className="text-xs text-slate-500">No saved projects yet.</p>
-                    ) : projectLibrary.map((project) => (
-                      <div key={`${project.username}-${project.name}`} className="rounded-lg border border-slate-200 bg-white p-2">
-                        <div className="flex items-center justify-between gap-2">
-                          <span className="min-w-0 truncate text-sm font-medium text-slate-800">{project.name}</span>
-                          <div className="flex shrink-0 items-center gap-1">
-                            {project.plannerMode && <span className="text-[9px] uppercase rounded-full bg-cyan-100 text-cyan-800 px-2 py-1">{PLANNER_MODE_LABELS[project.plannerMode] || project.plannerMode}</span>}
-                            <span className="text-[10px] uppercase rounded-full bg-slate-100 text-slate-600 px-2 py-1">{project.username}</span>
-                          </div>
-                        </div>
-                        <button type="button" onClick={() => loadProjectFromLibrary(project)} className="mt-2 text-xs text-blue-600 hover:text-blue-700">Open project</button>
-                      </div>
-                    ))}
-                  </div>
-                </div>
-                {renderStarterMotionLibrary()}
-                {savedCodes.length === 0 ? <p className="text-sm text-slate-500">No saved code yet.</p> : savedCodes.map((code) => (
-                  <div key={code.name} className="rounded-lg border border-slate-200 p-2">
-                    <p className="font-medium text-slate-800 text-sm">{code.name}</p>
-                    <p className="text-xs text-slate-500 mt-1">{code.code.slice(0, 60)}{code.code.length > 60 ? '...' : ''}</p>
-                    <button type="button" onClick={() => updateGeneratedCode(code.code)} className="mt-2 text-xs text-blue-600 hover:text-blue-700">Load</button>
-                  </div>
-                ))}
               </>
             )}
           </div>
         </div>
 
-        <div className="flex max-h-[calc(100vh-8rem)] min-h-0 flex-col rounded-xl border border-slate-200 bg-white shadow-xl">
-          <div className="border-b border-slate-200 bg-slate-50 p-3 flex items-center justify-between">
-            <div>
-              <h3 className="font-semibold text-slate-800">{G1_EDU_23_ENV.robotType} Internal Simulator</h3>
-              <p className="text-[10px] uppercase tracking-wide text-slate-500">23-DoF local environment</p>
-            </div>
-            <span className="text-xs rounded-full bg-emerald-100 text-emerald-700 px-2 py-1">{simulatorState.status}</span>
+        <div
+          role="dialog"
+          aria-modal="true"
+          aria-label="Object area"
+          className={`flex max-h-[calc(100vh-8rem)] min-h-0 flex-col rounded-xl border border-slate-200 bg-white shadow-xl ${isObjectPanelOpen ? '' : 'hidden'}`}
+        >
+          <div className="flex items-center justify-between border-b border-slate-200 bg-slate-50 p-3">
+            <h2 className="font-semibold text-slate-800">Objects</h2>
+            <button type="button" onClick={() => setIsObjectPanelOpen(false)} aria-label="Close object area" className="rounded-md p-1 text-slate-500 hover:bg-slate-200 hover:text-slate-800">
+              <X size={16} />
+            </button>
           </div>
 
           <div className="border-b border-slate-200 bg-slate-50 px-3 pt-3">
@@ -6158,14 +6883,12 @@ export default function App() {
               {[
                 { id: 'add-object', label: 'Add Object' },
                 { id: 'scene-objects', label: 'Scene Objects' },
-                { id: 'settings', label: 'Settings' },
               ].map((tab) => (
                 <button
                   key={tab.id}
                   type="button"
-                  onClick={() => setSimulatorSidebarTab(tab.id)}
-                  aria-label={tab.id === 'settings' ? 'Open simulator settings panel' : tab.label}
-                  className={`flex-1 rounded-t-md border-b-2 px-2 py-2 text-[10px] font-semibold uppercase tracking-wide transition ${simulatorSidebarTab === tab.id ? 'border-blue-600 bg-white text-blue-700' : 'border-transparent bg-slate-100 text-slate-500 hover:bg-slate-200'}`}
+                  onClick={() => setObjectPanelTab(tab.id)}
+                  className={`flex-1 rounded-t-md border-b-2 px-2 py-2 text-[10px] font-semibold uppercase tracking-wide transition ${objectPanelTab === tab.id ? 'border-blue-600 bg-white text-blue-700' : 'border-transparent bg-slate-100 text-slate-500 hover:bg-slate-200'}`}
                 >
                   {tab.label}
                 </button>
@@ -6174,7 +6897,7 @@ export default function App() {
           </div>
 
           <div className="min-h-0 flex-1 space-y-3 overflow-y-auto overscroll-contain p-3">
-            {simulatorSidebarTab === 'add-object' && (
+            {objectPanelTab === 'add-object' && (
               <>
                 <div className="grid grid-cols-3 gap-2">
                   {OBJECT_LIBRARY.map((objectType) => (
@@ -6193,7 +6916,7 @@ export default function App() {
               </>
             )}
 
-            {simulatorSidebarTab === 'scene-objects' && (
+            {objectPanelTab === 'scene-objects' && (
               <div className="space-y-2">
                 {sceneObjects.length === 0 ? (
                   <p className="rounded-lg border border-dashed border-slate-200 bg-slate-50 p-3 text-xs text-slate-500">No scene objects yet. Add one from the object library.</p>
@@ -6249,163 +6972,6 @@ export default function App() {
               </div>
             )}
 
-            {simulatorSidebarTab === 'settings' && (
-              <div className="space-y-3">
-                <div className="rounded-lg border border-slate-200 bg-white p-2">
-                  <p className="text-[10px] uppercase tracking-wide text-slate-500 mb-2">Preview mode</p>
-                  <div className="flex gap-2">
-                    {Object.entries(SIMULATOR_MODES).map(([key, mode]) => (
-                      <button
-                        key={key}
-                        type="button"
-                        onClick={() => setSimulatorMode(key)}
-                        className={`flex-1 rounded-lg px-2 py-1.5 text-[10px] font-semibold transition ${simulatorMode === key ? 'bg-blue-600 text-white' : 'bg-slate-100 text-slate-600 hover:bg-slate-200'}`}
-                      >
-                        {mode.label}
-                      </button>
-                    ))}
-                  </div>
-                </div>
-
-                <div className="rounded-lg border border-slate-200 bg-white p-2 text-[10px] text-slate-600">
-                  <label className="flex items-center justify-between font-semibold">
-                    <span>Grid size</span>
-                    <span>{gridSize} m x {gridSize} m</span>
-                  </label>
-                  <input type="range" min="10" max="80" step="1" value={gridSize} onChange={(event) => setGridSize(Number(event.target.value))} className="mt-2 w-full accent-blue-600" />
-                  <label className="mt-3 flex items-center justify-between font-semibold">
-                    <span>Simulation speed</span>
-                    <span>{playbackSpeed.toFixed(1)}x</span>
-                  </label>
-                  <input type="range" min="0.1" max="3" step="0.1" value={playbackSpeed} onChange={(event) => setPlaybackSpeed(Number(event.target.value))} className="mt-2 w-full accent-cyan-600" />
-                  <p className="mt-2 text-[10px] text-slate-500">Speed changes timing only. Distances remain in meters.</p>
-                </div>
-
-              </div>
-            )}
-
-            <div className="rounded-xl border border-slate-200 bg-slate-100 p-2">
-              <svg viewBox="0 0 220 220" className="block aspect-square w-full" onPointerMove={handleScenePointerMove} onPointerUp={handleScenePointerUp} onPointerLeave={handleScenePointerUp}>
-                <defs>
-                  <pattern id="grid-pattern" width={sceneScale} height={sceneScale} patternUnits="userSpaceOnUse">
-                      <path d={`M ${sceneScale} 0 L 0 0 0 ${sceneScale}`} fill="none" stroke="#dfe7f3" strokeWidth="0.25"/>
-                  </pattern>
-                </defs>
-                <rect x="0" y="0" width="220" height="220" fill="url(#grid-pattern)" rx="12"/>
-                {sharedLidarOverlayEnabled && sharedLidarMap?.map?.map && (
-                  <g pointerEvents="none">
-                    <path
-                      data-testid="shared-lidar-grid-overlay"
-                      d={sharedGridOverlayPath}
-                      fill="#ef4444"
-                      fillOpacity="0.24"
-                      stroke="#b91c1c"
-                      strokeOpacity="0.35"
-                      strokeWidth="0.35"
-                    />
-                    <g data-testid="shared-lidar-pointcloud-overlay">
-                      {sharedPointCloudPreview.map((point, index) => (
-                        <circle
-                          key={`${index}-${point.x}-${point.y}`}
-                          cx={sceneX(point.x)}
-                          cy={sceneY(point.y)}
-                          r={Math.max(0.45, Math.min(1.4, sceneScale * 0.025))}
-                          fill={point.z < 0.25 ? '#2563eb' : point.z < 1.2 ? '#16a34a' : point.z < 2.2 ? '#f59e0b' : '#a855f7'}
-                          fillOpacity="0.72"
-                        />
-                      ))}
-                    </g>
-                  </g>
-                )}
-                {session?.user?.role === 'teacher' && lidarScanJob?.status === 'scanning' && (
-                  <g data-testid="live-lidar-scan-preview" pointerEvents="none">
-                    {liveLidarScanPoints.map((point, index) => (
-                      <circle
-                        key={`live-${index}-${point.x}-${point.y}`}
-                        cx={sceneX(point.x)}
-                        cy={sceneY(point.y)}
-                        r={Math.max(0.5, Math.min(1.5, sceneScale * 0.03))}
-                        fill={point.z < 0.25 ? '#2563eb' : point.z < 1.2 ? '#16a34a' : point.z < 2.2 ? '#f59e0b' : '#a855f7'}
-                        fillOpacity="0.8"
-                      />
-                    ))}
-                  </g>
-                )}
-                {activeObstacles.map((obstacle) => {
-                  const isStudentObstacle = String(obstacle.id).startsWith('student-');
-                  const isDragging = activeDragItem?.kind === 'obstacle' && activeDragItem.id === obstacle.id;
-                  const color = obstacle.color || (isStudentObstacle ? '#a78bfa' : '#fbbf24');
-                  const centerX = sceneX(obstacle.x);
-                  const centerY = sceneY(obstacle.y);
-                  const size = (obstacle.radius / 12) * sceneScale;
-                  const dimensions = getSceneObjectDimensions(obstacle);
-                  const baseDimensions = getSceneObjectBaseDimensions(obstacle.type, obstacle.radius);
-                  const objectScaleX = dimensions.width / baseDimensions.width;
-                  const objectScaleY = dimensions.depth / baseDimensions.depth;
-                  return (
-                    <g key={obstacle.id} onPointerDown={(event) => handleObstaclePointerDown(event, obstacle.id)} style={{ cursor: isDragging ? 'grabbing' : 'grab' }}>
-                      <g data-obstacle-type={obstacle.type || 'unknown'}>
-                      {(isDragging || selectedSceneObjectId === obstacle.id) && <circle cx={centerX} cy={centerY} r={size + 4} fill="none" stroke="#0891b2" strokeWidth="2" strokeDasharray="4 2" />}
-                      <g transform={`translate(${centerX} ${centerY}) scale(${objectScaleX} ${objectScaleY}) translate(${-centerX} ${-centerY})`}>
-                      <SceneObstacleShape
-                        obstacle={obstacle}
-                        centerX={centerX}
-                        centerY={centerY}
-                        size={size}
-                        color={color}
-                        opacity={isStudentObstacle ? 0.45 : 0.35}
-                        stroke={isStudentObstacle ? '#7c3aed' : '#f59e0b'}
-                        strokeWidth={2.5}
-                        strokeDasharray="0"
-                      />
-                      </g>
-                      <text x={centerX} y={centerY + 4} textAnchor="middle" fontSize="8" fill="#fff">drag</text>
-                      </g>
-                    </g>
-                  );
-                })}
-                {plannerWaypoints.length > 0 && (
-                  <g>
-                    <polyline
-                      points={plannerWaypoints.map((point) => `${sceneX(point.x)},${sceneY(point.y)}`).join(' ')}
-                      fill="none"
-                      stroke="#22c55e"
-                      strokeWidth="3"
-                      strokeDasharray="6 4"
-                      opacity="0.9"
-                    />
-                    {plannerWaypoints.map((point, index) => (
-                      <g key={point.id} onPointerDown={(event) => handlePlannerWaypointPointerDown(event, point.id)} style={{ cursor: activeDragItem?.kind === 'waypoint' && activeDragItem.id === point.id ? 'grabbing' : 'grab' }}>
-                        {activeDragItem?.kind === 'waypoint' && activeDragItem.id === point.id && <circle cx={sceneX(point.x)} cy={sceneY(point.y)} r="10" fill="none" stroke="#0891b2" strokeWidth="2" strokeDasharray="4 2" />}
-                        <circle cx={sceneX(point.x)} cy={sceneY(point.y)} r="6" fill="#22c55e" stroke="#14532d" strokeWidth="2" />
-                        <text x={sceneX(point.x)} y={sceneY(point.y) + 3} textAnchor="middle" fontSize="7" fill="#fff" fontWeight="700">{index + 1}</text>
-                      </g>
-                    ))}
-                  </g>
-                )}
-                {simulatorState.goal && (
-                  <g>
-                    <circle cx={sceneX(simulatorState.goal.x)} cy={sceneY(simulatorState.goal.y)} r={simulatorState.goal.radius * sceneScale} fill={simulatorState.goalReached ? '#34d399' : '#a7f3d0'} fillOpacity="0.35" stroke="#22c55e" strokeWidth="2"/>
-                    <text x={sceneX(simulatorState.goal.x)} y={sceneY(simulatorState.goal.y) - 12} textAnchor="middle" fontSize="9" fill="#166534" fontWeight="700">GOAL</text>
-                  </g>
-                )}
-                <polyline
-                  points={simulatorState.path.map((point) => `${sceneX(point.x)},${sceneY(point.y)}`).join(' ')}
-                  fill="none"
-                  stroke="#60a5fa"
-                  strokeWidth="3"
-                  strokeLinejoin="round"
-                  strokeLinecap="round"
-                  opacity="0.9"
-                />
-                <g transform={`translate(${sceneX(simulatorState.x)}, ${sceneY(simulatorState.y)}) rotate(${simulatorState.heading})`}>
-                  <rect x="-12" y="-10" width="24" height="20" rx="6" fill="#2563eb" stroke="#0f172a" strokeWidth="2"/>
-                  <polygon points="18,0 28,6 18,12" fill="#f59e0b"/>
-                  <circle cx="0" cy="0" r="3" fill="#f8fafc"/>
-                </g>
-              </svg>
-            </div>
-
           </div>
         </div>
       </div>
@@ -6413,43 +6979,54 @@ export default function App() {
       )}
 
       <div ref={sceneShellRef} className="relative flex-1 overflow-hidden scene-shell">
-        <div className="absolute inset-0 bg-[radial-gradient(circle_at_top,_rgba(148,163,184,0.28),_rgba(15,23,42,0.04)_45%,_rgba(15,23,42,0.1))]" />
-        <div className="scene-platform absolute left-[-8%] right-[-8%] top-[16%] bottom-[-8%] rounded-[28%]" />
-        <G1Simulation3D
-          code={generatedCode}
-          simulatorState={simulatorState}
-          controllerVersion={controllerVersion}
-          obstacles={activeObstacles}
-          waypoints={plannerWaypoints}
-          isWaypointPlacementEnabled={isWaypointPlacementEnabled}
-          onObstacleSelect={selectSceneObject}
-          onObstacleChange={updateStudentObstacle}
-          onWaypointChange={updatePlannerWaypoint}
-          onWaypointPlace={placePlannerWaypoint}
-          isPlaying={isPreviewPlaying}
-          playbackSpeed={playbackSpeed}
-          playbackProgress={playbackProgress}
-          gridSize={gridSize}
-          onPlaybackProgress={setPlaybackProgress}
-          onPlaybackToggle={(playing) => playing ? startSimulationPreview() : pauseSimulationPreview()}
-          onPlaybackReset={resetSimulationPreview}
-          onPlaybackSpeedChange={handlePlaybackSpeedChange}
-        />
+        {isSimulationVisible && (
+          <>
+            <div className="absolute inset-0 bg-[radial-gradient(circle_at_top,_rgba(148,163,184,0.28),_rgba(15,23,42,0.04)_45%,_rgba(15,23,42,0.1))]" />
+            <div className="scene-platform absolute left-[-8%] right-[-8%] top-[16%] bottom-[-8%] rounded-[28%]" />
+            <div data-testid="simulation-view" className="absolute inset-0">
+              <G1Simulation3D
+                code={generatedCode}
+                simulatorState={simulatorState}
+                controllerVersion={controllerVersion}
+                obstacles={activeObstacles}
+                waypoints={plannerWaypoints}
+                isWaypointPlacementEnabled={isWaypointPlacementEnabled}
+                onObstacleSelect={selectSceneObject}
+                onObstacleChange={updateStudentObstacle}
+                onWaypointChange={updatePlannerWaypoint}
+                onWaypointPlace={placePlannerWaypoint}
+                isPlaying={isPreviewPlaying}
+                playbackSpeed={playbackSpeed}
+                playbackProgress={playbackProgress}
+                gridSize={gridSize}
+                onPlaybackProgress={setPlaybackProgress}
+                onPlaybackToggle={(playing) => playing ? startSimulationPreview() : pauseSimulationPreview()}
+                onPlaybackReset={resetSimulationPreview}
+                onPlaybackSpeedChange={handlePlaybackSpeedChange}
+                workspacePanelRef={workspacePanelRef}
+              />
+            </div>
+          </>
+        )}
 
         <div
-          className="absolute z-40 flex flex-col overflow-visible rounded-xl border border-slate-700 bg-slate-950/90 shadow-[0_0_30px_rgba(15,23,42,0.5)] backdrop-blur-sm"
+          ref={workspacePanelRef}
+          data-testid="workspace-panel"
+          className={`z-40 flex flex-col overflow-visible border border-slate-700 bg-slate-950/90 shadow-[0_0_30px_rgba(15,23,42,0.5)] backdrop-blur-sm ${isSimulationVisible ? 'absolute rounded-xl' : 'relative h-full w-full rounded-none shadow-none'}`}
           style={{
-            top: toolPanelRect.top,
-            right: toolPanelCollapsed ? 16 : toolPanelRect.right,
-            width: toolPanelCollapsed ? 48 : `min(${toolPanelRect.width}px, calc(100% - 16px))`,
-            height: toolPanelCollapsed ? 48 : `min(${toolPanelRect.height}px, calc(100% - 16px))`,
-            maxHeight: 'calc(100% - 16px)',
+            ...(isSimulationVisible ? {
+              top: toolPanelRect.top,
+              right: toolPanelCollapsed ? 16 : toolPanelRect.right,
+              width: toolPanelCollapsed ? 48 : `min(${toolPanelRect.width}px, calc(100% - 16px))`,
+              height: toolPanelCollapsed ? 48 : `min(${toolPanelRect.height}px, calc(100% - 16px))`,
+              maxHeight: 'calc(100% - 16px)',
+            } : {}),
           }}
           onPointerMove={updateToolPanelInteraction}
           onPointerUp={endToolPanelInteraction}
           onPointerCancel={endToolPanelInteraction}
         >
-          {!toolPanelCollapsed && (
+          {isSimulationVisible && !toolPanelCollapsed && (
             <>
               <div className="absolute -left-1 top-3 bottom-3 z-40 w-2 cursor-ew-resize" onPointerDown={(event) => beginToolPanelInteraction(event, 'left')} />
               <div className="absolute -right-1 top-3 bottom-3 z-40 w-2 cursor-ew-resize" onPointerDown={(event) => beginToolPanelInteraction(event, 'right')} />
@@ -6461,7 +7038,10 @@ export default function App() {
               <div className="absolute -right-1 -bottom-1 z-40 h-3 w-3 cursor-nwse-resize" onPointerDown={(event) => beginToolPanelInteraction(event, 'right bottom')} />
             </>
           )}
-          <div className="flex cursor-move items-center justify-between border-b border-slate-700 bg-slate-900 px-2 py-2" onPointerDown={(event) => beginToolPanelInteraction(event, 'move')}>
+          <div
+            className={`flex items-center justify-between border-b border-slate-700 bg-slate-900 px-2 py-2 ${isSimulationVisible ? 'cursor-move' : ''}`}
+            onPointerDown={isSimulationVisible ? (event) => beginToolPanelInteraction(event, 'move') : undefined}
+          >
             <button
               type="button"
               onClick={() => setToolPanelCollapsed((value) => !value)}
@@ -6491,15 +7071,18 @@ export default function App() {
                   </button>
                 )}
                 {currentUser.role === 'teacher' && (
-                  <button type="button" onClick={() => setIsSimulatorOpen(true)} className="flex-1 rounded-md bg-blue-500 px-2 py-2 text-[10px] font-bold text-white hover:bg-blue-400">
+                  <button type="button" onClick={() => { setIsConnectionPanelOnly(false); setIsQueueOpen(true); }} className="flex-1 rounded-md bg-blue-500 px-2 py-2 text-[10px] font-bold text-white hover:bg-blue-400">
                     Open queue
                   </button>
                 )}
-                {currentUser.role === 'student' && (
-                  <button type="button" onClick={() => setIsSimulatorOpen(true)} className="rounded-md bg-slate-700 px-2 py-2 text-[10px] font-bold text-white hover:bg-slate-600" title="Open saved code">
+                <button
+                  type="button"
+                  onClick={() => setIsLibraryOpen(true)}
+                  className="rounded-md bg-slate-700 px-2 py-2 text-[10px] font-bold text-white hover:bg-slate-600"
+                  title="Open project library"
+                >
                     Library
-                  </button>
-                )}
+                </button>
                 {currentUser.role === 'teacher' && (
                   <button
                     type="button"
@@ -6515,6 +7098,32 @@ export default function App() {
               <div className="mt-2 flex items-center justify-between text-[10px] text-slate-400">
                 <span>{currentUser.role === 'teacher' ? 'Teacher workspace' : 'Student workspace'}</span>
                 <div className="flex items-center gap-2">
+                  {currentUser.role === 'teacher' && (
+                    <button
+                      type="button"
+                      onClick={() => {
+                        setIsQueueOpen(false);
+                        setIsObjectPanelOpen(false);
+                        setIsConnectionPanelOnly(true);
+                      }}
+                      aria-label="Open robot connection"
+                      className="text-slate-300 hover:text-white"
+                    >
+                      Connection
+                    </button>
+                  )}
+                  <button
+                    type="button"
+                    onClick={() => {
+                      setIsQueueOpen(false);
+                      setIsConnectionPanelOnly(false);
+                      setIsObjectPanelOpen(true);
+                    }}
+                    aria-label="Open objects area"
+                    className="text-slate-300 hover:text-white"
+                  >
+                    Objects
+                  </button>
                   <div className="relative">
                     <button
                       type="button"
@@ -6556,6 +7165,10 @@ export default function App() {
                         onClick={(event) => event.stopPropagation()}
                       >
                         <MenuItem dark label={t.actSaveToAccount} icon={Save} onClick={() => { handleSaveCodeToAccount(); setActiveMenu(null); }} />
+                        <MenuItem dark label="Save as Project" icon={Save} onClick={() => { promptSaveNamedProject(); setActiveMenu(null); }} />
+                        {currentUser.role === 'teacher' && (
+                          <MenuItem dark label="Save as Starter Motion" icon={Save} onClick={() => { saveAsStarterMotion(); setActiveMenu(null); }} />
+                        )}
                         <div className="my-1 h-px bg-slate-700"></div>
                         <MenuItem dark label={t.actNew} icon={FileText} onClick={() => { handleClear(); setActiveMenu(null); }} />
                         <MenuItem dark label={t.actImportJson} icon={FolderOpen} onClick={handleOpenProjectClick} />
@@ -6570,19 +7183,6 @@ export default function App() {
                       document.body,
                     )}
                   </div>
-                  <button type="button" onClick={handleLogout} className="text-slate-300 hover:text-white">Logout</button>
-                  {currentUser.role === 'teacher' && (
-                    <>
-                      <button
-                        type="button"
-                        onClick={() => setShowConfigEditor(true)}
-                        aria-label="Open robot configuration"
-                        className="text-slate-300 hover:text-white"
-                      >
-                        Configure
-                      </button>
-                    </>
-                  )}
                   <button
                     type="button"
                     onClick={() => setShowAppSettings(true)}
@@ -6591,6 +7191,17 @@ export default function App() {
                   >
                     Settings
                   </button>
+                  {currentUser.role === 'teacher' && (
+                    <button
+                      type="button"
+                      onClick={() => setShowConfigEditor(true)}
+                      aria-label="Open robot configuration"
+                      className="text-slate-300 hover:text-white"
+                    >
+                      Configure
+                    </button>
+                  )}
+                  <button type="button" onClick={handleLogout} className="text-slate-300 hover:text-white">Logout</button>
                 </div>
               </div>
             </div>
@@ -7637,61 +8248,79 @@ export default function App() {
                   <div className="min-h-0 flex-[2_1_0%] overflow-y-auto space-y-3 text-slate-200">
                     <div className="rounded-xl border border-slate-700 bg-slate-900 p-3">
                       <p className="text-[10px] uppercase tracking-[0.18em] text-slate-400">
-                        {controllerVersion === 'duet' ? 'Executable DUET commands' : 'Executable robot commands'}
+                        {controllerVersion === 'duet' ? 'DUET command reference' : 'Legacy command reference'}
                       </p>
-                      <div className="mt-2 max-h-56 space-y-2 overflow-y-auto text-[10px]">
-                        {(controllerVersion === 'duet'
-                          ? getDuetCommandExamples(savedDuetMotions).map((example) => ({
-                            ...example,
-                            method: example.key,
-                            description: example.label,
-                            script: example.code,
-                          }))
-                          : legacyCommandsForCurrentUser).flatMap((command) => {
-                          if (controllerVersion === 'duet') {
-                            return [{
-                              ...command,
-                            }];
-                          }
-                          if (command.method === 'arm_action') {
-                            return command.args[0].choices.map(([presetLabel, preset]) => ({
-                              ...command,
-                              key: `arm_action_${preset}`,
-                              script: `robot.arm_action(${JSON.stringify(preset)})`,
-                              label: `Arm preset: ${presetLabel.replace(/ \(\d+\)$/, '')}`,
-                              description: G1_ARM_PRESET_DESCRIPTIONS[preset],
-                            }));
-                          }
-                          const args = command.args.map((argument) => argument.kind === 'choice'
-                            ? `"${argument.value}"`
-                            : argument.kind === 'text'
-                              ? JSON.stringify(argument.value)
-                              : String(argument.value));
-                          return [{
-                            ...command,
-                            key: command.method,
-                            script: `robot.${command.method}(${args.join(', ')})`,
-                            label: command.label,
-                          }];
-                        }).map((command) => (
-                          <div key={command.key} className="rounded-md bg-slate-800 px-2 py-1.5">
-                            <span className="block text-slate-200">{command.label}</span>
-                            <code className="text-cyan-300">{command.script}</code>
-                            <p className="mt-1 text-slate-400">{command.description}</p>
-                            {controllerVersion === 'legacy' && command.sdkMethod
-                              ? <p className="mt-1 text-emerald-300">Unitree SDK: {command.sdkMethod}</p>
-                              : controllerVersion === 'legacy' && command.method === 'wait'
-                                ? <p className="mt-1 text-emerald-300">Runs as a timed pause.</p>
-                                : null}
-                            {controllerVersion === 'legacy' && command.method === 'arm_action' && <p className="mt-1 text-amber-300">Stop cannot cancel an arm preset; keep the area clear.</p>}
-                            {controllerVersion === 'legacy' && !command.adapters.simulator && <p className="mt-1 text-amber-300">Hardware only; not simulated.</p>}
+                      <input
+                        type="search"
+                        aria-label="Search IDE commands and shared motions"
+                        value={ideCommandSearch}
+                        onChange={(event) => setIdeCommandSearch(event.target.value)}
+                        placeholder="Search commands and shared motions"
+                        className="mt-2 w-full rounded-md border border-slate-700 bg-slate-950 px-2 py-1.5 text-[10px] text-slate-100"
+                      />
+                      <div className="mt-2 space-y-1.5 text-[10px]">
+                        {(() => {
+                          const query = ideCommandSearch.trim().toLocaleLowerCase();
+                          const visibleEntries = ideCommandEntries.filter((entry) => (
+                            !query || `${entry.label} ${entry.script} ${entry.description}`.toLocaleLowerCase().includes(query)
+                          ));
+                          const categories = [...new Set(visibleEntries.map((entry) => entry.category))];
+                          return categories.map((category) => (
+                            <details key={category} className="rounded-md bg-slate-800 px-2 py-1.5">
+                              <summary className="cursor-pointer font-semibold text-slate-200">
+                                {category} <span className="text-slate-500">({visibleEntries.filter((entry) => entry.category === category).length})</span>
+                              </summary>
+                              <div className="mt-2 space-y-2">
+                                {visibleEntries.filter((entry) => entry.category === category).map((entry) => (
+                                  <div key={entry.key} className="border-t border-slate-700 pt-2">
+                                    <span className="block text-slate-200">{entry.label}</span>
+                                    <code className="break-all text-cyan-300">{entry.script}</code>
+                                    <p className="mt-1 text-slate-400">{entry.description}</p>
+                                    {controllerVersion === 'legacy' && entry.sdkMethod && (
+                                      <p className="mt-1 text-emerald-300">Unitree SDK: {entry.sdkMethod}</p>
+                                    )}
+                                    {controllerVersion === 'legacy' && entry.method === 'arm_action' && (
+                                      <p className="mt-1 text-amber-300">Stop cannot cancel an arm preset; keep the area clear.</p>
+                                    )}
+                                    {controllerVersion === 'legacy' && entry.adapters && !entry.adapters.simulator && (
+                                      <p className="mt-1 text-amber-300">Hardware only; not simulated.</p>
+                                    )}
+                                  </div>
+                                ))}
+                              </div>
+                            </details>
+                          ));
+                        })()}
+                        <details className="rounded-md border border-cyan-800 bg-slate-800 px-2 py-1.5">
+                          <summary className="cursor-pointer font-semibold text-cyan-200">
+                            Shared {controllerVersion.toUpperCase()} motions
+                          </summary>
+                          <div className="mt-2 space-y-2">
+                            {sharedMotions
+                              .filter((motion) => motion.controller_version === controllerVersion)
+                              .filter((motion) => !ideCommandSearch.trim()
+                                || `${motion.name} ${motion.code}`.toLocaleLowerCase().includes(ideCommandSearch.trim().toLocaleLowerCase()))
+                              .map((motion) => (
+                                <details key={motion.id} className="rounded bg-slate-900 p-2">
+                                  <summary className="cursor-pointer text-slate-100">{motion.name}</summary>
+                                  <p className="mt-1 text-slate-400">Type this stable call into the IDE when you want to run the shared sequence:</p>
+                                  <code className="mt-1 block break-all text-cyan-300">
+                                    {controllerVersion === 'duet' ? 'duet' : 'robot'}.shared_motion({JSON.stringify(motion.id)})
+                                  </code>
+                                  <pre className="mt-2 max-h-40 overflow-auto whitespace-pre-wrap break-words rounded bg-slate-950 p-2 font-mono text-slate-300">{motion.code}</pre>
+                                </details>
+                              ))}
+                            {sharedMotions.filter((motion) => motion.controller_version === controllerVersion).length === 0 && (
+                              <p className="text-slate-400">No shared motions for this controller yet.</p>
+                            )}
                           </div>
-                        ))}
-                        <div className="rounded-md bg-slate-800 px-2 py-1.5">
-                          <code className="text-cyan-300">for _ in range(3):</code>
+                        </details>
+                        <details className="rounded-md bg-slate-800 px-2 py-1.5">
+                          <summary className="cursor-pointer font-semibold text-slate-200">Loops</summary>
+                          <code className="mt-2 block text-cyan-300">for _ in range(3):</code>
                           <code className="block pl-3 text-cyan-300">{controllerVersion === 'duet' ? 'duet.move(0.15, 0, 0, 1)' : 'robot.walk(2)'}</code>
                           <p className="mt-1 text-slate-400">Repeat an indented group of commands.</p>
-                        </div>
+                        </details>
                       </div>
                     </div>
                     <textarea

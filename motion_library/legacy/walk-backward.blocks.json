@@ -20,7 +20,7 @@
       "type": "g1_command_backward",
       "method": "backward",
       "inputs": [
-        "1"
+        "2"
       ]
     }
   ]

@@ -116,6 +116,14 @@ test('G1 command catalog emits matching bounded Blockly commands', () => {
   );
 });
 
+test('Legacy shared-motion calls parse as stable references for Blockly and IDE previews', () => {
+  const parsed = parseG1Program('robot.shared_motion("sm_0123456789abcdef")');
+  assert.equal(parsed[0].method, 'shared_motion');
+  assert.deepEqual(parsed[0].values, ['sm_0123456789abcdef']);
+  assert.equal(parsed[0].code, 'robot.shared_motion("sm_0123456789abcdef")');
+  assert.throws(() => parseG1Program('robot.shared_motion(name)'), /quoted string/);
+});
+
 test('all executable Blockly command blocks instantiate successfully', () => {
   const blocks = getG1BlocklyCommandBlocks(G1_EXECUTABLE_COMMANDS);
   const definitions = blocks.map((block) => {

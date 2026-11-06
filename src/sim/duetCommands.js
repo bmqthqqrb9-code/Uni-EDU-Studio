@@ -198,6 +198,15 @@ export const DUET_COMMANDS = Object.freeze([
         choices: [['No saved motions available', '']],
       },
     ], 'Run saved motion'),
+    command('shared_motion', 'Run shared motion %1', 'Run a teacher-managed shared DUET starter motion.', [
+      {
+        name: 'MOTION_ID',
+        label: 'shared motion',
+        kind: 'choice',
+        value: '',
+        choices: [['No shared motions available', '']],
+      },
+    ], 'Run shared motion'),
     armGesture('reach_and_return', 'Reach and return', DUET_ARM_COMMANDS.reach_and_return),
     armGesture('receive_and_hold', 'Receive and hold', DUET_ARM_COMMANDS.receive_and_hold),
     armGesture('hold_and_return', 'Hold and return', DUET_ARM_COMMANDS.hold_and_return),
@@ -289,20 +298,20 @@ function normalizeCommand(method, rawArgs, lineNumber) {
       code: 'duet.turn_around_180()',
     };
   }
-  if (method === 'saved_motion') {
+  if (method === 'saved_motion' || method === 'shared_motion') {
     const args = splitArguments(rawArgs, lineNumber);
     if (args.length !== 1) {
-      throw new Error(`duet.saved_motion expects one motion ID on line ${lineNumber}.`);
+      throw new Error(`duet.${method} expects one motion ID on line ${lineNumber}.`);
     }
     const motionId = args[0].replace(/^(['"])(.*)\1$/, '$2').toLowerCase();
-    if (!/^[a-z][a-z0-9_]{0,48}$/.test(motionId)) {
-      throw new Error(`Saved DUET motion ID on line ${lineNumber} is invalid.`);
+    if (!/^[a-z][a-z0-9_]{0,63}$/.test(motionId)) {
+      throw new Error(`DUET motion ID on line ${lineNumber} is invalid.`);
     }
     return {
       type: 'command',
       method,
       values: [motionId],
-      code: `duet.saved_motion(${JSON.stringify(motionId)})`,
+      code: `duet.${method}(${JSON.stringify(motionId)})`,
     };
   }
   if (method === 'hold_pose' || method === 'hold_pose_until_reset') {
@@ -660,25 +669,31 @@ export function formatDuetProgram(nodes, indent = 0) {
   )).join('\n');
 }
 
-export function getDuetBlocklyCommandBlocks(savedMotions = []) {
+export function getDuetBlocklyCommandBlocks(savedMotions = [], sharedMotions = []) {
   return [
     ...DUET_COMMANDS.map((definition) => ({
     type: definition.type,
-    category: definition.category || (definition.method === 'saved_motion'
-      ? 'Saved motions'
+    category: definition.category || (definition.method === 'shared_motion'
+      ? 'Shared motions'
+      : definition.method === 'saved_motion'
+        ? 'Saved motions'
       : definition.method === 'wait' || definition.method === 'stop' || definition.method === 'reset_arms'
       ? 'Control'
       : definition.armPoses
         ? 'Arm gestures'
         : definition.poseInput ? 'Arm poses' : 'Locomotion'),
     message0: definition.message,
-    args0: definition.method === 'saved_motion'
+    args0: definition.method === 'saved_motion' || definition.method === 'shared_motion'
       ? [{
         type: 'field_dropdown',
         name: 'MOTION_ID',
-        options: savedMotions.length
-          ? savedMotions.map(({ id, name }) => [name, id])
-          : [['No saved motions available', '']],
+        options: definition.method === 'saved_motion'
+          ? savedMotions.length
+            ? savedMotions.map(({ id, name }) => [name, id])
+            : [['No saved motions available', '']]
+          : sharedMotions.length
+            ? sharedMotions.map(({ id, name }) => [name, id])
+            : [['No shared motions available', '']],
       }]
       : definition.args.map((argument) => argument.kind === 'number'
       ? {
@@ -736,9 +751,18 @@ export function getDuetCommand(method) {
   return COMMAND_BY_METHOD.get(DUET_COMMAND_ALIASES[method] || method) || null;
 }
 
-export function getDuetCommandExamples(savedMotions = []) {
+export function getDuetCommandExamples(savedMotions = [], sharedMotions = []) {
   const commandExamples = DUET_COMMANDS.flatMap((definition) => {
-    if (definition.method === 'saved_motion') return [];
+    if (definition.method === 'saved_motion' || definition.method === 'shared_motion') return [];
+    const category = definition.category || (
+      definition.method === 'wait' || definition.method === 'stop' || definition.method === 'reset_arms'
+        ? 'Control'
+        : definition.armPoses
+          ? 'Arm gestures'
+          : definition.poseInput
+            ? 'Arm poses'
+            : 'Locomotion'
+    );
     if (definition.poseInput) {
       return getDuetArmPoseNames().map((poseName) => {
         const poseCode = `duet.pose(${JSON.stringify(poseName)})`;
@@ -747,6 +771,7 @@ export function getDuetCommandExamples(savedMotions = []) {
           : `duet.hold_pose_until_reset(${poseCode})`;
         return {
           key: `${definition.method}_${poseName}`,
+          category,
           label: `${definition.method === 'hold_pose' ? 'Hold' : 'Hold until reset'}: ${poseName.replaceAll('_', ' ')}`,
           code,
         };
@@ -754,6 +779,7 @@ export function getDuetCommandExamples(savedMotions = []) {
     }
     return [{
       key: definition.method,
+      category,
       label: definition.label,
       code: `duet.${definition.method}(${definition.args.map((argument) => (
         argument.kind === 'choice' ? JSON.stringify(argument.value) : String(argument.value)
@@ -764,16 +790,25 @@ export function getDuetCommandExamples(savedMotions = []) {
     ...commandExamples,
     ...savedMotions.map(({ id, name }) => ({
       key: `saved_motion_${id}`,
+      category: 'Saved motions',
       label: `Saved motion: ${name}`,
       code: `duet.saved_motion(${JSON.stringify(id)})`,
     })),
+    ...sharedMotions.map(({ id, name }) => ({
+      key: `shared_motion_${id}`,
+      category: 'Shared motions',
+      label: `Shared motion: ${name}`,
+      code: `duet.shared_motion(${JSON.stringify(id)})`,
+    })),
     {
       key: 'front_distance_condition',
+      category: 'Conditions',
       label: 'Front distance condition example',
       code: 'if duet.front_distance_m() < 1:\n    duet.stop()\nelse:\n    duet.walk(1)',
     },
     {
       key: 'rear_distance_condition',
+      category: 'Conditions',
       label: 'Rear distance condition example',
       code: 'if duet.rear_distance_m() < 1:\n    duet.stop()\nelse:\n    duet.backward(1)',
     },

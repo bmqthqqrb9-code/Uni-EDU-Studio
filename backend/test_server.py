@@ -1,4 +1,5 @@
 import os
+import re
 import json
 import sqlite3
 import subprocess
@@ -35,12 +36,193 @@ class ServerClassroomTests(unittest.TestCase):
         starters = payload["starter_codes"]
         self.assertEqual(response.status_code, 200)
         self.assertEqual({entry["controller_version"] for entry in starters}, {"legacy", "duet"})
-        self.assertEqual(len(starters), 18)
+        self.assertEqual(len(starters), 24)
         self.assertEqual(
             sum(entry["name"] == "turn-around-180" for entry in starters),
             2,
         )
         self.assertTrue(all(entry["builtin"] for entry in starters))
+
+    def test_named_student_projects_wait_for_teacher_approval_and_never_overwrite(self):
+        client = TestClient(app)
+        with tempfile.TemporaryDirectory() as temp_dir, patch.object(
+            server, "DB_PATH", os.path.join(temp_dir, "classroom.db")
+        ):
+            server.init_db()
+            teacher = client.post(
+                "/api/classroom/login",
+                json={"username": "teacher", "password": "teacher"},
+            ).json()
+            student = client.post(
+                "/api/classroom/login",
+                json={"username": "student1", "password": "student1"},
+            ).json()
+            other_student = client.post(
+                "/api/classroom/login",
+                json={"username": "student2", "password": "student2"},
+            ).json()
+            headers = lambda login: {"Authorization": f"Bearer {login['token']}"}
+            payload = {
+                "name": "Classroom route",
+                "sceneObjects": [{"id": "chair"}],
+                "generatedCode": "robot.walk(1)",
+                "duetCode": "",
+            }
+            saved = client.post(
+                "/api/classroom/project/save-named",
+                headers=headers(student),
+                json=payload,
+            )
+            project = saved.json()["project"]
+            self.assertEqual(saved.status_code, 200)
+            self.assertEqual(project["status"], "pending")
+            self.assertEqual(project["sceneObjects"], [{"id": "chair"}])
+
+            other_projects = client.get(
+                "/api/classroom/projects",
+                headers=headers(other_student),
+            ).json()["projects"]
+            self.assertNotIn(project["id"], [entry["id"] for entry in other_projects])
+            self.assertEqual(
+                client.get(
+                    "/api/classroom/project",
+                    headers=headers(other_student),
+                    params={"owner": "student1", "name": "Classroom route"},
+                ).status_code,
+                404,
+            )
+
+            second = client.post(
+                "/api/classroom/project/save-named",
+                headers=headers(student),
+                json=payload,
+            ).json()["project"]
+            self.assertNotEqual(second["id"], project["id"])
+            self.assertEqual(second["name"], "Classroom route (2)")
+            self.assertEqual(second["status"], "pending")
+
+            self.assertEqual(
+                client.post(
+                    f"/api/classroom/project/{project['id']}/approve",
+                    headers=headers(student),
+                ).status_code,
+                403,
+            )
+            approved = client.post(
+                f"/api/classroom/project/{project['id']}/approve",
+                headers=headers(teacher),
+            )
+            self.assertEqual(approved.status_code, 200)
+            self.assertEqual(approved.json()["project"]["status"], "approved")
+            self.assertIn(
+                project["id"],
+                [
+                    entry["id"]
+                    for entry in client.get(
+                        "/api/classroom/projects",
+                        headers=headers(other_student),
+                    ).json()["projects"]
+                ],
+            )
+
+    def test_teacher_shared_motions_are_versioned_validated_editable_and_expandable(self):
+        client = TestClient(app)
+        with tempfile.TemporaryDirectory() as temp_dir, patch.object(
+            server, "DB_PATH", os.path.join(temp_dir, "classroom.db")
+        ):
+            server.init_db()
+            teacher = client.post(
+                "/api/classroom/login",
+                json={"username": "teacher", "password": "teacher"},
+            ).json()
+            student = client.post(
+                "/api/classroom/login",
+                json={"username": "student1", "password": "student1"},
+            ).json()
+            teacher_headers = {"Authorization": f"Bearer {teacher['token']}"}
+            student_headers = {"Authorization": f"Bearer {student['token']}"}
+
+            legacy = client.post(
+                "/api/classroom/starter-motions",
+                headers=teacher_headers,
+                json={
+                    "name": "Ready walk",
+                    "code": "robot.stand()\nrobot.walk(2)",
+                    "controller_version": "legacy",
+                },
+            )
+            duet = client.post(
+                "/api/classroom/starter-motions",
+                headers=teacher_headers,
+                json={
+                    "name": "DUET walk",
+                    "code": "duet.walk(1)",
+                    "controller_version": "duet",
+                },
+            )
+            self.assertEqual(legacy.status_code, 200)
+            self.assertEqual(duet.status_code, 200)
+            legacy_motion = legacy.json()["motion"]
+            duet_motion = duet.json()["motion"]
+            self.assertNotEqual(legacy_motion["id"], duet_motion["id"])
+            self.assertEqual(
+                server.expand_shared_motion_calls(
+                    f'robot.shared_motion("{legacy_motion["id"]}")',
+                    "legacy",
+                ),
+                "robot.stand()\nrobot.walk(2)",
+            )
+            self.assertEqual(
+                client.post(
+                    "/api/classroom/starter-motions",
+                    headers=student_headers,
+                    json={
+                        "name": "Student motion",
+                        "code": "robot.walk(1)",
+                        "controller_version": "legacy",
+                    },
+                ).status_code,
+                403,
+            )
+            motions = client.get(
+                "/api/classroom/codes",
+                headers=student_headers,
+            ).json()["shared_motions"]
+            self.assertEqual(
+                {motion["controller_version"] for motion in motions},
+                {"legacy", "duet"},
+            )
+            with self.assertRaisesRegex(HTTPException, "unavailable for duet mode"):
+                server.expand_shared_motion_calls(
+                    f'duet.shared_motion("{legacy_motion["id"]}")',
+                    "duet",
+                )
+
+            updated = client.put(
+                f"/api/classroom/starter-motions/{legacy_motion['id']}",
+                headers=teacher_headers,
+                json={"name": "Ready and walk", "code": "robot.stand()\nrobot.walk(3)"},
+            )
+            self.assertEqual(updated.status_code, 200)
+            self.assertEqual(updated.json()["motion"]["id"], legacy_motion["id"])
+            self.assertEqual(
+                updated.json()["motion"]["code"],
+                "robot.stand()\nrobot.walk(3)",
+            )
+            duplicate = client.post(
+                f"/api/classroom/starter-motions/{legacy_motion['id']}/duplicate",
+                headers=teacher_headers,
+                json={},
+            ).json()["motion"]
+            self.assertNotEqual(duplicate["id"], legacy_motion["id"])
+            self.assertEqual(duplicate["code"], updated.json()["motion"]["code"])
+            self.assertEqual(
+                client.delete(
+                    f"/api/classroom/starter-motions/{duplicate['id']}",
+                    headers=teacher_headers,
+                ).status_code,
+                200,
+            )
 
     def test_sidebar_settings_are_saved_per_teacher_account(self):
         client = TestClient(app)
@@ -63,7 +245,7 @@ class ServerClassroomTests(unittest.TestCase):
             saved = client.put(
                 "/api/classroom/sidebar-settings",
                 headers=teacher_headers,
-                json={"locked_panels": ["planner", "camera", "planner"]},
+                json={"locked_panels": ["blocks", "ide", "planner", "camera", "planner"]},
             )
             restored = client.get("/api/classroom/sidebar-settings", headers=teacher_headers)
             student_denied = client.get("/api/classroom/sidebar-settings", headers=student_headers)
@@ -76,10 +258,58 @@ class ServerClassroomTests(unittest.TestCase):
         self.assertEqual(initial.status_code, 200)
         self.assertEqual(initial.json(), {"locked_panels": [], "configured": False})
         self.assertEqual(saved.status_code, 200)
-        self.assertEqual(saved.json(), {"locked_panels": ["planner", "camera"], "configured": True})
+        self.assertEqual(saved.json(), {"locked_panels": ["blocks", "ide", "planner", "camera"], "configured": True})
         self.assertEqual(restored.json(), saved.json())
         self.assertEqual(student_denied.status_code, 403)
         self.assertEqual(invalid.status_code, 422)
+
+    def test_simulation_visibility_is_shared_with_students_and_teacher_only_writable(self):
+        client = TestClient(app)
+        with tempfile.TemporaryDirectory() as temp_dir, patch.object(
+            server, "DB_PATH", os.path.join(temp_dir, "classroom.db")
+        ):
+            server.init_db()
+            teacher = client.post(
+                "/api/classroom/login",
+                json={"username": "teacher", "password": "teacher"},
+            ).json()
+            student = client.post(
+                "/api/classroom/login",
+                json={"username": "student1", "password": "student1"},
+            ).json()
+            teacher_headers = {"Authorization": f"Bearer {teacher['token']}"}
+            student_headers = {"Authorization": f"Bearer {student['token']}"}
+            initial = client.get(
+                "/api/classroom/simulation-visibility",
+                headers=teacher_headers,
+            )
+            saved = client.put(
+                "/api/classroom/simulation-visibility",
+                headers=teacher_headers,
+                json={"show_simulation": False},
+            )
+            student_setting = client.get(
+                "/api/classroom/simulation-visibility",
+                headers=student_headers,
+            )
+            student_write = client.put(
+                "/api/classroom/simulation-visibility",
+                headers=student_headers,
+                json={"show_simulation": True},
+            )
+            restored = client.get(
+                "/api/classroom/simulation-visibility",
+                headers=teacher_headers,
+            )
+
+        self.assertEqual(initial.status_code, 200)
+        self.assertEqual(initial.json(), {"show_simulation": True})
+        self.assertEqual(saved.status_code, 200)
+        self.assertEqual(saved.json(), {"show_simulation": False})
+        self.assertEqual(student_setting.status_code, 200)
+        self.assertEqual(student_setting.json(), {"show_simulation": False})
+        self.assertEqual(student_write.status_code, 403)
+        self.assertEqual(restored.json(), {"show_simulation": False})
 
     def test_planner_mode_setting_is_teacher_controlled_and_shared(self):
         with tempfile.TemporaryDirectory() as temp_dir, patch.object(
@@ -1345,6 +1575,207 @@ class AccountManagementTests(unittest.TestCase):
         )
         self.assertEqual(teacher_login.status_code, 200)
         self.assertEqual(teacher_login.json()['user']['role'], 'teacher')
+
+    def create_class_group(self, size=25, name=''):
+        return self.client.post(
+            '/api/classroom/groups',
+            headers=self.teacher_headers,
+            json={'size': size, 'name': name},
+        )
+
+    def test_class_groups_use_sequential_names_and_persistent_numeric_passwords(self):
+        first = self.create_class_group(size=25, name='Room A')
+        second = self.create_class_group(size=25)
+        self.assertEqual(first.status_code, 200)
+        self.assertEqual(second.status_code, 200)
+        first_group = first.json()['group']
+        second_group = second.json()['group']
+        self.assertEqual((first_group['group_number'], first_group['name']), (1, 'Room A'))
+        self.assertEqual((second_group['group_number'], second_group['name']), (2, 'Class 2'))
+        self.assertEqual(
+            [account['username'] for account in first_group['accounts']],
+            [f'1{number:02d}' for number in range(1, 26)],
+        )
+        self.assertEqual(
+            [account['username'] for account in second_group['accounts']],
+            [f'2{number:02d}' for number in range(1, 26)],
+        )
+        first_passwords = [account['password'] for account in first_group['accounts']]
+        second_passwords = [account['password'] for account in second_group['accounts']]
+        self.assertTrue(all(re.fullmatch(r'\d{8}', password) for password in first_passwords))
+        self.assertGreater(len(set(first_passwords)), 1)
+        self.assertEqual(first_passwords, second_passwords)
+
+        renamed = self.client.put(
+            '/api/classroom/groups/2',
+            headers=self.teacher_headers,
+            json={'name': 'Room B'},
+        )
+        self.assertEqual(renamed.status_code, 200)
+        self.assertEqual(renamed.json()['name'], 'Room B')
+        listed = self.client.get('/api/classroom/groups', headers=self.teacher_headers)
+        self.assertEqual(listed.status_code, 200)
+        self.assertEqual([group['name'] for group in listed.json()['groups']], ['Room A', 'Room B'])
+
+        student_token = self.client.post(
+            '/api/classroom/login',
+            json={'username': 'student1', 'password': 'student1'},
+        ).json()['token']
+        self.assertEqual(
+            self.client.get(
+                '/api/classroom/groups',
+                headers={'Authorization': 'Bearer ' + student_token},
+            ).status_code,
+            403,
+        )
+
+    def test_clear_class_data_is_scoped_and_preserves_accounts_and_passwords(self):
+        first = self.create_class_group(size=2, name='First')
+        second = self.create_class_group(size=2, name='Second')
+        self.assertEqual((first.status_code, second.status_code), (200, 200))
+        first_account = first.json()['group']['accounts'][0]
+        second_account = second.json()['group']['accounts'][0]
+        first_login = self.client.post(
+            '/api/classroom/login',
+            json={'username': first_account['username'], 'password': first_account['password']},
+        ).json()
+        second_login = self.client.post(
+            '/api/classroom/login',
+            json={'username': second_account['username'], 'password': second_account['password']},
+        ).json()
+        server.upsert_program(first_account['username'], 'class_one_work', 'robot.stand()')
+        server.upsert_program(second_account['username'], 'class_two_work', 'robot.stand()')
+        server.insert_queue_item(first_account['username'], 'active_class_submission', 'robot.stand()')
+        conn = server.get_db_connection()
+        conn.execute(
+            "UPDATE queue SET status = 'running' WHERE student = ?",
+            (first_account['username'],),
+        )
+        conn.commit()
+        conn.close()
+        blocked = self.client.post(
+            '/api/classroom/groups/1/clear-data',
+            headers=self.teacher_headers,
+        )
+        self.assertEqual(blocked.status_code, 409)
+        conn = server.get_db_connection()
+        conn.execute(
+            "UPDATE queue SET status = 'submitted' WHERE student = ?",
+            (first_account['username'],),
+        )
+        conn.commit()
+        conn.close()
+
+        cleared = self.client.post(
+            '/api/classroom/groups/1/clear-data',
+            headers=self.teacher_headers,
+        )
+        self.assertEqual(cleared.status_code, 200)
+        self.assertEqual(cleared.json()['accounts'], 2)
+        self.assertEqual(
+            self.client.get(
+                '/api/classroom/me',
+                headers={'Authorization': 'Bearer ' + first_login['token']},
+            ).status_code,
+            401,
+        )
+        self.assertEqual(
+            self.client.post(
+                '/api/classroom/login',
+                json={'username': first_account['username'], 'password': first_account['password']},
+            ).status_code,
+            200,
+        )
+        self.assertEqual(
+            self.client.get(
+                '/api/classroom/me',
+                headers={'Authorization': 'Bearer ' + second_login['token']},
+            ).status_code,
+            200,
+        )
+        conn = server.get_db_connection()
+        self.assertEqual(
+            conn.execute(
+                "SELECT COUNT(*) FROM programs WHERE username = ?",
+                (first_account['username'],),
+            ).fetchone()[0],
+            0,
+        )
+        self.assertEqual(
+            conn.execute(
+                "SELECT COUNT(*) FROM programs WHERE username = ?",
+                (second_account['username'],),
+            ).fetchone()[0],
+            1,
+        )
+        conn.close()
+
+    def test_deleting_and_recreating_class_reuses_account_slot_passwords(self):
+        first = self.create_class_group(size=3)
+        original_accounts = first.json()['group']['accounts']
+        deleted = self.client.delete(
+            '/api/classroom/groups/1',
+            headers=self.teacher_headers,
+        )
+        self.assertEqual(deleted.status_code, 200)
+        recreated = self.create_class_group(size=3)
+        self.assertEqual(recreated.status_code, 200)
+        recreated_accounts = recreated.json()['group']['accounts']
+        self.assertEqual(
+            [(account['username'], account['password']) for account in original_accounts],
+            [(account['username'], account['password']) for account in recreated_accounts],
+        )
+
+    def test_legacy_guest_accounts_migrate_to_class_one_with_saved_data(self):
+        conn = server.get_db_connection()
+        conn.executemany(
+            "INSERT INTO users (username, password, role) VALUES (?, '12345678', 'student')",
+            [('001',), ('025',)],
+        )
+        conn.commit()
+        conn.close()
+        server.upsert_program('001', 'legacy_work', 'robot.stand()')
+
+        groups = self.client.get('/api/classroom/groups', headers=self.teacher_headers)
+        self.assertEqual(groups.status_code, 200)
+        migrated = groups.json()['groups']
+        self.assertEqual(len(migrated), 2)
+        self.assertEqual(migrated[0]['group_number'], 1)
+        self.assertEqual(
+            [account['username'] for account in migrated[0]['accounts']],
+            [f'1{number:02d}' for number in range(1, 26)],
+        )
+        self.assertTrue(all(re.fullmatch(r'\d{8}', account['password']) for account in migrated[0]['accounts']))
+        self.assertEqual(
+            [account['username'] for account in migrated[1]['accounts']],
+            [f'2{number:02d}' for number in range(1, 26)],
+        )
+        self.assertEqual(
+            [account['password'] for account in migrated[0]['accounts']],
+            [account['password'] for account in migrated[1]['accounts']],
+        )
+        self.assertEqual(
+            self.client.post(
+                '/api/classroom/login',
+                json={
+                    'username': '101',
+                    'password': next(account['password'] for account in migrated[0]['accounts'] if account['username'] == '101'),
+                },
+            ).status_code,
+            200,
+        )
+        conn = server.get_db_connection()
+        self.assertIsNone(conn.execute("SELECT 1 FROM users WHERE username = '001'").fetchone())
+        self.assertEqual(
+            conn.execute("SELECT COUNT(*) FROM programs WHERE username = '101' AND name = 'legacy_work'").fetchone()[0],
+            1,
+        )
+        conn.close()
+
+    def test_class_group_creation_validates_size(self):
+        for size in (0, 100):
+            response = self.create_class_group(size=size)
+            self.assertEqual(response.status_code, 400)
 
     def test_delete_cleans_owned_data_revokes_sessions_and_preserves_shared_map(self):
         self.assertEqual(self.create_student('remove_me').status_code, 201)

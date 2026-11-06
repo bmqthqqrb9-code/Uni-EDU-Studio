@@ -7,6 +7,7 @@ import json
 import math
 import os
 import re
+import secrets
 import socket
 import sqlite3
 import sys
@@ -28,7 +29,15 @@ from fastapi.responses import FileResponse, Response
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 try:
-    from .g1_robot import clear_robot_stop_request, connect_robot, execute_robot_program, robot_status, stop_robot
+    from .g1_robot import (
+        CommandValidationError,
+        clear_robot_stop_request,
+        connect_robot,
+        execute_robot_program,
+        parse_robot_program,
+        robot_status,
+        stop_robot,
+    )
     from .duet_robot import (
         DuetControllerError,
         DuetProgramValidationError,
@@ -74,7 +83,15 @@ try:
     )
     from .map_alignment import MapAlignmentError, align_occupancy_maps, transform_pose_between_maps
 except ImportError:
-    from g1_robot import clear_robot_stop_request, connect_robot, execute_robot_program, robot_status, stop_robot
+    from g1_robot import (
+        CommandValidationError,
+        clear_robot_stop_request,
+        connect_robot,
+        execute_robot_program,
+        parse_robot_program,
+        robot_status,
+        stop_robot,
+    )
     from duet_robot import (
         DuetControllerError,
         DuetProgramValidationError,
@@ -222,6 +239,10 @@ class ProjectSaveRequest(BaseModel):
     selectedPlannerVariant: Optional[str] = None
 
 
+class NamedProjectSaveRequest(ProjectSaveRequest):
+    project_id: Optional[int] = None
+
+
 class ProjectRenameRequest(BaseModel):
     owner: str
     name: str
@@ -231,6 +252,21 @@ class ProjectRenameRequest(BaseModel):
 class ProjectDeleteRequest(BaseModel):
     owner: str
     name: str
+
+
+class StarterMotionCreateRequest(BaseModel):
+    name: str
+    code: str
+    controller_version: Literal["legacy", "duet"]
+
+
+class StarterMotionUpdateRequest(BaseModel):
+    name: str
+    code: str
+
+
+class StarterMotionDuplicateRequest(BaseModel):
+    name: Optional[str] = None
 
 class NavigationStartRequest(BaseModel):
     map_id: str
@@ -259,11 +295,15 @@ class SharedLidarSettingsRequest(BaseModel):
 
 
 class SidebarSettingsRequest(BaseModel):
-    locked_panels: List[Literal["planner", "prompt", "camera"]]
+    locked_panels: List[Literal["blocks", "ide", "planner", "prompt", "camera"]]
 
 
 class SafeModeSettingsRequest(BaseModel):
     enabled: bool
+
+
+class SimulationVisibilitySettingsRequest(BaseModel):
+    show_simulation: bool
 
 
 class SensorServiceRequest(BaseModel):
@@ -278,6 +318,16 @@ class CreateUserRequest(BaseModel):
     username: str
     password: str
     role: str = "student"
+
+
+class ClassroomGroupRequest(BaseModel):
+    size: int = 25
+    name: str = ""
+
+
+class ClassroomGroupRenameRequest(BaseModel):
+    name: str
+
 
 DB_PATH = os.path.join(os.path.dirname(__file__), "classroom.db")
 DEFAULT_USERS: Dict[str, Dict[str, str]] = {
@@ -811,6 +861,10 @@ def delete_user_account(username: str, active_username: str) -> None:
             "UPDATE shared_lidar_map SET published_by = 'deleted account' WHERE published_by = ?",
             (username,),
         )
+        conn.execute(
+            "DELETE FROM classroom_group_members WHERE username = ?",
+            (username,),
+        )
         conn.execute("DELETE FROM users WHERE username = ?", (username,))
         conn.commit()
     except Exception:
@@ -901,6 +955,17 @@ def init_db():
     conn.execute("INSERT OR IGNORE INTO planner_settings (id, active_mode) VALUES (1, 'manual')")
     conn.execute(
         """
+        CREATE TABLE IF NOT EXISTS simulation_visibility_settings (
+            id INTEGER PRIMARY KEY CHECK (id = 1),
+            show_simulation INTEGER NOT NULL DEFAULT 1 CHECK (show_simulation IN (0, 1))
+        )
+        """
+    )
+    conn.execute(
+        "INSERT OR IGNORE INTO simulation_visibility_settings (id, show_simulation) VALUES (1, 1)"
+    )
+    conn.execute(
+        """
         CREATE TABLE IF NOT EXISTS teacher_sidebar_settings (
             username TEXT PRIMARY KEY,
             locked_panels TEXT NOT NULL DEFAULT '[]',
@@ -914,6 +979,49 @@ def init_db():
             username TEXT PRIMARY KEY,
             enabled INTEGER NOT NULL DEFAULT 0 CHECK (enabled IN (0, 1)),
             updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+        )
+        """
+    )
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS classroom_user_data_versions (
+            username TEXT PRIMARY KEY,
+            revision INTEGER NOT NULL DEFAULT 0
+        )
+        """
+    )
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS classroom_groups (
+            group_number INTEGER PRIMARY KEY,
+            name TEXT NOT NULL,
+            created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+        )
+        """
+    )
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS classroom_group_members (
+            username TEXT PRIMARY KEY,
+            group_number INTEGER NOT NULL,
+            account_number INTEGER NOT NULL,
+            UNIQUE (group_number, account_number)
+        )
+        """
+    )
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS classroom_account_passwords (
+            account_number INTEGER PRIMARY KEY,
+            password TEXT NOT NULL
+        )
+        """
+    )
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS classroom_migrations (
+            migration_id TEXT PRIMARY KEY,
+            completed_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
         )
         """
     )
@@ -1007,6 +1115,7 @@ def init_db():
             planner_waypoints TEXT NOT NULL DEFAULT '[]',
             generated_code TEXT NOT NULL DEFAULT '',
             duet_code TEXT,
+            status TEXT NOT NULL DEFAULT 'approved',
             updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
             UNIQUE(username, name)
         )
@@ -1025,11 +1134,29 @@ def init_db():
         )
         """
     )
+    conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS starter_motions (
+                motion_id TEXT PRIMARY KEY,
+                name TEXT NOT NULL,
+                controller_version TEXT NOT NULL CHECK (controller_version IN ('legacy', 'duet')),
+                code TEXT NOT NULL,
+                created_by TEXT NOT NULL,
+                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                UNIQUE (controller_version, name COLLATE NOCASE)
+            )
+            """
+    )
     project_columns = {
         row["name"] for row in conn.execute("PRAGMA table_info(projects)").fetchall()
     }
     if "duet_code" not in project_columns:
         conn.execute("ALTER TABLE projects ADD COLUMN duet_code TEXT")
+    if "status" not in project_columns:
+        conn.execute(
+            "ALTER TABLE projects ADD COLUMN status TEXT NOT NULL DEFAULT 'approved'"
+        )
     for user in DEFAULT_USERS.values():
         conn.execute(
             "INSERT OR IGNORE INTO users (username, password, role) VALUES (?, ?, ?)",
@@ -1037,6 +1164,189 @@ def init_db():
         )
     conn.commit()
     conn.close()
+
+
+def _classroom_group_password(conn: sqlite3.Connection, account_number: int) -> str:
+    row = conn.execute(
+        "SELECT password FROM classroom_account_passwords WHERE account_number = ?",
+        (account_number,),
+    ).fetchone()
+    if row:
+        return row["password"]
+    existing_passwords = {
+        row["password"]
+        for row in conn.execute(
+            "SELECT password FROM classroom_account_passwords"
+        ).fetchall()
+    }
+    password = f"{secrets.randbelow(100_000_000):08d}"
+    while existing_passwords and len(existing_passwords) == 1 and password in existing_passwords:
+        password = f"{secrets.randbelow(100_000_000):08d}"
+    conn.execute(
+        "INSERT INTO classroom_account_passwords (account_number, password) VALUES (?, ?)",
+        (account_number, password),
+    )
+    return password
+
+
+def _classroom_group_credentials(
+    conn: sqlite3.Connection,
+    group_number: int,
+) -> list[dict]:
+    rows = conn.execute(
+        """
+        SELECT member.username, member.account_number, password.password
+        FROM classroom_group_members AS member
+        JOIN classroom_account_passwords AS password
+          ON password.account_number = member.account_number
+        JOIN users ON users.username = member.username AND users.role = 'student'
+        WHERE member.group_number = ?
+        ORDER BY member.account_number
+        """,
+        (group_number,),
+    ).fetchall()
+    return [
+        {
+            "username": row["username"],
+            "password": row["password"],
+            "account_number": row["account_number"],
+        }
+        for row in rows
+    ]
+
+
+def _migrate_legacy_guest_group(conn: sqlite3.Connection) -> None:
+    migration_id = "legacy-guest-accounts-001-025-to-group-1"
+    if conn.execute(
+        "SELECT 1 FROM classroom_migrations WHERE migration_id = ?",
+        (migration_id,),
+    ).fetchone():
+        return
+
+    legacy_accounts = conn.execute(
+        """
+        SELECT username, role FROM users
+        WHERE username BETWEEN '001' AND '025'
+          AND length(username) = 3
+          AND username GLOB '[0-9][0-9][0-9]'
+        ORDER BY username
+        """
+    ).fetchall()
+    if not legacy_accounts:
+        conn.execute(
+            "INSERT INTO classroom_migrations (migration_id) VALUES (?)",
+            (migration_id,),
+        )
+        return
+
+    if any(account["role"] != "student" for account in legacy_accounts):
+        raise HTTPException(
+            status_code=409,
+            detail="Legacy accounts 001–025 include a non-student account and cannot be migrated automatically.",
+        )
+    legacy_usernames = tuple(account["username"] for account in legacy_accounts)
+    placeholders = ",".join("?" for _ in legacy_usernames)
+    active_queue = conn.execute(
+        f"SELECT 1 FROM queue WHERE student IN ({placeholders}) AND status = 'running' LIMIT 1",
+        legacy_usernames,
+    ).fetchone()
+    active_navigation = conn.execute(
+        f"""
+        SELECT 1 FROM navigation_operations
+        WHERE username IN ({placeholders}) AND status IN (
+            {",".join("?" for _ in _NAVIGATION_ACTIVE_STATES)}
+        ) LIMIT 1
+        """,
+        (*legacy_usernames, *_NAVIGATION_ACTIVE_STATES),
+    ).fetchone()
+    active_scan = conn.execute(
+        f"SELECT 1 FROM lidar_scans WHERE username IN ({placeholders}) AND status = 'scanning' LIMIT 1",
+        legacy_usernames,
+    ).fetchone()
+    if active_queue or active_navigation or active_scan:
+        raise HTTPException(
+            status_code=409,
+            detail="Legacy guest accounts have active classroom or robot operations; wait for them to finish before migration.",
+        )
+
+    legacy_by_slot = {
+        int(account["username"]): account["username"]
+        for account in legacy_accounts
+    }
+    for group_number in (1, 2):
+        for account_number in range(1, 26):
+            target = f"{group_number}{account_number:02d}"
+            if conn.execute("SELECT 1 FROM users WHERE username = ?", (target,)).fetchone():
+                source = legacy_by_slot.get(account_number, f"account {account_number:02d}")
+                raise HTTPException(
+                    status_code=409,
+                    detail=f"Cannot migrate {source} to {target}: that username already exists.",
+                )
+
+    conn.executemany(
+        "INSERT INTO classroom_groups (group_number, name) VALUES (?, ?)",
+        ((1, "Class 1"), (2, "Class 2")),
+    )
+    for account_number in range(1, 26):
+        old_username = legacy_by_slot.get(account_number)
+        first_username = f"1{account_number:02d}"
+        password = _classroom_group_password(conn, account_number)
+        if old_username:
+            conn.execute(
+                "UPDATE users SET username = ?, password = ? WHERE username = ?",
+                (first_username, password, old_username),
+            )
+            for table, owner_column in (
+                ("programs", "username"),
+                ("projects", "username"),
+                ("queue", "student"),
+                ("navigation_operations", "username"),
+                ("lidar_scans", "username"),
+                ("duet_motions", "username"),
+                ("classroom_user_data_versions", "username"),
+            ):
+                conn.execute(
+                    f"UPDATE {table} SET {owner_column} = ? WHERE {owner_column} = ?",
+                    (first_username, old_username),
+                )
+            conn.execute(
+                "UPDATE queue SET result_project_owner = ? WHERE result_project_owner = ?",
+                (first_username, old_username),
+            )
+            conn.execute(
+                "UPDATE shared_lidar_map SET published_by = ? WHERE published_by = ?",
+                (first_username, old_username),
+            )
+        else:
+            conn.execute(
+                "INSERT INTO users (username, password, role) VALUES (?, ?, 'student')",
+                (first_username, password),
+            )
+        conn.execute(
+            """
+            INSERT INTO classroom_group_members (username, group_number, account_number)
+            VALUES (?, 1, ?)
+            """,
+            (first_username, account_number),
+        )
+
+        second_username = f"2{account_number:02d}"
+        conn.execute(
+            "INSERT INTO users (username, password, role) VALUES (?, ?, 'student')",
+            (second_username, password),
+        )
+        conn.execute(
+            """
+            INSERT INTO classroom_group_members (username, group_number, account_number)
+            VALUES (?, 2, ?)
+            """,
+            (second_username, account_number),
+        )
+
+    conn.execute(
+        "INSERT INTO classroom_migrations (migration_id) VALUES (?)",
+        (migration_id,),
+    )
 
 
 def get_user_from_db(username: str):
@@ -1213,46 +1523,53 @@ def clear_queue_items():
 def list_projects_for_user(username: str):
     conn = get_db_connection()
     rows = conn.execute(
-        "SELECT username, name, scene_objects, planner_waypoints, generated_code, duet_code FROM projects WHERE username = ? ORDER BY updated_at DESC",
+        "SELECT id, username, name, scene_objects, planner_waypoints, generated_code, duet_code, status "
+        "FROM projects WHERE username = ? ORDER BY updated_at DESC",
         (username,),
     ).fetchall()
     conn.close()
-    return [
-        {
-            "username": row["username"],
-            "name": row["name"],
-            "sceneObjects": __safe_json_load(row["scene_objects"]),
-            "plannerWaypoints": __safe_json_load(row["planner_waypoints"]),
-            "generatedCode": (row["generated_code"] or "").split("\n", 1)[1]
-            if (row["generated_code"] or "").startswith("# __PLANNER_META__") and "\n" in (row["generated_code"] or "")
-            else row["generated_code"],
-            "duetCode": row["duet_code"] or "",
-            **_project_planner_metadata(row["generated_code"] or ""),
-        }
-        for row in rows
-    ]
+    return [_serialize_project_row(row) for row in rows]
 
 
-def list_all_projects():
+def list_all_projects(user: Optional[dict] = None):
     conn = get_db_connection()
-    rows = conn.execute(
-        "SELECT username, name, scene_objects, planner_waypoints, generated_code, duet_code FROM projects ORDER BY updated_at DESC"
-    ).fetchall()
+    if user is None or user["role"] == "teacher":
+        if user is None:
+            rows = conn.execute(
+                "SELECT id, username, name, scene_objects, planner_waypoints, generated_code, duet_code, status "
+                "FROM projects ORDER BY updated_at DESC"
+            ).fetchall()
+        else:
+            rows = conn.execute(
+                "SELECT id, username, name, scene_objects, planner_waypoints, generated_code, duet_code, status "
+                "FROM projects WHERE status != 'private' OR username = ? ORDER BY updated_at DESC",
+                (user["username"],),
+            ).fetchall()
+    else:
+        rows = conn.execute(
+            "SELECT id, username, name, scene_objects, planner_waypoints, generated_code, duet_code, status "
+            "FROM projects WHERE status = 'approved' OR username = ? ORDER BY updated_at DESC",
+            (user["username"],),
+        ).fetchall()
     conn.close()
-    return [
-        {
-            "username": row["username"],
-            "name": row["name"],
-            "sceneObjects": __safe_json_load(row["scene_objects"]),
-            "plannerWaypoints": __safe_json_load(row["planner_waypoints"]),
-            "generatedCode": (row["generated_code"] or "").split("\n", 1)[1]
-            if (row["generated_code"] or "").startswith("# __PLANNER_META__") and "\n" in (row["generated_code"] or "")
-            else row["generated_code"],
-            "duetCode": row["duet_code"] or "",
-            **_project_planner_metadata(row["generated_code"] or ""),
-        }
-        for row in rows
-    ]
+    return [_serialize_project_row(row) for row in rows]
+
+
+def _serialize_project_row(row: sqlite3.Row) -> dict:
+    generated_code = row["generated_code"] or ""
+    return {
+        "id": row["id"],
+        "username": row["username"],
+        "name": row["name"],
+        "sceneObjects": __safe_json_load(row["scene_objects"]),
+        "plannerWaypoints": __safe_json_load(row["planner_waypoints"]),
+        "generatedCode": generated_code.split("\n", 1)[1]
+        if generated_code.startswith("# __PLANNER_META__") and "\n" in generated_code
+        else generated_code,
+        "duetCode": row["duet_code"] or "",
+        "status": row["status"],
+        **_project_planner_metadata(generated_code),
+    }
 
 
 def __safe_json_load(value: Optional[str]):
@@ -1296,32 +1613,24 @@ def _project_planner_metadata(code: str) -> dict:
 def get_project_for_user(username: str, name: str = "default"):
     conn = get_db_connection()
     row = conn.execute(
-        "SELECT name, scene_objects, planner_waypoints, generated_code, duet_code FROM projects WHERE username = ? AND name = ?",
+        "SELECT id, username, name, scene_objects, planner_waypoints, generated_code, duet_code, status "
+        "FROM projects WHERE username = ? AND name = ?",
         (username, name),
     ).fetchone()
     conn.close()
     if not row:
         return None
-    generated_code = row["generated_code"] or ""
-    stripped_code = generated_code.split("\n", 1)[1] if generated_code.startswith("# __PLANNER_META__") and "\n" in generated_code else generated_code
-    return {
-        "name": row["name"],
-        "sceneObjects": __safe_json_load(row["scene_objects"]),
-        "plannerWaypoints": __safe_json_load(row["planner_waypoints"]),
-        "generatedCode": stripped_code,
-        "duetCode": row["duet_code"] or "",
-        **_project_planner_metadata(generated_code),
-    }
+    return _serialize_project_row(row)
 
 
-def save_project_for_user(username: str, payload: dict):
+def save_project_for_user(username: str, payload: dict, status: str = "approved"):
     name = (payload.get("name") or "default").strip() or "default"
     generated_code = _annotate_generated_code(payload.get("generatedCode", ""), payload)
     conn = get_db_connection()
     conn.execute(
         """
-        INSERT INTO projects (username, name, scene_objects, planner_waypoints, generated_code, duet_code)
-        VALUES (?, ?, ?, ?, ?, ?)
+        INSERT INTO projects (username, name, scene_objects, planner_waypoints, generated_code, duet_code, status)
+        VALUES (?, ?, ?, ?, ?, ?, ?)
         ON CONFLICT(username, name)
         DO UPDATE SET scene_objects = excluded.scene_objects,
                       planner_waypoints = excluded.planner_waypoints,
@@ -1336,11 +1645,114 @@ def save_project_for_user(username: str, payload: dict):
             json.dumps(payload.get("plannerWaypoints", [])),
             generated_code,
             payload.get("duetCode"),
+            status,
         ),
     )
     conn.commit()
     conn.close()
     return get_project_for_user(username, name)
+
+
+def save_named_project(user: dict, payload: dict, project_id: Optional[int] = None) -> dict:
+    name = (payload.get("name") or "").strip()
+    if not name or len(name) > 120:
+        raise HTTPException(status_code=400, detail="Project name must contain 1 to 120 characters.")
+    if user["role"] == "teacher" and project_id is not None:
+        conn = get_db_connection()
+        existing = conn.execute(
+            "SELECT username, name FROM projects WHERE id = ?",
+            (project_id,),
+        ).fetchone()
+        if not existing:
+            conn.close()
+            raise HTTPException(status_code=404, detail="Project not found.")
+        generated_code = _annotate_generated_code(payload.get("generatedCode", ""), payload)
+        try:
+            conn.execute(
+                """
+                UPDATE projects
+                SET name = ?, scene_objects = ?, planner_waypoints = ?, generated_code = ?,
+                    duet_code = ?, status = 'approved', updated_at = CURRENT_TIMESTAMP
+                WHERE id = ?
+                """,
+                (
+                    name,
+                    json.dumps(payload.get("sceneObjects", [])),
+                    json.dumps(payload.get("plannerWaypoints", [])),
+                    generated_code,
+                    payload.get("duetCode"),
+                    project_id,
+                ),
+            )
+            conn.commit()
+        except sqlite3.IntegrityError as error:
+            conn.rollback()
+            raise HTTPException(
+                status_code=409,
+                detail="A project with that name already exists for its owner.",
+            ) from error
+        finally:
+            conn.close()
+        saved = get_project_for_user(existing["username"], name)
+        return {**saved, "username": existing["username"]}
+
+    owner = user["username"]
+    status = "pending" if user["role"] == "student" else "approved"
+    conn = get_db_connection()
+    try:
+        if user["role"] == "student":
+            private_copy = conn.execute(
+                "SELECT id FROM projects WHERE username = ? AND name = ? AND status = 'private'",
+                (owner, name),
+            ).fetchone()
+            if private_copy:
+                conn.execute(
+                    """
+                    UPDATE projects
+                    SET scene_objects = ?, planner_waypoints = ?, generated_code = ?, duet_code = ?,
+                        status = 'pending', updated_at = CURRENT_TIMESTAMP
+                    WHERE id = ?
+                    """,
+                    (
+                        json.dumps(payload.get("sceneObjects", [])),
+                        json.dumps(payload.get("plannerWaypoints", [])),
+                        _annotate_generated_code(payload.get("generatedCode", ""), payload),
+                        payload.get("duetCode"),
+                        private_copy["id"],
+                    ),
+                )
+                conn.commit()
+                saved = get_project_for_user(owner, name)
+                return {**saved, "username": owner}
+        for suffix in range(1, 1000):
+            suffix_text = f" ({suffix})"
+            candidate = name if suffix == 1 else f"{name[: 120 - len(suffix_text)]}{suffix_text}"
+            generated_code = _annotate_generated_code(payload.get("generatedCode", ""), payload)
+            try:
+                cursor = conn.execute(
+                    """
+                    INSERT INTO projects
+                        (username, name, scene_objects, planner_waypoints, generated_code, duet_code, status)
+                    VALUES (?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        owner,
+                        candidate,
+                        json.dumps(payload.get("sceneObjects", [])),
+                        json.dumps(payload.get("plannerWaypoints", [])),
+                        generated_code,
+                        payload.get("duetCode"),
+                        status,
+                    ),
+                )
+                conn.commit()
+                saved = get_project_for_user(owner, candidate)
+                return {**saved, "id": cursor.lastrowid, "username": owner}
+            except sqlite3.IntegrityError:
+                conn.rollback()
+    finally:
+        conn.close()
+    raise HTTPException(status_code=409, detail="Could not generate a unique project name.")
 
 
 def _validate_duet_motion_name(name: str) -> str:
@@ -1473,10 +1885,15 @@ def expand_duet_motion_calls(code: str, username: str) -> str:
                 "SELECT code FROM duet_motions WHERE username = ? AND motion_id = ?",
                 (username, motion_id),
             ).fetchone()
+            if not motion:
+                motion = conn.execute(
+                    "SELECT code FROM starter_motions WHERE motion_id = ? AND controller_version = 'duet'",
+                    (motion_id,),
+                ).fetchone()
             conn.close()
             if not motion:
                 raise DuetProgramValidationError(
-                    f"Saved DUET motion {motion_id!r} is not available to this teacher."
+                    f"Saved DUET motion {motion_id!r} is not available in this classroom."
                 )
             try:
                 saved_tree = ast.parse(motion["code"], mode="exec")
@@ -1490,6 +1907,154 @@ def expand_duet_motion_calls(code: str, username: str) -> str:
     if len(expanded_code) > 20_000:
         raise DuetProgramValidationError("Expanded DUET program exceeds 20,000 characters.")
     return expanded_code
+
+
+def list_shared_starter_motions() -> list[dict]:
+    conn = get_db_connection()
+    rows = conn.execute(
+        """
+        SELECT motion_id, name, controller_version, code, created_by, created_at, updated_at
+        FROM starter_motions
+        ORDER BY controller_version, name COLLATE NOCASE, motion_id
+        """
+    ).fetchall()
+    conn.close()
+    return [
+        {
+            "id": row["motion_id"],
+            "name": row["name"],
+            "controller_version": row["controller_version"],
+            "code": row["code"],
+            "created_by": row["created_by"],
+            "created_at": row["created_at"],
+            "updated_at": row["updated_at"],
+        }
+        for row in rows
+    ]
+
+
+def expand_shared_motion_calls(code: str, controller_version: str) -> str:
+    if not isinstance(code, str) or len(code) > 40_000:
+        raise HTTPException(status_code=400, detail="Program must be text no longer than 40,000 characters.")
+    if controller_version not in {"legacy", "duet"}:
+        raise HTTPException(status_code=400, detail="Unsupported controller version.")
+
+    def expand(source: str, stack: tuple[str, ...] = ()) -> str:
+        lines = []
+        for line_number, line in enumerate(source.splitlines(), start=1):
+            stripped = line.strip()
+            if ".shared_motion(" not in stripped:
+                lines.append(line)
+                continue
+            try:
+                statement = ast.parse(stripped, mode="exec").body
+            except SyntaxError as error:
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"Invalid shared motion call on line {line_number}.",
+                ) from error
+            if (
+                len(statement) != 1
+                or not isinstance(statement[0], ast.Expr)
+                or not isinstance(statement[0].value, ast.Call)
+            ):
+                raise HTTPException(status_code=400, detail=f"Invalid shared motion call on line {line_number}.")
+            call = statement[0].value
+            if (
+                not isinstance(call.func, ast.Attribute)
+                or not isinstance(call.func.value, ast.Name)
+                or call.func.value.id != ("robot" if controller_version == "legacy" else "duet")
+                or call.func.attr != "shared_motion"
+                or len(call.args) != 1
+                or call.keywords
+                or not isinstance(call.args[0], ast.Constant)
+                or not isinstance(call.args[0].value, str)
+            ):
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"Shared motion call on line {line_number} requires one quoted motion ID.",
+                )
+            motion_id = call.args[0].value
+            if motion_id in stack:
+                raise HTTPException(status_code=400, detail="Shared motions may not call themselves recursively.")
+            if len(stack) >= 5:
+                raise HTTPException(status_code=400, detail="Shared motion calls may be nested at most five levels.")
+            conn = get_db_connection()
+            motion = conn.execute(
+                "SELECT code, controller_version FROM starter_motions WHERE motion_id = ?",
+                (motion_id,),
+            ).fetchone()
+            conn.close()
+            if not motion or motion["controller_version"] != controller_version:
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"Shared motion {motion_id!r} is unavailable for {controller_version} mode.",
+                )
+            expanded_motion = expand(motion["code"], (*stack, motion_id))
+            indentation = line[: len(line) - len(line.lstrip())]
+            lines.extend(
+                f"{indentation}{motion_line}" if motion_line else ""
+                for motion_line in expanded_motion.splitlines()
+            )
+        expanded = "\n".join(lines)
+        if len(expanded) > 40_000:
+            raise HTTPException(status_code=400, detail="Expanded shared motions exceed 40,000 characters.")
+        return expanded
+
+    return expand(code)
+
+
+def _validate_starter_motion_code(name: str, code: str, version: str, username: str) -> tuple[str, str]:
+    normalized_name = name.strip() if isinstance(name, str) else ""
+    if (
+        not normalized_name
+        or len(normalized_name) > 80
+        or any(ord(character) < 32 or ord(character) == 127 for character in normalized_name)
+    ):
+        raise HTTPException(status_code=400, detail="Motion names must contain 1 to 80 printable characters.")
+    if not isinstance(code, str) or not code.strip() or len(code) > 20_000:
+        raise HTTPException(status_code=400, detail="Motion code must be non-empty text no longer than 20,000 characters.")
+    try:
+        expanded = expand_shared_motion_calls(code, version)
+        if version == "duet":
+            expanded = expand_duet_motion_calls(expanded, username)
+            commands = parse_duet_program(expanded)
+        else:
+            commands = parse_robot_program(expanded)
+    except (CommandValidationError, DuetProgramValidationError) as error:
+        raise HTTPException(status_code=400, detail=f"Motion sequence is invalid: {error}") from error
+    if not commands:
+        raise HTTPException(status_code=400, detail="Add at least one supported motion command before saving.")
+    return normalized_name, expanded.strip()
+
+
+def create_shared_starter_motion(
+    name: str,
+    code: str,
+    version: str,
+    username: str,
+) -> dict:
+    normalized_name, expanded_code = _validate_starter_motion_code(name, code, version, username)
+    motion_id = f"sm_{uuid.uuid4().hex}"
+    conn = get_db_connection()
+    try:
+        conn.execute(
+            """
+            INSERT INTO starter_motions (motion_id, name, controller_version, code, created_by)
+            VALUES (?, ?, ?, ?, ?)
+            """,
+            (motion_id, normalized_name, version, expanded_code, username),
+        )
+        conn.commit()
+    except sqlite3.IntegrityError as error:
+        conn.rollback()
+        raise HTTPException(
+            status_code=409,
+            detail=f"A {version.upper()} starter motion named {normalized_name!r} already exists.",
+        ) from error
+    finally:
+        conn.close()
+    return next(motion for motion in list_shared_starter_motions() if motion["id"] == motion_id)
 
 
 def save_unique_project_for_user(
@@ -1681,23 +2246,38 @@ def classroom_register_student(request: CreateUserRequest):
 
 @app.get("/api/classroom/me")
 def classroom_me(user: dict = Depends(auth_required)):
-    return {"user": {"username": user["username"], "role": user["role"]}}
+    conn = get_db_connection()
+    try:
+        version = conn.execute(
+            "SELECT revision FROM classroom_user_data_versions WHERE username = ?",
+            (user["username"],),
+        ).fetchone()
+    finally:
+        conn.close()
+    return {
+        "user": {"username": user["username"], "role": user["role"]},
+        "data_revision": version["revision"] if version else 0,
+    }
 
 
 @app.get("/api/classroom/codes")
 def classroom_codes(user: dict = Depends(auth_required)):
     codes = get_saved_codes_for_user(user["username"])
-    return {"codes": codes, "starter_codes": get_starter_motion_codes()}
+    return {
+        "codes": codes,
+        "starter_codes": get_starter_motion_codes(),
+        "shared_motions": list_shared_starter_motions(),
+    }
 
 
 @app.get("/api/classroom/projects")
 def classroom_projects(user: dict = Depends(auth_required)):
-    return {"projects": list_all_projects()}
+    return {"projects": list_all_projects(user)}
 
 
 @app.get("/api/classroom/projects/all")
 def classroom_all_projects(user: dict = Depends(auth_required)):
-    return {"projects": list_all_projects()}
+    return {"projects": list_all_projects(user)}
 
 
 @app.get("/api/classroom/project")
@@ -1708,6 +2288,13 @@ def classroom_project(
 ):
     project_owner = owner or user["username"]
     project = get_project_for_user(project_owner, name)
+    if (
+        project
+        and project["status"] != "approved"
+        and project_owner != user["username"]
+        and user["role"] != "teacher"
+    ):
+        raise HTTPException(status_code=404, detail="Project not found.")
     if project and project_owner != user["username"]:
         project["username"] = project_owner
     return {"project": project or {"name": name, "sceneObjects": [], "plannerWaypoints": [], "generatedCode": ""}}
@@ -1717,8 +2304,158 @@ def classroom_project(
 def save_project(user: dict = Depends(auth_required), request: ProjectSaveRequest = None):
     if not request:
         raise HTTPException(status_code=400, detail="Missing project payload")
-    project = save_project_for_user(user["username"], request.model_dump())
+    project = save_project_for_user(
+        user["username"],
+        request.model_dump(),
+        status="private" if user["role"] == "student" else "approved",
+    )
     return {"status": "saved", "project": project}
+
+
+@app.post("/api/classroom/project/save-named")
+def save_named_project_endpoint(
+    request: NamedProjectSaveRequest,
+    user: dict = Depends(auth_required),
+):
+    payload = request.model_dump(exclude={"project_id"}, exclude_none=True)
+    _validated_project_snapshot(payload)
+    project = save_named_project(
+        user,
+        payload,
+        request.project_id,
+    )
+    return {
+        "status": "pending" if project["status"] == "pending" else "saved",
+        "project": project,
+    }
+
+
+@app.post("/api/classroom/project/{project_id}/approve")
+def approve_project(project_id: int, user: dict = Depends(auth_required)):
+    if user["role"] != "teacher":
+        raise HTTPException(status_code=403, detail="Teacher role required")
+    conn = get_db_connection()
+    result = conn.execute(
+        "UPDATE projects SET status = 'approved', updated_at = CURRENT_TIMESTAMP WHERE id = ?",
+        (project_id,),
+    )
+    conn.commit()
+    conn.close()
+    if result.rowcount == 0:
+        raise HTTPException(status_code=404, detail="Project not found.")
+    project = next(
+        (entry for entry in list_all_projects(user) if entry["id"] == project_id),
+        None,
+    )
+    return {"status": "approved", "project": project}
+
+
+@app.post("/api/classroom/starter-motions")
+def create_starter_motion(
+    request: StarterMotionCreateRequest,
+    user: dict = Depends(auth_required),
+):
+    if user["role"] != "teacher":
+        raise HTTPException(status_code=403, detail="Teacher role required")
+    motion = create_shared_starter_motion(
+        request.name,
+        request.code,
+        request.controller_version,
+        user["username"],
+    )
+    return {"status": "saved", "motion": motion}
+
+
+@app.put("/api/classroom/starter-motions/{motion_id}")
+def update_starter_motion(
+    motion_id: str,
+    request: StarterMotionUpdateRequest,
+    user: dict = Depends(auth_required),
+):
+    if user["role"] != "teacher":
+        raise HTTPException(status_code=403, detail="Teacher role required")
+    conn = get_db_connection()
+    existing = conn.execute(
+        "SELECT controller_version FROM starter_motions WHERE motion_id = ?",
+        (motion_id,),
+    ).fetchone()
+    conn.close()
+    if not existing:
+        raise HTTPException(status_code=404, detail="Starter motion not found.")
+    name, code = _validate_starter_motion_code(
+        request.name,
+        request.code,
+        existing["controller_version"],
+        user["username"],
+    )
+    conn = get_db_connection()
+    try:
+        conn.execute(
+            """
+            UPDATE starter_motions
+            SET name = ?, code = ?, updated_at = CURRENT_TIMESTAMP
+            WHERE motion_id = ?
+            """,
+            (name, code, motion_id),
+        )
+        conn.commit()
+    except sqlite3.IntegrityError as error:
+        conn.rollback()
+        raise HTTPException(
+            status_code=409,
+            detail=f"A {existing['controller_version'].upper()} starter motion named {name!r} already exists.",
+        ) from error
+    finally:
+        conn.close()
+    motion = next(item for item in list_shared_starter_motions() if item["id"] == motion_id)
+    return {"status": "saved", "motion": motion}
+
+
+@app.post("/api/classroom/starter-motions/{motion_id}/duplicate")
+def duplicate_starter_motion(
+    motion_id: str,
+    request: StarterMotionDuplicateRequest,
+    user: dict = Depends(auth_required),
+):
+    if user["role"] != "teacher":
+        raise HTTPException(status_code=403, detail="Teacher role required")
+    conn = get_db_connection()
+    source = conn.execute(
+        "SELECT name, code, controller_version FROM starter_motions WHERE motion_id = ?",
+        (motion_id,),
+    ).fetchone()
+    conn.close()
+    if not source:
+        raise HTTPException(status_code=404, detail="Starter motion not found.")
+    base_name = (request.name or f"{source['name']} copy").strip()
+    for suffix in range(1, 1000):
+        suffix_text = f" ({suffix})"
+        candidate = base_name if suffix == 1 else f"{base_name[: 80 - len(suffix_text)]}{suffix_text}"
+        try:
+            motion = create_shared_starter_motion(
+                candidate,
+                source["code"],
+                source["controller_version"],
+                user["username"],
+            )
+            return {"status": "saved", "motion": motion}
+        except HTTPException as error:
+            if error.status_code != 409:
+                raise
+    raise HTTPException(status_code=409, detail="Could not generate a unique starter motion name.")
+
+
+@app.delete("/api/classroom/starter-motions/{motion_id}")
+def delete_starter_motion(motion_id: str, user: dict = Depends(auth_required)):
+    if user["role"] != "teacher":
+        raise HTTPException(status_code=403, detail="Teacher role required")
+    conn = get_db_connection()
+    result = conn.execute("DELETE FROM starter_motions WHERE motion_id = ?", (motion_id,))
+    conn.commit()
+    conn.close()
+    if result.rowcount == 0:
+        raise HTTPException(status_code=404, detail="Starter motion not found.")
+    return {"status": "deleted", "id": motion_id}
 
 
 @app.post("/api/classroom/project/save-execution")
@@ -2113,7 +2850,8 @@ def run_next(request: QueueRunRequest, user: dict = Depends(auth_required)):
                 with _MOTION_START_LOCK:
                     if active_navigation_operation() or active_lidar_scan() or robot_status().get("running"):
                         raise HTTPException(status_code=409, detail="Another robot operation currently owns motion.")
-                    expanded_code = expand_duet_motion_calls(item["code"], user["username"])
+                    shared_code = expand_shared_motion_calls(item["code"], "duet")
+                    expanded_code = expand_duet_motion_calls(shared_code, user["username"])
                     result = execute_duet_program(
                         expanded_code,
                         safe_mode=teacher_safe_mode_enabled(user["username"]),
@@ -2123,7 +2861,7 @@ def run_next(request: QueueRunRequest, user: dict = Depends(auth_required)):
                 with _MOTION_START_LOCK:
                     ensure_sdk_motion_available()
                     result = execute_robot_program(
-                        item["code"],
+                        expand_shared_motion_calls(item["code"], "legacy"),
                         safe_mode=teacher_safe_mode_enabled(user["username"]),
                         safe_mode_stop_margin_m=SAFE_MODE_STOP_MARGIN_METERS,
                     )
@@ -2271,6 +3009,284 @@ def classroom_create_user(
     return {"status": "created", "user": {"username": username, "role": request.role}}
 
 
+@app.get("/api/classroom/groups")
+def classroom_groups(user: dict = Depends(auth_required)):
+    if user["role"] != "teacher":
+        raise HTTPException(status_code=403, detail="Teacher role required")
+    conn = get_db_connection()
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        _migrate_legacy_guest_group(conn)
+        conn.commit()
+        groups = conn.execute(
+            "SELECT group_number, name, created_at FROM classroom_groups ORDER BY group_number"
+        ).fetchall()
+        return {
+            "groups": [
+                {
+                    "group_number": row["group_number"],
+                    "name": row["name"],
+                    "created_at": row["created_at"],
+                    "accounts": _classroom_group_credentials(conn, row["group_number"]),
+                }
+                for row in groups
+            ]
+        }
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
+
+
+@app.post("/api/classroom/groups")
+def classroom_create_group(
+    request: ClassroomGroupRequest,
+    user: dict = Depends(auth_required),
+):
+    if user["role"] != "teacher":
+        raise HTTPException(status_code=403, detail="Teacher role required")
+    if not 1 <= request.size <= 99:
+        raise HTTPException(status_code=400, detail="Class size must be from 1 to 99.")
+
+    name = request.name.strip()
+    if len(name) > 60 or any(ord(char) < 32 or ord(char) == 127 for char in name):
+        raise HTTPException(status_code=400, detail="Class names must be at most 60 printable characters.")
+
+    conn = get_db_connection()
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        _migrate_legacy_guest_group(conn)
+        occupied = {
+            row["group_number"]
+            for row in conn.execute("SELECT group_number FROM classroom_groups").fetchall()
+        }
+        group_number = 1
+        while group_number in occupied:
+            group_number += 1
+        group_name = name or f"Class {group_number}"
+        conn.execute(
+            "INSERT INTO classroom_groups (group_number, name) VALUES (?, ?)",
+            (group_number, group_name),
+        )
+
+        accounts = []
+        for account_number in range(1, request.size + 1):
+            username = f"{group_number}{account_number:02d}"
+            existing = conn.execute(
+                "SELECT role FROM users WHERE username = ?",
+                (username,),
+            ).fetchone()
+            if existing:
+                raise HTTPException(
+                    status_code=409,
+                    detail=f"Cannot create this class: username {username} already exists outside a class group.",
+                )
+            password = _classroom_group_password(conn, account_number)
+            conn.execute(
+                "INSERT INTO users (username, password, role) VALUES (?, ?, 'student')",
+                (username, password),
+            )
+            conn.execute(
+                """
+                INSERT INTO classroom_group_members (username, group_number, account_number)
+                VALUES (?, ?, ?)
+                """,
+                (username, group_number, account_number),
+            )
+            accounts.append({
+                "username": username,
+                "password": password,
+                "account_number": account_number,
+            })
+        conn.commit()
+        return {
+            "status": "created",
+            "group": {
+                "group_number": group_number,
+                "name": group_name,
+                "accounts": accounts,
+            },
+        }
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
+
+
+@app.put("/api/classroom/groups/{group_number}")
+def classroom_rename_group(
+    group_number: int,
+    request: ClassroomGroupRenameRequest,
+    user: dict = Depends(auth_required),
+):
+    if user["role"] != "teacher":
+        raise HTTPException(status_code=403, detail="Teacher role required")
+    name = request.name.strip()
+    if not name or len(name) > 60 or any(ord(char) < 32 or ord(char) == 127 for char in name):
+        raise HTTPException(status_code=400, detail="Class names must contain 1 to 60 printable characters.")
+    conn = get_db_connection()
+    try:
+        result = conn.execute(
+            "UPDATE classroom_groups SET name = ? WHERE group_number = ?",
+            (name, group_number),
+        )
+        if result.rowcount == 0:
+            raise HTTPException(status_code=404, detail="Class not found.")
+        conn.commit()
+    finally:
+        conn.close()
+    return {"status": "renamed", "group_number": group_number, "name": name}
+
+
+def _reset_classroom_group_data(group_number: int, remove_accounts: bool = False):
+    _QUEUE_RUN_LOCK.acquire()
+    conn = None
+    deleted_counts = {}
+    try:
+        conn = get_db_connection()
+        conn.execute("BEGIN IMMEDIATE")
+        group = conn.execute(
+            "SELECT name FROM classroom_groups WHERE group_number = ?",
+            (group_number,),
+        ).fetchone()
+        if not group:
+            raise HTTPException(status_code=404, detail="Class not found.")
+        usernames = tuple(
+            row["username"]
+            for row in conn.execute(
+                "SELECT username FROM classroom_group_members WHERE group_number = ?",
+                (group_number,),
+            ).fetchall()
+        )
+        if not usernames:
+            if remove_accounts:
+                conn.execute(
+                    "DELETE FROM classroom_groups WHERE group_number = ?",
+                    (group_number,),
+                )
+                conn.commit()
+                return {
+                    "status": "deleted",
+                    "group_number": group_number,
+                    "accounts": 0,
+                    "deleted": {},
+                    "total_deleted": 0,
+                }
+            return {
+                "status": "cleared",
+                "group_number": group_number,
+                "accounts": 0,
+                "deleted": {},
+                "total_deleted": 0,
+            }
+        placeholders = ",".join("?" for _ in usernames)
+        running_queue_item = conn.execute(
+            f"SELECT student FROM queue WHERE student IN ({placeholders}) AND status = 'running' LIMIT 1",
+            usernames,
+        ).fetchone()
+        active_navigation = conn.execute(
+            f"""
+            SELECT username FROM navigation_operations
+            WHERE username IN ({placeholders}) AND status IN (
+                {",".join("?" for _ in _NAVIGATION_ACTIVE_STATES)}
+            ) LIMIT 1
+            """,
+            (*usernames, *_NAVIGATION_ACTIVE_STATES),
+        ).fetchone()
+        active_scan = conn.execute(
+            f"SELECT username FROM lidar_scans WHERE username IN ({placeholders}) AND status = 'scanning' LIMIT 1",
+            usernames,
+        ).fetchone()
+        if running_queue_item or active_navigation or active_scan:
+            raise HTTPException(
+                status_code=409,
+                detail=f"An account in {group['name']} owns an active queue or robot operation; wait for it to finish before clearing class data.",
+            )
+
+        for table, owner_column in (
+            ("programs", "username"),
+            ("projects", "username"),
+            ("queue", "student"),
+            ("navigation_operations", "username"),
+            ("lidar_scans", "username"),
+            ("duet_motions", "username"),
+        ):
+            cursor = conn.execute(
+                f"DELETE FROM {table} WHERE {owner_column} IN ({placeholders})",
+                usernames,
+            )
+            deleted_counts[table] = cursor.rowcount
+        conn.executemany(
+            """
+            INSERT INTO classroom_user_data_versions (username, revision)
+            VALUES (?, 1)
+            ON CONFLICT(username) DO UPDATE SET revision = revision + 1
+            """,
+            ((username,) for username in usernames),
+        )
+        if remove_accounts:
+            conn.execute(
+                f"UPDATE shared_lidar_map SET published_by = 'deleted account' WHERE published_by IN ({placeholders})",
+                usernames,
+            )
+            conn.execute(
+                f"DELETE FROM users WHERE username IN ({placeholders})",
+                usernames,
+            )
+            conn.execute(
+                "DELETE FROM classroom_group_members WHERE group_number = ?",
+                (group_number,),
+            )
+            conn.execute(
+                "DELETE FROM classroom_groups WHERE group_number = ?",
+                (group_number,),
+            )
+        conn.commit()
+    except Exception:
+        if conn is not None:
+            conn.rollback()
+        raise
+    finally:
+        if conn is not None:
+            conn.close()
+        _QUEUE_RUN_LOCK.release()
+
+    revoked_usernames = set(usernames)
+    for token, token_username in list(SESSION_TOKENS.items()):
+        if token_username in revoked_usernames:
+            SESSION_TOKENS.pop(token, None)
+
+    return {
+        "status": "deleted" if remove_accounts else "cleared",
+        "group_number": group_number,
+        "accounts": len(usernames),
+        "deleted": deleted_counts,
+        "total_deleted": sum(deleted_counts.values()),
+    }
+
+
+@app.post("/api/classroom/groups/{group_number}/clear-data")
+def classroom_clear_group_data(
+    group_number: int,
+    user: dict = Depends(auth_required),
+):
+    if user["role"] != "teacher":
+        raise HTTPException(status_code=403, detail="Teacher role required")
+    return _reset_classroom_group_data(group_number)
+
+
+@app.delete("/api/classroom/groups/{group_number}")
+def classroom_delete_group(
+    group_number: int,
+    user: dict = Depends(auth_required),
+):
+    if user["role"] != "teacher":
+        raise HTTPException(status_code=403, detail="Teacher role required")
+    return _reset_classroom_group_data(group_number, remove_accounts=True)
+
+
 @app.delete("/api/classroom/users/{username}")
 def classroom_delete_user(username: str, user: dict = Depends(auth_required)):
     if user["role"] != "teacher":
@@ -2286,7 +3302,7 @@ def run_code(request: CodeRequest, user: dict = Depends(auth_required)):
     with _MOTION_START_LOCK:
         ensure_sdk_motion_available()
         return execute_robot_program(
-            request.code,
+            expand_shared_motion_calls(request.code, "legacy"),
             safe_mode=teacher_safe_mode_enabled(user["username"]),
             safe_mode_stop_margin_m=SAFE_MODE_STOP_MARGIN_METERS,
         )
@@ -2558,7 +3574,8 @@ def run_duet_code(request: DuetProgramRequest, user: dict = Depends(auth_require
             )
         if robot_status().get("running"):
             raise HTTPException(status_code=409, detail="An SDK robot program is already running.")
-        expanded_code = expand_duet_motion_calls(request.code, user["username"])
+        shared_code = expand_shared_motion_calls(request.code, "duet")
+        expanded_code = expand_duet_motion_calls(shared_code, user["username"])
         return execute_duet_program(
             expanded_code,
             safe_mode=teacher_safe_mode_enabled(user["username"]),
@@ -3393,6 +4410,47 @@ def update_planner_settings(
     return {"active_mode": request.active_mode}
 
 
+@app.get("/api/classroom/simulation-visibility")
+def get_simulation_visibility(
+    response: Response,
+    user: dict = Depends(auth_required),
+):
+    response.headers["Cache-Control"] = "no-store, max-age=0"
+    conn = get_db_connection()
+    try:
+        row = conn.execute(
+            "SELECT show_simulation FROM simulation_visibility_settings WHERE id = 1"
+        ).fetchone()
+    finally:
+        conn.close()
+    if row is None:
+        raise HTTPException(status_code=503, detail="Simulation visibility setting is unavailable.")
+    return {"show_simulation": bool(row["show_simulation"])}
+
+
+@app.put("/api/classroom/simulation-visibility")
+def update_simulation_visibility(
+    request: SimulationVisibilitySettingsRequest,
+    user: dict = Depends(auth_required),
+):
+    if user["role"] != "teacher":
+        raise HTTPException(status_code=403, detail="Teacher role required")
+    conn = get_db_connection()
+    try:
+        conn.execute(
+            """
+            INSERT INTO simulation_visibility_settings (id, show_simulation)
+            VALUES (1, ?)
+            ON CONFLICT(id) DO UPDATE SET show_simulation = excluded.show_simulation
+            """,
+            (int(request.show_simulation),),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+    return {"show_simulation": request.show_simulation}
+
+
 @app.get("/api/classroom/sidebar-settings")
 def get_teacher_sidebar_settings(user: dict = Depends(auth_required)):
     if user["role"] != "teacher":
@@ -3409,7 +4467,7 @@ def get_teacher_sidebar_settings(user: dict = Depends(auth_required)):
         locked_panels = json.loads(row["locked_panels"])
     except (TypeError, json.JSONDecodeError) as error:
         raise HTTPException(status_code=503, detail="Teacher sidebar settings are invalid.") from error
-    valid_panels = {"planner", "prompt", "camera"}
+    valid_panels = {"blocks", "ide", "planner", "prompt", "camera"}
     if not isinstance(locked_panels, list) or any(panel not in valid_panels for panel in locked_panels):
         raise HTTPException(status_code=503, detail="Teacher sidebar settings are invalid.")
     return {"locked_panels": locked_panels, "configured": True}

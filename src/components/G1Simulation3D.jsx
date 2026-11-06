@@ -11,7 +11,7 @@ import { simulateDuetG1Edu23Program } from '../sim/duetG1Edu23Env';
 import { getSceneObjectScale } from '../sim/sceneObjects';
 import {
   DEFAULT_CAMERA_DISTANCE, DEFAULT_CAMERA_PITCH, DEFAULT_CAMERA_TARGET_HEIGHT,
-  DEFAULT_CAMERA_YAW, getCameraPanDirection, getCameraPanTargetOffset,
+  DEFAULT_CAMERA_YAW, getCameraHorizontalFocusOffset, getCameraPanDirection, getCameraPanTargetOffset,
 } from '../sim/cameraNavigation';
 
 const JOINT_AXES = {
@@ -529,7 +529,7 @@ async function loadG1MeshRig() {
   return { robot, joints };
 }
 
-export default function G1Simulation3D({ code, simulatorState, controllerVersion = 'legacy', obstacles = [], waypoints = [], onObstacleChange, onObstacleSelect, onWaypointChange, isWaypointPlacementEnabled = false, onWaypointPlace, isPlaying = false, playbackSpeed = 1, playbackProgress = 0, gridSize = 20, onPlaybackProgress, onPlaybackToggle, onPlaybackReset, onPlaybackSpeedChange }) {
+export default function G1Simulation3D({ code, simulatorState, controllerVersion = 'legacy', obstacles = [], waypoints = [], onObstacleChange, onObstacleSelect, onWaypointChange, isWaypointPlacementEnabled = false, onWaypointPlace, isPlaying = false, playbackSpeed = 1, playbackProgress = 0, gridSize = 20, onPlaybackProgress, onPlaybackToggle, onPlaybackReset, onPlaybackSpeedChange, workspacePanelRef }) {
   const mountRef = useRef(null);
   const sceneRef = useRef(null);
   const rendererRef = useRef(null);
@@ -559,6 +559,7 @@ export default function G1Simulation3D({ code, simulatorState, controllerVersion
     pinchDistance: 0,
     pinchMidpoint: null,
   });
+  const defaultHorizontalFocusRef = useRef(null);
   const isPlayingRef = useRef(isPlaying);
   const playbackSpeedRef = useRef(playbackSpeed);
   const playbackProgressRef = useRef(playbackProgress);
@@ -653,8 +654,9 @@ export default function G1Simulation3D({ code, simulatorState, controllerVersion
     view.yaw = DEFAULT_CAMERA_YAW;
     view.pitch = DEFAULT_CAMERA_PITCH;
     view.distance = DEFAULT_CAMERA_DISTANCE;
-    view.focusOffset.set(0, 0, 0);
-    view.target.set(0, DEFAULT_CAMERA_TARGET_HEIGHT, 0);
+    const horizontalFocus = defaultHorizontalFocusRef.current || 0;
+    view.focusOffset.set(horizontalFocus, 0, 0);
+    view.target.set(horizontalFocus, DEFAULT_CAMERA_TARGET_HEIGHT, 0);
     updateCameraPosition(cameraRef.current, view);
   };
 
@@ -862,6 +864,27 @@ export default function G1Simulation3D({ code, simulatorState, controllerVersion
       renderer.setSize(width, height, false);
     };
     resize();
+    if (defaultHorizontalFocusRef.current === null) {
+      const mountBounds = mount.getBoundingClientRect();
+      const panelBounds = workspacePanelRef?.current?.getBoundingClientRect();
+      const panelOverlapsView = panelBounds
+        && panelBounds.left < mountBounds.right
+        && panelBounds.right > mountBounds.left
+        && panelBounds.top < mountBounds.bottom
+        && panelBounds.bottom > mountBounds.top;
+      const visibleWidth = panelOverlapsView
+        ? Math.max(0, Math.min(mount.clientWidth, panelBounds.left - mountBounds.left))
+        : mount.clientWidth;
+      defaultHorizontalFocusRef.current = getCameraHorizontalFocusOffset(
+        mount.clientWidth,
+        visibleWidth,
+        DEFAULT_CAMERA_DISTANCE,
+        camera.aspect,
+        camera.fov,
+      );
+      viewRef.current.focusOffset.set(defaultHorizontalFocusRef.current, 0, 0);
+      viewRef.current.target.set(defaultHorizontalFocusRef.current, DEFAULT_CAMERA_TARGET_HEIGHT, 0);
+    }
     const observer = new ResizeObserver(resize);
     observer.observe(mount);
 
@@ -1181,7 +1204,7 @@ export default function G1Simulation3D({ code, simulatorState, controllerVersion
       plannerLineRef.current = null;
       obstacleGroupRef.current = null;
     };
-  }, [gridSize, obstacles]);
+  }, [gridSize, obstacles, workspacePanelRef]);
 
   useEffect(() => {
     syncWaypointMarkers(waypointGroupRef.current, plannerLineRef.current, waypoints);

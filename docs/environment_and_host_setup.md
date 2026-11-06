@@ -164,6 +164,21 @@ http://<host-ip>:5179
 
 The robot-control backend must run on the G1 computer (or a host with the supported Unitree SDK2 Python and DDS network access). A Codespace or ordinary classroom server does not control a robot just because the browser can reach its IP address.
 
+### DUET v2 controller connection (separate from SDK2)
+
+DUET does not connect through the browser, through the legacy Unitree SDK adapter, or through the ordinary G1 backend installer. The DUET backend talks to the modified DUET controller over a private Unix-domain socket on the **same host**. The controller must be built and started separately in its required Velocity state, with `DUET_GATEWAY_ENABLED=true`. Run it as the same local user as the backend and give both processes the same absolute `DUET_CONTROL_DIR` (default: `~/.cache/uni-edu-duet`). The socket is local IPC, not a network address; opening the app from a classroom browser does not provide that connection.
+
+The backend also needs `DUET_EXPECTED_POLICY_ID` set to the exact policy identity reported by the deployed controller. For the generated user service, add these environment entries to `~/.config/systemd/user/uni-edu-studio.service` under `[Service]`, then reload and restart that service:
+
+```ini
+Environment=DUET_CONTROL_DIR=/home/<g1-user>/.cache/uni-edu-duet
+Environment=DUET_EXPECTED_POLICY_ID=<exact-controller-policy-id>
+```
+
+After editing the service, run `systemctl --user daemon-reload && systemctl --user restart uni-edu-studio`. Set `DUET_CONTROL_DIR` to the actual directory shared by both processes; do not copy the example user path literally. Configure the controller's gateway environment with `DUET_GATEWAY_ENABLED=true` and the same directory. `DUET_PHYSICAL_ENABLED=true` and `DUET_COMMISSIONING_ENABLED=true` are additional explicit gates for teacher commissioning, not substitutes for a running gateway or matching policy. Do not enable normal physical runs until the exact robot and policy have passed the documented supervised hardware acceptance.
+
+Select **DUET v2** in the teacher panel to query its backend status, then press **Connect** to request a controller lease. A disconnected status that mentions the gateway means the local gateway/socket is not available to the backend; check the controller process, shared directory, user permissions, and backend service environment. A reported policy/protocol mismatch requires correcting the deployment configuration, not bypassing validation. Connect/status checks are not proof of safe physical behavior and connection never starts a motion. See [the DUET gateway and hardware-verified commands guide](./duet-v2-gateway-implementation-plan.md) and [teacher guide](./teacher_guide.md) for commissioning and acceptance requirements.
+
 Install the Unitree SDK2 Python package using the vendor-supported setup for the robot image, then start the backend with the correct DDS domain:
 
 ```bash

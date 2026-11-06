@@ -22,7 +22,10 @@ const shouldCapture = (version, name) => (
 const countBlocks = (value) => {
   if (Array.isArray(value)) return value.reduce((count, item) => count + countBlocks(item), 0);
   if (!value || typeof value !== 'object') return 0;
-  return (value.type ? 1 : 0)
+  const repeatCountBlock = value.type === 'controls_repeat_ext' && Number.isFinite(value.times)
+    ? 1
+    : 0;
+  return (value.type ? 1 : 0) + repeatCountBlock
     + Object.values(value).reduce((count, item) => count + countBlocks(item), 0);
 };
 
@@ -122,7 +125,7 @@ try {
           .locator('xpath=../..');
         await activityCard.getByRole('button', { name: 'Load into editor' })
           .evaluate((button) => button.click());
-        await page.getByRole('button', { name: 'Close simulator' })
+        await page.getByRole('button', { name: 'Close', exact: true })
           .evaluate((button) => button.click());
       } else {
         const ideEditor = page.locator('textarea:visible').first();

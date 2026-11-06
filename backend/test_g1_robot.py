@@ -1055,6 +1055,43 @@ class G1RobotProgramTests(unittest.TestCase):
             )
             self.assertEqual(events[1]["command"], {"method": "stand"})
 
+    def test_robot_loop_does_not_sync_storage_between_commands(self):
+        class FakeLocoClient:
+            def SetFsmId(self, fsm_id):
+                return 0
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            log_path = Path(temp_dir) / "session.jsonl"
+            log_path.touch(mode=0o600)
+            original_client = g1_robot._client
+            g1_robot._client = FakeLocoClient()
+            try:
+                with patch.object(g1_robot, "_connection_log_path", log_path), patch.object(
+                    g1_robot.os, "fsync"
+                ) as sync_storage:
+                    result = g1_robot.execute_robot_program(
+                        "for _ in range(3):\n    robot.stand()"
+                    )
+            finally:
+                g1_robot._client = original_client
+
+            events = [json.loads(line) for line in log_path.read_text().splitlines()]
+            self.assertEqual(result["commandsExecuted"], 3)
+            self.assertEqual(sync_storage.call_count, 2)
+            self.assertEqual(
+                [event["event"] for event in events],
+                [
+                    "program_started",
+                    "command_started",
+                    "command_completed",
+                    "command_started",
+                    "command_completed",
+                    "command_started",
+                    "command_completed",
+                    "program_completed",
+                ],
+            )
+
     def test_stand_reports_sdk_transition_error(self):
         class FakeLocoClient:
             def SetFsmId(self, fsm_id):

@@ -1506,7 +1506,11 @@ def controller_status() -> dict:
                 "motionOwner": "none",
                 "motionActive": False,
                 "programActive": _run_lock.locked(),
-                "error": None,
+                "error": (
+                    "DUET controller gateway is not running or its socket is unavailable: "
+                    f"{error}. Start the DUET gateway with DUET_GATEWAY_ENABLED=true and ensure "
+                    "it shares DUET_CONTROL_DIR with the backend."
+                ),
             }
         return {
             "status": "unavailable",

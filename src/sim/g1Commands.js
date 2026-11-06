@@ -306,6 +306,19 @@ function formatArgument(value, definition) {
 }
 
 function normalizeCommand(method, rawArgs) {
+  if (method === 'shared_motion') {
+    const args = splitArguments(rawArgs);
+    if (args.length !== 1) throw new Error('robot.shared_motion expects one motion ID.');
+    const motionId = decodeArgument(args[0], textArgument('MOTION_ID', 'shared motion ID', ''));
+    if (!/^[a-z][a-z0-9_]{0,63}$/.test(motionId)) {
+      throw new Error('Shared motion ID is invalid.');
+    }
+    return {
+      method,
+      values: [motionId],
+      code: `robot.shared_motion(${JSON.stringify(motionId)})`,
+    };
+  }
   const definition = COMMAND_BY_METHOD.get(method);
   if (!definition) throw new Error(`Unknown robot command: ${method}`);
   const args = splitArguments(rawArgs);
