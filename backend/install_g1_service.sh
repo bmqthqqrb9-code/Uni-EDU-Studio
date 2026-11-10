@@ -7,9 +7,14 @@ if [[ ! -x "$SDK_ENV_DIR/bin/python" ]]; then
   SDK_ENV_DIR="$HOME/venvs/g1-sdk-py312"
 fi
 PYTHON="$SDK_ENV_DIR/bin/python"
+DUET_CONTROL_DIR="${DUET_CONTROL_DIR:-$HOME/.cache/uni-edu-duet}"
 
 if [[ ! -x "$PYTHON" ]]; then
   echo "Unitree SDK virtual environment not found. Set G1_SDK_ENV_DIR to its path." >&2
+  exit 1
+fi
+if [[ "$DUET_CONTROL_DIR" != /* ]]; then
+  echo "DUET_CONTROL_DIR must be an absolute path." >&2
   exit 1
 fi
 if ! command -v npm >/dev/null 2>&1; then
@@ -70,6 +75,7 @@ Environment=CYCLONEDDS_HOME=$HOME/cyclonedds/install
 Environment=UNITREE_DOMAIN_ID=0
 Environment=UNITREE_INTERFACE=eth0
 Environment=UNI_EDU_PORT=5179
+Environment=DUET_CONTROL_DIR=$DUET_CONTROL_DIR
 ExecStart=$PYTHON $PROJECT_DIR/backend/server.py
 Restart=on-failure
 RestartSec=3
@@ -188,6 +194,7 @@ echo
 echo "Uni EDU Studio is serving its frontend and will start automatically at boot."
 echo "Open http://<this-computer-wifi-ip>:5179 on a device connected to the same Wi-Fi."
 echo "Check service status with: systemctl --user status uni-edu-studio"
+echo "DUET backend socket directory: $DUET_CONTROL_DIR"
 if [[ "$LIDAR_CONFIGURED" != "1" && "$LIDAR_PREVIOUSLY_INSTALLED" != "1" ]]; then
   echo "The app/backend is installed without LiDAR. SDK connection and supported non-conditional SDK commands remain available."
 elif [[ "$LIDAR_CONFIGURED" != "1" && "$LIDAR_PREVIOUSLY_INSTALLED" == "1" ]]; then
