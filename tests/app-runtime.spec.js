@@ -6,6 +6,47 @@ async function openConnectionPanel(page) {
   await page.getByRole('button', { name: 'Open robot connection' }).click();
 }
 
+test('login starts blank and determines role from the account', async ({ page }) => {
+  let loginPayload;
+  await page.route('**/api/**', async (route) => {
+    const request = route.request();
+    const path = new URL(request.url()).pathname;
+    if (path === '/api/classroom/login') {
+      loginPayload = request.postDataJSON();
+    }
+    await route.fulfill({
+      status: 200,
+      contentType: 'application/json',
+      body: JSON.stringify(path === '/api/classroom/login'
+        ? { token: 'student-login-token', user: { role: 'student', username: 'student-login-test' } }
+        : {}),
+    });
+  });
+
+  await page.goto('/');
+  await expect(page.locator('input[type="text"]')).toHaveValue('');
+  const passwordInput = page.locator('input[autocomplete="current-password"]');
+  await expect(passwordInput).toHaveAttribute('type', 'password');
+  await expect(passwordInput).toHaveValue('');
+  await expect(page.getByLabel('Role')).toHaveCount(0);
+  await expect(page.getByText('Teacher demo: teacher / teacher')).toHaveCount(0);
+  await expect(page.getByText('Student demo: student1 / student1')).toHaveCount(0);
+
+  await page.locator('input[type="text"]').fill('student-login-test');
+  await passwordInput.fill('classroom-password');
+  await page.getByRole('button', { name: 'Show password' }).click();
+  await expect(passwordInput).toHaveAttribute('type', 'text');
+  await expect(page.getByRole('button', { name: 'Hide password' })).toHaveAttribute('aria-pressed', 'true');
+  await page.getByRole('button', { name: 'Hide password' }).click();
+  await expect(passwordInput).toHaveAttribute('type', 'password');
+  await page.getByRole('button', { name: 'Log In' }).click();
+  await expect.poll(() => loginPayload).toEqual({
+    username: 'student-login-test',
+    password: 'classroom-password',
+  });
+  await expect(page.getByRole('button', { name: 'Open queue' })).toHaveCount(0);
+});
+
 test('legacy and DUET expose the same approximate in-place 180-degree turn name', () => {
   const legacy = parseG1Program('robot.turn_around_180()');
   const duet = parseDuetProgram('duet.turn_around_180()');

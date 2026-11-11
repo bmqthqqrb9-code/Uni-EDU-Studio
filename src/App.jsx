@@ -4,7 +4,7 @@ import {
   Save, FolderOpen, Download, Settings, Play, Square,
   Code, X, RefreshCw, FileJson, Check, Loader2,
   Menu, Undo, Redo, ChevronRight, Sidebar, MoreVertical, Trash2,
-  Upload, FileText, Edit3, FunctionSquare
+  Upload, FileText, Edit3, FunctionSquare, Eye, EyeOff
 } from 'lucide-react';
 import * as Blockly from 'blockly/core';
 import { pythonGenerator } from 'blockly/python';
@@ -1066,8 +1066,9 @@ export default function App() {
   const [isQueueReviewRunning, setIsQueueReviewRunning] = useState(false);
   const [isQueueReviewPreviewing, setIsQueueReviewPreviewing] = useState(false);
   const [teacherRoster, setTeacherRoster] = useState([]);
-  const [loginForm, setLoginForm] = useState({ username: 'teacher', password: 'teacher', role: 'teacher' });
+  const [loginForm, setLoginForm] = useState({ username: '', password: '' });
   const [loginError, setLoginError] = useState('');
+  const [isLoginPasswordVisible, setIsLoginPasswordVisible] = useState(false);
   const [isRegistering, setIsRegistering] = useState(false);
   const [newStudent, setNewStudent] = useState({ username: '', password: '', role: 'student' });
   const [accountManagementError, setAccountManagementError] = useState('');
@@ -1917,7 +1918,7 @@ export default function App() {
     try {
       const response = await apiFetch('/api/classroom/login', {
         method: 'POST',
-        body: JSON.stringify(loginForm)
+        body: JSON.stringify({ username: loginForm.username, password: loginForm.password })
       }, false);
       setSession({ token: response.token, user: response.user });
     } catch (err) {
@@ -5586,27 +5587,27 @@ export default function App() {
               </div>
               <div>
                 <label className="block text-sm font-medium text-slate-700 mb-1">Password</label>
-                <input
-                  type="password"
-                  value={loginForm.password}
-                  onChange={(e) => setLoginForm({ ...loginForm, password: e.target.value })}
-                  autoComplete={isRegistering ? 'new-password' : 'current-password'}
-                  minLength={isRegistering ? 8 : undefined}
-                  required
-                  className="w-full border border-slate-200 rounded-xl px-3 py-2 focus:outline-none focus:ring-2 focus:ring-blue-500"
-                />
+                <div className="flex overflow-hidden rounded-xl border border-slate-200 focus-within:ring-2 focus-within:ring-blue-500">
+                  <input
+                    type={isLoginPasswordVisible ? 'text' : 'password'}
+                    value={loginForm.password}
+                    onChange={(e) => setLoginForm({ ...loginForm, password: e.target.value })}
+                    autoComplete={isRegistering ? 'new-password' : 'current-password'}
+                    minLength={isRegistering ? 8 : undefined}
+                    required
+                    className="min-w-0 flex-1 px-3 py-2 focus:outline-none"
+                  />
+                  <button
+                    type="button"
+                    aria-label={isLoginPasswordVisible ? 'Hide password' : 'Show password'}
+                    aria-pressed={isLoginPasswordVisible}
+                    onClick={() => setIsLoginPasswordVisible((visible) => !visible)}
+                    className="px-3 text-slate-500 hover:bg-slate-50 hover:text-slate-700"
+                  >
+                    {isLoginPasswordVisible ? <EyeOff size={18} aria-hidden="true" /> : <Eye size={18} aria-hidden="true" />}
+                  </button>
+                </div>
               </div>
-              {!isRegistering && <div>
-                <label className="block text-sm font-medium text-slate-700 mb-1">Role</label>
-                <select
-                  value={loginForm.role}
-                  onChange={(e) => setLoginForm({ ...loginForm, role: e.target.value })}
-                  className="w-full border border-slate-200 rounded-xl px-3 py-2 focus:outline-none focus:ring-2 focus:ring-blue-500"
-                >
-                  <option value="teacher">Teacher</option>
-                  <option value="student">Student</option>
-                </select>
-              </div>}
               {loginError && <p className="text-red-600 text-sm">{loginError}</p>}
               <button type="submit" className="w-full bg-blue-600 text-white rounded-xl py-2.5 font-semibold hover:bg-blue-700 transition-colors">
                 {isRegistering ? 'Create Student Account' : 'Log In'}
@@ -5625,9 +5626,7 @@ export default function App() {
                 {isRegistering
                   ? <p>Student accounts only. Username: 3–32 letters, numbers, _ or -. Password: 8–128 characters.</p>
                   : <>
-                    <p>Teacher demo: teacher / teacher</p>
-                    <p>Student demo: student1 / student1</p>
-                    <p>Create a student account to join the classroom.</p>
+                    <p>Sign in with your classroom account or create a student account to join.</p>
                   </>}
               </div>
           </form>
