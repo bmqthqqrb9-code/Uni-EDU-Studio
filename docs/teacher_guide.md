@@ -59,6 +59,19 @@ In the DUET V2 connection panel, use **Start full test sequence**. Review the ex
 
 A passed software commissioning report is not supervised hardware acceptance and does not unlock normal DUET runs. Only after a qualified operator separately records acceptance on the exact G1 and deployed policy may `DUET_HARDWARE_ACCEPTANCE_ID` be configured to the report ID. Keep physical motion disabled if any acceptance item is outstanding. A STOP acknowledgement does not prove physical immobility; stop the DUET controller process before using the legacy SDK.
 
+## Record and export a measured robot motion
+
+Teachers can open **Settings → Record a real robot motion** with either controller selected:
+
+- **DUET v2** requires a ready controller that advertises arm feedback. Enter an approved arm-only DUET command; the recorder stores the ten measured arm joints.
+- **Legacy SDK** requires the SDK connection and fresh ROS `/joint_states` telemetry from the installed read-only G1 state bridge. The recorder stores all 23 measured joint positions. SDK status alone is not proof that telemetry is available.
+
+Enter a unique name, review the command, confirm the robot workspace is clear, keep the emergency stop accessible, and select **Run & record on robot**. The app runs the command on the physical robot while sampling positions. Only arm actions/static poses and waits are accepted for legacy capture. DUET commands are restricted to approved arm-only operations. Captures are limited to 30 seconds and 601 samples. Use **Stop robot** if needed; a capture or feedback error does not automatically stop the active command, and a stop acknowledgement does not prove physical immobility.
+
+Saved recordings are teacher-owned and can be previewed on the 23-DOF simulator. DUET recordings animate the ten measured arm joints with the other joints neutral; legacy recordings animate the full 23-joint trajectory. **Export JSON** downloads one recording and **Export all JSON** downloads the teacher's complete recording set. The versioned JSON includes the robot model, controller, original command, named joint order, radians, capture time, and timestamped samples. Keep this export and provide it when requesting a permanent simulator trajectory; exporting does not itself alter the simulator's built-in motions.
+
+These are position recordings, not safety certification or confirmation that the robot physically followed the expected command. Legacy capture requires the sensor/ROS runtime to be configured and live; hardware capture and command-to-trajectory correspondence still require operator-supervised validation.
+
 ## DUET prompt and vision motion
 
 When DUET v2 is selected, **Prompt to Motion** and **Vision to Motion** both offer two modes:

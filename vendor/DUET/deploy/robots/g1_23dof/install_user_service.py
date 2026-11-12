@@ -6,9 +6,14 @@ import os
 import re
 import sys
 from pathlib import Path
+from typing import Optional
 
 
 CONTROLLER_DIR = Path(__file__).resolve().parent
+PROJECT_DIR = CONTROLLER_DIR.parents[4]
+sys.path.insert(0, str(PROJECT_DIR / "backend"))
+from duet_setup import resolve_loaded_policy
+
 INTERFACE_PATTERN = re.compile(r"^[A-Za-z0-9_.:-]+$")
 CONTROL_DIR_SUFFIX = Path(".cache/uni-edu-duet")
 SOCKET_PATH_LIMIT = 108
@@ -26,11 +31,19 @@ def validate_interface(interface: str, sysfs_root: Path = Path("/sys/class/net")
         )
 
 
-def render_unit(controller_dir: Path, home: Path, interface: str) -> str:
+def render_unit(
+    controller_dir: Path,
+    home: Path,
+    interface: str,
+    control_dir: Optional[Path] = None,
+) -> str:
     controller_dir = controller_dir.resolve()
     home = home.resolve()
     executable = controller_dir / "build" / "g1_ctrl"
-    control_dir = home / CONTROL_DIR_SUFFIX
+    control_dir = control_dir or (home / CONTROL_DIR_SUFFIX)
+    if not control_dir.is_absolute():
+        raise ValueError("DUET_CONTROL_DIR must be an absolute path.")
+    control_dir = control_dir.resolve()
 
     for value in (str(controller_dir), str(executable), str(control_dir)):
         if any(char in value for char in ('"', "\\", "%", "$")) or any(
@@ -72,6 +85,12 @@ def main() -> int:
         required=True,
         help="present G1-host DDS network interface, as accepted by g1_ctrl --network",
     )
+    parser.add_argument(
+        "--control-dir",
+        type=Path,
+        default=Path(os.environ.get("DUET_CONTROL_DIR", Path.home() / CONTROL_DIR_SUFFIX)),
+        help="absolute local socket directory shared with the Uni-EDU backend",
+    )
     args = parser.parse_args()
 
     if os.geteuid() == 0:
@@ -79,27 +98,19 @@ def main() -> int:
     try:
         validate_interface(args.interface)
         executable = CONTROLLER_DIR / "build" / "g1_ctrl"
-        policy = (
-            CONTROLLER_DIR
-            / "config"
-            / "policy"
-            / "velocity"
-            / "v0"
-            / "exported"
-            / "policy.onnx"
-        )
         if not executable.is_file() or not os.access(executable, os.X_OK):
             raise ValueError(
                 f"controller binary not found or not executable: {executable}; "
                 "build deploy/robots/g1_23dof first."
             )
-        if not policy.is_file():
-            raise ValueError(f"configured DUET policy is missing: {policy}")
+        policy = resolve_loaded_policy(CONTROLLER_DIR)
 
         home = Path.home().resolve()
         unit_dir = home / ".config" / "systemd" / "user"
         unit_path = unit_dir / "duet-g1-controller.service"
-        unit_text = render_unit(CONTROLLER_DIR, home, args.interface)
+        if not args.control_dir.is_absolute():
+            raise ValueError("--control-dir must be absolute")
+        unit_text = render_unit(CONTROLLER_DIR, home, args.interface, args.control_dir)
         unit_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
         if unit_path.exists():
             if unit_path.read_text(encoding="utf-8") == unit_text:
@@ -122,9 +133,16 @@ def main() -> int:
         return 1
 
     print(f"Installed {unit_path}")
-    print(f"Controller and backend control directory: {home / CONTROL_DIR_SUFFIX}")
-    print("The unit is not enabled or started. Review it, then run:")
+    print(f"Controller and backend control directory: {args.control_dir.resolve()}")
+    print(f"Controller-configured policy: {policy}")
+    print("The unit is not enabled or started.")
     print("  systemctl --user daemon-reload")
+    print(
+        "CAUTION: Starting this service initializes the physical G1 controller. "
+        "Only proceed after reviewing the unit, verifying the target robot and DDS "
+        "interface, clearing the area, and ensuring a qualified operator is present."
+    )
+    print("When the operator is ready, start it explicitly:")
     print("  systemctl --user start duet-g1-controller.service")
     return 0
 

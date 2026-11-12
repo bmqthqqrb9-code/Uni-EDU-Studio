@@ -40,9 +40,11 @@ import {
   validateDuetArmMotion,
 } from './sim/duetArmMotions.js';
 import { simulateDuetG1Edu23Program } from './sim/duetG1Edu23Env.js';
+import { buildG1RecordedMotionFrames } from './sim/g1RecordedArmMotion.js';
 import { analyzeDuetVideo, captureDuetLiveMotion } from './sim/duetVisionMotion.js';
 import { createRobotConnection } from './robot/RobotConnection';
 import { DuetRobotConnection } from './robot/DuetRobotConnection.js';
+import TeacherArmMotionRecorder from './components/TeacherArmMotionRecorder.jsx';
 
 const blocklyRuntime = Object.assign({}, Blockly, { Python: pythonGenerator });
 window.Blockly = blocklyRuntime;
@@ -879,6 +881,8 @@ export default function App() {
   const [projectMenuPosition, setProjectMenuPosition] = useState(null);
   const [showConfigEditor, setShowConfigEditor] = useState(false);
   const [showAppSettings, setShowAppSettings] = useState(false);
+  const [isArmMotionRecording, setIsArmMotionRecording] = useState(false);
+  const [recordedMotionPreview, setRecordedMotionPreview] = useState(null);
   const [isBlocklyLoaded, setIsBlocklyLoaded] = useState(false);
   
   const [promptState, setPromptState] = useState({ isOpen: false, message: '', defaultValue: '', callback: null, inputValue: '' });
@@ -2472,6 +2476,15 @@ export default function App() {
       alert('Teacher login is required to connect the robot.');
       return;
     }
+    if (controllerVersion === 'duet' && !isRobotConnected) {
+      const approved = window.confirm(
+        'Starting the DUET controller initializes the physical G1 controller process. '
+        + 'This will not transition the FSM into Velocity or issue a motion command. '
+        + 'Continue only with the G1 and area checked, an operator present at the robot, '
+        + 'and a clear path to the physical stop controls.',
+      );
+      if (!approved) return;
+    }
     if (controllerVersion === 'duet' && isRobotConnected && isDuetProgramActive) {
       alert('Stop the active DUET program and wait for confirmed completion before disconnecting.');
       return;
@@ -2494,6 +2507,16 @@ export default function App() {
         return;
       }
       const connection = await activeRobotConnection.connect();
+      if (controllerVersion === 'duet' && connection.operatorActionRequired === true) {
+        setIsRobotConnected(false);
+        duetProgramActiveRef.current = false;
+        setIsDuetProgramActive(false);
+        setIsRunning(false);
+        setRobotConnectionStatus(connection.message || connection.error || (
+          'DUET service is running but the gateway is not ready. Use the G1 operator controls, then press Connect again.'
+        ));
+        return;
+      }
       if (connection.status !== 'connected' || (controllerVersion === 'duet' && connection.ready !== true)) {
         throw new Error('Backend did not confirm a connected robot.');
       }
@@ -2928,33 +2951,21 @@ export default function App() {
       alert('Wait for the current robot operation or connection attempt to finish before switching versions.');
       return;
     }
-    let duetOwnershipUnverified = false;
-    if (
-      controllerVersion === 'duet'
-      && nextVersion === 'legacy'
-      && (isRobotConnected || isDuetProgramActive)
-    ) {
+    if (controllerVersion === 'duet' && nextVersion === 'legacy') {
       setIsRobotConnecting(true);
       try {
-        let status = await duetRobotConnection.status();
-        if (status.connected === true || status.motionOwner === 'duet') {
-          const disconnected = await duetRobotConnection.disconnect();
-          if (disconnected.status !== 'disconnected' || disconnected.lowcmd_owner !== 'none') {
-            throw new Error('DUET did not confirm release of rt/lowcmd ownership.');
-          }
-          status = await duetRobotConnection.status();
-        }
-        if (status.connected === true || status.ready === true || status.motionOwner !== 'none') {
-          throw new Error(status.error || 'DUET motion ownership is not confirmed released.');
+        const status = await duetRobotConnection.status();
+        if (status.motionOwner !== 'none') {
+          throw new Error(
+            'DUET rt/lowcmd ownership is still active or cannot be verified. '
+            + 'Use the G1 operator controls to return the controller to Passive. '
+            + 'The app will not stop the DUET service; retry only after backend status confirms no DUET owner.',
+          );
         }
       } catch (error) {
-        if (error.status === 401) {
-          duetOwnershipUnverified = true;
-        } else {
-          setRobotConnectionStatus(`Cannot switch to legacy mode: ${error.message}`);
-          alert(`Cannot switch to legacy mode: ${error.message}`);
-          return;
-        }
+        setRobotConnectionStatus(`Cannot switch to legacy mode: ${error.message}`);
+        alert(`Cannot switch to legacy mode: ${error.message}`);
+        return;
       } finally {
         setIsRobotConnecting(false);
       }
@@ -2980,13 +2991,6 @@ export default function App() {
     setBlockSyncError('');
     setSafetyNotice('');
     setIsRobotConnected(false);
-
-    if (duetOwnershipUnverified) {
-      setRobotConnectionStatus(
-        'Legacy preview selected • DUET ownership could not be checked because the session expired. Sign in again before robot connection or motion; the backend ownership interlock remains active.',
-      );
-      return;
-    }
 
     if (!session || session.user.role !== 'teacher') {
       setRobotConnectionStatus(nextVersion === 'duet'
@@ -4616,14 +4620,26 @@ export default function App() {
     }
   }, [controllerVersion, generatedCode, simulatorMode, activeObstacles]);
 
+  const previewRecordedArmMotion = (recording) => {
+    try {
+      buildG1RecordedMotionFrames(recording);
+      setRecordedMotionPreview(recording);
+      setPlaybackProgress(0);
+      setIsPreviewPlaying(true);
+      setShowAppSettings(false);
+    } catch (error) {
+      alert(`Recorded motion cannot be previewed: ${error.message}`);
+    }
+  };
+
   const startSimulationPreview = () => {
-    if (!generatedCode.trim()) {
+    if (!recordedMotionPreview && !generatedCode.trim()) {
       alert('Add some robot commands before starting the simulation preview.');
       return;
     }
     setPlaybackProgress((progress) => progress >= 1 ? 0 : progress);
     setIsPreviewPlaying(true);
-    previewPreviewState();
+    if (!recordedMotionPreview) previewPreviewState();
   };
 
   const pauseSimulationPreview = () => {
@@ -4640,6 +4656,7 @@ export default function App() {
       alert('Add code or blocks before running the simulation.');
       return;
     }
+    setRecordedMotionPreview(null);
     setPlaybackProgress(0);
     setIsPreviewPlaying(true);
     setIsWaypointPlacementEnabled(false);
@@ -5730,9 +5747,10 @@ export default function App() {
               <button
                 type="button"
                 onClick={() => setShowAppSettings(false)}
+                disabled={isArmMotionRecording}
                 className="rounded-md px-3 py-1.5 text-sm font-medium text-slate-600 hover:bg-slate-200"
               >
-                Close
+                {isArmMotionRecording ? 'Recording…' : 'Close'}
               </button>
             </div>
             <div className="space-y-3 overflow-y-auto p-5">
@@ -5818,6 +5836,30 @@ export default function App() {
               </fieldset>
               {currentUser.role === 'teacher' && (
                 <>
+              <TeacherArmMotionRecorder
+                connection={activeRobotConnection}
+                controllerVersion={controllerVersion}
+                onBusyChange={setIsArmMotionRecording}
+                onPreview={previewRecordedArmMotion}
+              />
+              {recordedMotionPreview && (
+                <div className="flex flex-wrap items-center justify-between gap-2 rounded-lg border border-violet-200 bg-white px-3 py-2">
+                  <p className="text-xs text-violet-900">
+                    Previewing measured motion: <strong>{recordedMotionPreview.name}</strong>
+                  </p>
+                  <button
+                    type="button"
+                    onClick={() => {
+                      setRecordedMotionPreview(null);
+                      setIsPreviewPlaying(false);
+                      setPlaybackProgress(0);
+                    }}
+                    className="rounded-md border border-violet-300 px-2 py-1 text-[11px] font-semibold text-violet-900"
+                  >
+                    Return to command preview
+                  </button>
+                </div>
+              )}
               <section className="rounded-xl border border-slate-200 bg-slate-50 p-4">
                 <h3 className="text-sm font-semibold uppercase tracking-wide text-slate-700">Manage classroom accounts</h3>
                 <div className="mt-3 rounded-lg border border-emerald-200 bg-emerald-50 p-3">
@@ -6139,7 +6181,7 @@ export default function App() {
                   type="checkbox"
                   aria-label="Enable DUET version two"
                   checked={controllerVersion === 'duet'}
-                  disabled={isRunning || isRobotConnecting || isDuetCommissioningBusy || isDuetCommissioningAborting}
+                  disabled={isRunning || isRobotConnecting || isDuetCommissioningBusy || isDuetCommissioningAborting || isArmMotionRecording}
                   onChange={(event) => handleControllerVersionChange(event.target.checked)}
                   className="h-5 w-5 shrink-0 accent-blue-700"
                 />
@@ -6987,6 +7029,7 @@ export default function App() {
                 code={generatedCode}
                 simulatorState={simulatorState}
                 controllerVersion={controllerVersion}
+                recordedMotionPreview={recordedMotionPreview}
                 obstacles={activeObstacles}
                 waypoints={plannerWaypoints}
                 isWaypointPlacementEnabled={isWaypointPlacementEnabled}

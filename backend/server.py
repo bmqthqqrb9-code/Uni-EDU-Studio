@@ -18,6 +18,7 @@ import zlib
 import logging
 import subprocess
 from datetime import datetime, timezone
+from pathlib import Path
 from typing import Dict, List, Optional, Literal
 from urllib.parse import quote, urlparse, urlsplit, urlunsplit
 
@@ -27,7 +28,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.middleware.gzip import GZipMiddleware
 from fastapi.responses import FileResponse, Response
 from fastapi.staticfiles import StaticFiles
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 try:
     from .g1_robot import (
         CommandValidationError,
@@ -58,6 +59,7 @@ try:
     from .camera_discovery import discover_camera_sources
     from .lidar_distance import distance_sensor_status
     from .safe_mode import SAFE_MODE_STOP_MARGIN_METERS
+    from .ros.g1_joint_state import JOINT_MOTOR_INDICES
     from .ros_lidar_provider import (
         MAX_CAMERA_FRAME_BYTES,
         MAX_CAMERA_HEIGHT,
@@ -112,6 +114,7 @@ except ImportError:
     from camera_discovery import discover_camera_sources
     from lidar_distance import distance_sensor_status
     from safe_mode import SAFE_MODE_STOP_MARGIN_METERS
+    from ros.g1_joint_state import JOINT_MOTOR_INDICES
     from ros_lidar_provider import (
         MAX_CAMERA_FRAME_BYTES,
         MAX_CAMERA_HEIGHT,
@@ -136,6 +139,13 @@ except ImportError:
         navigation_start_route,
     )
     from map_alignment import MapAlignmentError, align_occupancy_maps, transform_pose_between_maps
+
+G1_JOINT_NAMES = tuple(name for name, _ in JOINT_MOTOR_INDICES)
+DUET_ARM_JOINT_NAMES = tuple(
+    name for name in G1_JOINT_NAMES
+    if name.startswith(("left_shoulder_", "right_shoulder_"))
+    or name.endswith(("_elbow_joint", "_wrist_roll_joint"))
+)
 
 # 确保 unitree_sdk2py 在路径中
 # 假设 backend 文件夹与 unitree_sdk2py 同级，或者已安装
@@ -187,6 +197,25 @@ class DuetProgramRequest(BaseModel):
 class DuetMotionSaveRequest(BaseModel):
     name: str
     code: str
+
+
+class DuetArmRecordingFrame(BaseModel):
+    time: float
+    joints: List[float]
+
+
+class DuetArmRecordingSaveRequest(BaseModel):
+    name: str
+    frames: List[DuetArmRecordingFrame] = Field(min_length=2, max_length=601)
+
+
+class RobotMotionRecordingSaveRequest(BaseModel):
+    name: str
+    controller_version: Literal["legacy", "duet"]
+    command: str = Field(max_length=20_000)
+    joint_names: List[str]
+    captured_at: Optional[datetime] = None
+    frames: List[DuetArmRecordingFrame] = Field(min_length=2, max_length=601)
 
 
 class DuetCommissioningReviewRequest(BaseModel):
@@ -757,6 +786,99 @@ def active_lidar_scan():
     return dict(row) if row else None
 
 
+DUET_CONTROLLER_UNIT = "duet-g1-controller.service"
+
+
+def _validated_duet_controller_unit() -> Path:
+    project_dir = Path(__file__).resolve().parents[1]
+    controller_dir = project_dir / "vendor" / "DUET" / "deploy" / "robots" / "g1_23dof"
+    unit_path = Path.home() / ".config" / "systemd" / "user" / DUET_CONTROLLER_UNIT
+    expected_control_dir = os.getenv("DUET_CONTROL_DIR", "").strip()
+    if not expected_control_dir:
+        expected_control_dir = str(Path.home() / ".cache" / "uni-edu-duet")
+    control_dir_path = Path(expected_control_dir).expanduser()
+    if not control_dir_path.is_absolute():
+        raise DuetControllerError("DUET_CONTROL_DIR must be absolute before starting the DUET controller.")
+    try:
+        expected_control_dir = str(control_dir_path.resolve(strict=False))
+    except OSError as error:
+        raise DuetControllerError(f"Could not resolve DUET_CONTROL_DIR: {error}") from error
+    if unit_path.is_symlink() or not unit_path.is_file():
+        raise DuetControllerError(
+            "The manual DUET controller unit is not installed for this user. "
+            "Run backend/install_g1_service.sh on the G1 host first."
+        )
+    try:
+        unit = unit_path.read_text(encoding="utf-8")
+    except OSError as error:
+        raise DuetControllerError(f"Could not inspect the installed DUET controller unit: {error}") from error
+    required = (
+        f"WorkingDirectory={controller_dir}",
+        f"ExecStart={controller_dir}/build/g1_ctrl --network ",
+        f"Environment=DUET_CONTROL_DIR={expected_control_dir}",
+        "Environment=DUET_GATEWAY_ENABLED=true",
+        "Restart=no",
+    )
+    if any(entry not in unit for entry in required):
+        raise DuetControllerError(
+            "The installed DUET controller unit does not match this checkout or the backend "
+            "DUET_CONTROL_DIR. Review the unit and rerun G1 setup; it will not be started."
+        )
+    return unit_path
+
+
+def _duet_systemctl(*arguments: str) -> subprocess.CompletedProcess:
+    try:
+        return subprocess.run(
+            ["systemctl", "--user", *arguments],
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+    except (OSError, subprocess.TimeoutExpired) as error:
+        raise DuetControllerError(f"Could not query the DUET user service: {error}") from error
+
+
+def duet_controller_service_state() -> str:
+    _validated_duet_controller_unit()
+    result = _duet_systemctl("show", DUET_CONTROLLER_UNIT, "--property=ActiveState", "--value")
+    if result.returncode != 0:
+        reloaded = _duet_systemctl("daemon-reload")
+        if reloaded.returncode != 0:
+            detail = (reloaded.stderr or reloaded.stdout).strip()
+            raise DuetControllerError(f"Could not reload the installed DUET unit: {detail}")
+        result = _duet_systemctl("show", DUET_CONTROLLER_UNIT, "--property=ActiveState", "--value")
+    if result.returncode != 0:
+        detail = (result.stderr or result.stdout).strip()
+        raise DuetControllerError(f"Could not read DUET controller service state: {detail}")
+    return result.stdout.strip()
+
+
+def start_duet_controller_service() -> str:
+    state = duet_controller_service_state()
+    if state == "active":
+        return state
+    if state not in {"inactive", "dead"}:
+        raise DuetControllerError(
+            f"DUET controller service is {state or 'in an unknown state'}; inspect its user journal "
+            "instead of retrying startup."
+        )
+    started = _duet_systemctl("start", DUET_CONTROLLER_UNIT)
+    if started.returncode != 0:
+        detail = (started.stderr or started.stdout).strip()
+        raise DuetControllerError(
+            f"Could not start the installed DUET controller service: {detail or 'systemctl failed'}"
+        )
+    state = duet_controller_service_state()
+    if state != "active":
+        raise DuetControllerError(
+            f"DUET controller service start did not reach active state (state: {state or 'unknown'}). "
+            f"Inspect: journalctl --user -u {DUET_CONTROLLER_UNIT}"
+        )
+    return state
+
+
 def ensure_sdk_motion_available() -> None:
     duet_owns_motion, duet_ownership_error = duet_controller_owns_motion()
     if duet_owns_motion:
@@ -1132,6 +1254,50 @@ def init_db():
             PRIMARY KEY (username, motion_id),
             UNIQUE (username, name)
         )
+        """
+    )
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS duet_arm_recordings (
+            recording_id TEXT NOT NULL,
+            username TEXT NOT NULL,
+            name TEXT NOT NULL,
+            frames TEXT NOT NULL,
+            created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            captured_at TEXT NOT NULL DEFAULT '',
+            PRIMARY KEY (username, recording_id),
+            UNIQUE (username, name)
+        )
+        """
+    )
+    recording_columns = {
+        row["name"] for row in conn.execute("PRAGMA table_info(duet_arm_recordings)").fetchall()
+    }
+    if "controller_version" not in recording_columns:
+        conn.execute(
+            "ALTER TABLE duet_arm_recordings ADD COLUMN controller_version TEXT NOT NULL DEFAULT 'duet'"
+        )
+    if "command" not in recording_columns:
+        conn.execute(
+            "ALTER TABLE duet_arm_recordings ADD COLUMN command TEXT NOT NULL DEFAULT ''"
+        )
+    if "joint_names" not in recording_columns:
+        conn.execute(
+            "ALTER TABLE duet_arm_recordings ADD COLUMN joint_names TEXT NOT NULL DEFAULT '[]'"
+        )
+    conn.execute(
+        "UPDATE duet_arm_recordings SET joint_names = ? WHERE joint_names = '[]'",
+        (json.dumps(DUET_ARM_JOINT_NAMES, separators=(",", ":")),),
+    )
+    if "captured_at" not in recording_columns:
+        conn.execute(
+            "ALTER TABLE duet_arm_recordings ADD COLUMN captured_at TEXT NOT NULL DEFAULT ''"
+        )
+    conn.execute(
+        """
+        UPDATE duet_arm_recordings
+        SET captured_at = REPLACE(created_at, ' ', 'T') || 'Z'
+        WHERE captured_at = ''
         """
     )
     conn.execute(
@@ -1848,6 +2014,187 @@ def save_duet_motion_for_user(username: str, name: str, code: str) -> dict:
         "code": row["code"],
         "created_at": row["created_at"],
     }
+
+
+def list_robot_motion_recordings_for_user(
+    username: str,
+    controller_version: str | None = None,
+) -> list[dict]:
+    conn = get_db_connection()
+    if controller_version:
+        rows = conn.execute(
+            """
+            SELECT recording_id, name, frames, created_at, captured_at, controller_version, command, joint_names
+            FROM duet_arm_recordings
+            WHERE username = ? AND controller_version = ?
+            ORDER BY name COLLATE NOCASE, recording_id
+            """,
+            (username, controller_version),
+        ).fetchall()
+    else:
+        rows = conn.execute(
+            """
+            SELECT recording_id, name, frames, created_at, captured_at, controller_version, command, joint_names
+            FROM duet_arm_recordings
+            WHERE username = ?
+            ORDER BY name COLLATE NOCASE, recording_id
+            """,
+            (username,),
+        ).fetchall()
+    conn.close()
+    return [
+        {
+            "id": row["recording_id"],
+            "name": row["name"],
+            "frames": json.loads(row["frames"]),
+            "created_at": row["created_at"],
+            "captured_at": row["captured_at"],
+            "controller_version": row["controller_version"],
+            "command": row["command"],
+            "joint_names": json.loads(row["joint_names"]),
+        }
+        for row in rows
+    ]
+
+
+def list_duet_arm_recordings_for_user(username: str) -> list[dict]:
+    return list_robot_motion_recordings_for_user(username, "duet")
+
+
+def save_robot_motion_recording_for_user(
+    username: str,
+    name: str,
+    controller_version: str,
+    command: str,
+    joint_names: list[str],
+    frames: list[DuetArmRecordingFrame],
+    captured_at: datetime | None = None,
+) -> dict:
+    normalized_name = _validate_duet_motion_name(name)
+    expected_joint_names = (
+        G1_JOINT_NAMES if controller_version == "legacy" else DUET_ARM_JOINT_NAMES
+    )
+    if controller_version not in {"legacy", "duet"} or joint_names != list(expected_joint_names):
+        raise HTTPException(status_code=400, detail="Recording joint names do not match the selected controller.")
+    if not 2 <= len(frames) <= 601:
+        raise HTTPException(status_code=400, detail="A recording must contain 2 to 601 joint samples.")
+
+    validated_frames = []
+    previous_time = -1.0
+    for index, frame in enumerate(frames):
+        if (
+            not math.isfinite(frame.time)
+            or frame.time < 0
+            or frame.time > 30
+            or frame.time <= previous_time
+        ):
+            raise HTTPException(
+                status_code=400,
+                detail="Recording sample times must increase from zero and stay within 30 seconds.",
+            )
+        if len(frame.joints) != len(expected_joint_names) or any(
+            not math.isfinite(value) for value in frame.joints
+        ):
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    f"Recording sample {index + 1} must contain "
+                    f"{len(expected_joint_names)} finite joint positions."
+                ),
+            )
+        validated_frames.append({
+            "time": frame.time,
+            "joints": frame.joints,
+        })
+        previous_time = frame.time
+
+    if validated_frames[0]["time"] != 0:
+        raise HTTPException(status_code=400, detail="The first recording sample must start at time zero.")
+    capture_time = captured_at or datetime.now(timezone.utc)
+    if capture_time.tzinfo is None or capture_time.utcoffset() is None:
+        raise HTTPException(status_code=400, detail="Recording capture time must include a timezone.")
+    captured_at_text = capture_time.astimezone(timezone.utc).isoformat().replace("+00:00", "Z")
+
+    conn = get_db_connection()
+    existing_names = {
+        row["name"].casefold()
+        for row in conn.execute(
+            "SELECT name FROM duet_arm_recordings WHERE username = ?",
+            (username,),
+        ).fetchall()
+    }
+    if normalized_name.casefold() in existing_names:
+        conn.close()
+        raise HTTPException(status_code=409, detail=f"A recorded motion named {normalized_name!r} already exists.")
+    if len(existing_names) >= 50:
+        conn.close()
+        raise HTTPException(status_code=409, detail="The recorded motion library is limited to 50 items.")
+
+    recording_id = f"capture_{uuid.uuid4().hex[:12]}"
+    conn.execute(
+        """
+        INSERT INTO duet_arm_recordings
+            (recording_id, username, name, frames, controller_version, command, joint_names, captured_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            recording_id,
+            username,
+            normalized_name,
+            json.dumps(validated_frames, separators=(",", ":"), allow_nan=False),
+            controller_version,
+            command,
+            json.dumps(joint_names, separators=(",", ":")),
+            captured_at_text,
+        ),
+    )
+    conn.commit()
+    row = conn.execute(
+        """
+        SELECT recording_id, name, frames, created_at, captured_at, controller_version, command, joint_names
+        FROM duet_arm_recordings
+        WHERE username = ? AND recording_id = ?
+        """,
+        (username, recording_id),
+    ).fetchone()
+    conn.close()
+    return {
+        "id": row["recording_id"],
+        "name": row["name"],
+        "frames": json.loads(row["frames"]),
+        "created_at": row["created_at"],
+        "captured_at": row["captured_at"],
+        "controller_version": row["controller_version"],
+        "command": row["command"],
+        "joint_names": json.loads(row["joint_names"]),
+    }
+
+
+def save_duet_arm_recording_for_user(
+    username: str,
+    name: str,
+    frames: list[DuetArmRecordingFrame],
+) -> dict:
+    return save_robot_motion_recording_for_user(
+        username,
+        name,
+        "duet",
+        "",
+        list(DUET_ARM_JOINT_NAMES),
+        frames,
+    )
+
+
+def delete_duet_arm_recording_for_user(username: str, recording_id: str) -> bool:
+    conn = get_db_connection()
+    result = conn.execute(
+        "DELETE FROM duet_arm_recordings WHERE username = ? AND recording_id = ?",
+        (username, recording_id),
+    )
+    conn.commit()
+    deleted = result.rowcount > 0
+    conn.close()
+    return deleted
 
 
 def expand_duet_motion_calls(code: str, username: str) -> str:
@@ -3508,6 +3855,81 @@ def get_robot_status(response: Response, user: dict = Depends(auth_required)):
     return {**status, "distanceSensor": distance_sensor_status()}
 
 
+@app.get("/api/robot/joint-state")
+def get_robot_joint_state(response: Response, user: dict = Depends(auth_required)):
+    _require_teacher(user)
+    response.headers["Cache-Control"] = "no-store, no-cache, max-age=0"
+    provider_url = os.getenv("G1_DISTANCE_PROVIDER_URL", "").strip()
+    provider_token = os.getenv("G1_DISTANCE_PROVIDER_TOKEN", "").strip()
+    parsed_provider = urlsplit(provider_url)
+    if (
+        not provider_url
+        or not provider_token
+        or parsed_provider.scheme not in {"http", "https"}
+        or not parsed_provider.netloc
+    ):
+        raise HTTPException(status_code=503, detail="Authenticated ROS joint-state provider is not configured.")
+    if (
+        parsed_provider.scheme == "http"
+        and parsed_provider.hostname not in {"127.0.0.1", "::1", "localhost"}
+    ):
+        raise HTTPException(status_code=503, detail="Remote ROS joint-state providers require HTTPS.")
+    provider_path = parsed_provider.path.rstrip("/")
+    for suffix in ("/distance/front", "/distance/rear"):
+        if provider_path.endswith(suffix):
+            provider_path = provider_path[:-len(suffix)]
+            break
+    else:
+        raise HTTPException(status_code=503, detail="ROS joint-state provider URL has an unsupported path.")
+    joint_state_url = urlunsplit(
+        (parsed_provider.scheme, parsed_provider.netloc, f"{provider_path}/joint_state", "", "")
+    )
+    try:
+        provider_response = httpx.get(
+            joint_state_url,
+            headers={"Authorization": f"Bearer {provider_token}", "Accept": "application/json"},
+            timeout=0.5,
+            follow_redirects=False,
+        )
+    except httpx.HTTPError as error:
+        raise HTTPException(status_code=503, detail="ROS joint-state provider could not be reached.") from error
+    try:
+        payload = provider_response.json()
+    except ValueError:
+        payload = {}
+    if provider_response.status_code != 200:
+        detail = payload.get("error") if isinstance(payload, dict) else None
+        raise HTTPException(
+            status_code=503,
+            detail=detail if isinstance(detail, str) else "Fresh ROS joint-state data is unavailable.",
+        )
+    if (
+        not isinstance(payload, dict)
+        or payload.get("joint_names") != list(G1_JOINT_NAMES)
+        or not isinstance(payload.get("received_at"), str)
+        or not payload["received_at"]
+        or not isinstance(payload.get("positions_rad"), list)
+        or len(payload["positions_rad"]) != len(G1_JOINT_NAMES)
+        or any(
+            isinstance(position, bool)
+            or not isinstance(position, (int, float))
+            or not math.isfinite(position)
+            for position in payload["positions_rad"]
+        )
+        or isinstance(payload.get("age_ms"), bool)
+        or not isinstance(payload.get("age_ms"), (int, float))
+        or not math.isfinite(payload["age_ms"])
+        or not 0 <= payload["age_ms"] <= 250
+    ):
+        raise HTTPException(status_code=502, detail="ROS joint-state provider returned invalid or stale data.")
+    return {
+        "joint_names": payload["joint_names"],
+        "positions_rad": payload["positions_rad"],
+        "received_at": payload.get("received_at"),
+        "age_ms": payload["age_ms"],
+    }
+
+
 @app.post("/api/duet/connect")
 def duet_connect(user: dict = Depends(auth_required)):
     if user["role"] != "teacher":
@@ -3518,8 +3940,8 @@ def duet_connect(user: dict = Depends(auth_required)):
         current = duet_controller_status()
         if current.get("controlLease") and current.get("ready") and current.get("motionOwner") == "duet":
             return current
-        if current.get("motionOwner") == "unknown":
-            raise HTTPException(status_code=409, detail=current.get("error") or "DUET controller ownership is unknown.")
+        if current.get("programActive"):
+            raise HTTPException(status_code=409, detail="Stop the active DUET program before connecting.")
         if robot_status().get("running"):
             raise HTTPException(status_code=409, detail="Stop the active SDK robot program before connecting DUET.")
         if active_navigation_operation():
@@ -3530,6 +3952,71 @@ def duet_connect(user: dict = Depends(auth_required)):
                 status_code=409,
                 detail=f"LiDAR scan {scan['job_id']} is capturing the room; stop it before connecting DUET.",
             )
+        if current.get("motionOwner") == "unknown":
+            service_state = duet_controller_service_state()
+            if service_state == "active":
+                return {
+                    **current,
+                    "status": "service_active_gateway_unavailable",
+                    "operatorActionRequired": True,
+                    "message": (
+                        "The DUET controller service is already running, but its motion gateway "
+                        "is unavailable. Do not start another controller. If the G1 is in Passive, "
+                        "use its operator controls to enter the configured Velocity state, then "
+                        "press Connect again. Otherwise verify its DDS/interface and service logs."
+                    ),
+                }
+            raise HTTPException(
+                status_code=409,
+                detail=(
+                    current.get("error")
+                    or "DUET ownership is unknown; refusing to start a second controller."
+                ),
+            )
+        if current.get("motionOwner") not in {"none", None}:
+            raise HTTPException(
+                status_code=409,
+                detail="DUET controller ownership is not confirmed released; refusing controller startup.",
+            )
+
+        service_state = duet_controller_service_state()
+        if service_state in {"inactive", "dead"}:
+            start_duet_controller_service()
+        elif service_state != "active":
+            raise HTTPException(
+                status_code=409,
+                detail=f"DUET controller service is {service_state or 'in an unknown state'}; inspect its journal.",
+            )
+
+        current = duet_controller_status()
+        if current.get("motionOwner") == "unknown":
+            return {
+                **current,
+                "status": "service_started_waiting_for_operator",
+                "operatorActionRequired": True,
+                "message": (
+                    "DUET controller service started, but the command gateway is not available. "
+                    "The app did not change the FSM or issue motion. Use the G1 operator controls "
+                    "to enter the configured Velocity state, then press Connect again. If it is "
+                    "already there, check the DDS interface, shared DUET_CONTROL_DIR, and service logs."
+                ),
+            }
+        if current.get("motionOwner") == "none":
+            service_state = duet_controller_service_state()
+            if service_state == "active":
+                return {
+                    **current,
+                    "status": "service_started_waiting_for_operator",
+                    "operatorActionRequired": True,
+                    "message": (
+                        "DUET controller service started, but no command gateway is ready. "
+                        "Use the G1 operator controls to enter the configured Velocity state, "
+                        "then press Connect again. No FSM transition or motion was issued."
+                    ),
+                }
+            raise HTTPException(status_code=503, detail="DUET controller service did not remain active.")
+        if current.get("ready") is not True:
+            raise HTTPException(status_code=409, detail=current.get("error") or "DUET gateway is not ready.")
         return connect_duet_controller()
     except DuetProgramValidationError as error:
         raise HTTPException(status_code=400, detail=str(error)) from error
@@ -3601,6 +4088,65 @@ def create_duet_motion(request: DuetMotionSaveRequest, user: dict = Depends(auth
     if user["role"] != "teacher":
         raise HTTPException(status_code=403, detail="Teacher role required")
     return {"motion": save_duet_motion_for_user(user["username"], request.name, request.code)}
+
+
+@app.get("/api/duet/recordings")
+def get_duet_arm_recordings(user: dict = Depends(auth_required)):
+    if user["role"] != "teacher":
+        raise HTTPException(status_code=403, detail="Teacher role required")
+    return {"recordings": list_duet_arm_recordings_for_user(user["username"])}
+
+
+@app.get("/api/robot/recordings")
+def get_robot_motion_recordings(user: dict = Depends(auth_required)):
+    _require_teacher(user)
+    return {"recordings": list_robot_motion_recordings_for_user(user["username"])}
+
+
+@app.post("/api/robot/recordings")
+def create_robot_motion_recording(
+    request: RobotMotionRecordingSaveRequest,
+    user: dict = Depends(auth_required),
+):
+    _require_teacher(user)
+    recording = save_robot_motion_recording_for_user(
+        user["username"],
+        request.name,
+        request.controller_version,
+        request.command,
+        request.joint_names,
+        request.frames,
+        request.captured_at,
+    )
+    return {"recording": recording}
+
+
+@app.delete("/api/robot/recordings/{recording_id}")
+def delete_robot_motion_recording(recording_id: str, user: dict = Depends(auth_required)):
+    _require_teacher(user)
+    if not delete_duet_arm_recording_for_user(user["username"], recording_id):
+        raise HTTPException(status_code=404, detail="Recorded motion not found.")
+    return {"deleted": True}
+
+
+@app.post("/api/duet/recordings")
+def create_duet_arm_recording(
+    request: DuetArmRecordingSaveRequest,
+    user: dict = Depends(auth_required),
+):
+    if user["role"] != "teacher":
+        raise HTTPException(status_code=403, detail="Teacher role required")
+    recording = save_duet_arm_recording_for_user(user["username"], request.name, request.frames)
+    return {"recording": recording}
+
+
+@app.delete("/api/duet/recordings/{recording_id}")
+def delete_duet_arm_recording(recording_id: str, user: dict = Depends(auth_required)):
+    if user["role"] != "teacher":
+        raise HTTPException(status_code=403, detail="Teacher role required")
+    if not delete_duet_arm_recording_for_user(user["username"], recording_id):
+        raise HTTPException(status_code=404, detail="Recorded motion not found.")
+    return {"deleted": True}
 
 
 @app.post("/api/duet/stop")

@@ -48,6 +48,19 @@ class UserServiceInstallerTests(unittest.TestCase):
         self.assertNotIn("WantedBy=", unit)
         self.assertNotIn("ExecStartPre=", unit)
 
+    def test_custom_control_directory_is_shared_with_the_backend(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            custom_control_dir = root / "shared-duet"
+            unit = INSTALLER.render_unit(
+                root / "controller",
+                root / "home",
+                "enp1s0",
+                custom_control_dir,
+            )
+
+        self.assertIn(f"Environment=DUET_CONTROL_DIR={custom_control_dir}", unit)
+
     def test_rejects_missing_or_malformed_network_interfaces(self):
         with tempfile.TemporaryDirectory() as temporary_directory:
             sysfs = Path(temporary_directory)

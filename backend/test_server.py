@@ -17,6 +17,119 @@ app = server.app
 
 
 class ServerClassroomTests(unittest.TestCase):
+    def test_duet_service_connect_is_teacher_only(self):
+        with patch.object(server, "start_duet_controller_service") as start_service:
+            with self.assertRaises(HTTPException) as raised:
+                server.duet_connect({"role": "student"})
+
+        self.assertEqual(raised.exception.status_code, 403)
+        start_service.assert_not_called()
+
+    def test_duet_connect_starts_only_service_then_waits_for_operator_fsm_action(self):
+        passive_status = {
+            "status": "disconnected",
+            "connected": False,
+            "ready": False,
+            "controlLease": False,
+            "motionOwner": "none",
+            "motionActive": False,
+            "programActive": False,
+        }
+        gateway_unavailable = {
+            **passive_status,
+            "status": "unavailable",
+            "motionOwner": "unknown",
+            "error": "gateway is not available in Passive",
+        }
+        with patch.object(server, "duet_controller_status", side_effect=[passive_status, gateway_unavailable]), \
+                patch.object(server, "robot_status", return_value={"running": False}), \
+                patch.object(server, "active_navigation_operation", return_value=None), \
+                patch.object(server, "active_lidar_scan", return_value=None), \
+                patch.object(server, "duet_controller_service_state", return_value="inactive"), \
+                patch.object(server, "start_duet_controller_service", return_value="active") as start_service, \
+                patch.object(server, "connect_duet_controller") as acquire:
+            response = server.duet_connect({"role": "teacher"})
+
+        self.assertEqual(response["status"], "service_started_waiting_for_operator")
+        self.assertTrue(response["operatorActionRequired"])
+        self.assertIn("did not change the FSM", response["message"])
+        start_service.assert_called_once_with()
+        acquire.assert_not_called()
+
+    def test_duet_connect_never_starts_an_already_active_but_unavailable_controller(self):
+        unavailable = {
+            "status": "unavailable",
+            "connected": False,
+            "ready": False,
+            "motionOwner": "unknown",
+            "programActive": False,
+            "error": "gateway unavailable",
+        }
+        with patch.object(server, "duet_controller_status", return_value=unavailable), \
+                patch.object(server, "robot_status", return_value={"running": False}), \
+                patch.object(server, "active_navigation_operation", return_value=None), \
+                patch.object(server, "active_lidar_scan", return_value=None), \
+                patch.object(server, "duet_controller_service_state", return_value="active") as service_state, \
+                patch.object(server, "start_duet_controller_service") as start_service, \
+                patch.object(server, "connect_duet_controller") as acquire:
+            response = server.duet_connect({"role": "teacher"})
+
+        self.assertEqual(response["status"], "service_active_gateway_unavailable")
+        self.assertTrue(response["operatorActionRequired"])
+        service_state.assert_called_once_with()
+        start_service.assert_not_called()
+        acquire.assert_not_called()
+
+    def test_duet_connect_resource_interlock_prevents_service_start(self):
+        status = {
+            "status": "disconnected",
+            "connected": False,
+            "ready": False,
+            "controlLease": False,
+            "motionOwner": "none",
+            "motionActive": False,
+            "programActive": False,
+        }
+        with patch.object(server, "duet_controller_status", return_value=status), \
+                patch.object(server, "robot_status", return_value={"running": True}), \
+                patch.object(server, "start_duet_controller_service") as start_service:
+            with self.assertRaises(HTTPException) as raised:
+                server.duet_connect({"role": "teacher"})
+
+        self.assertEqual(raised.exception.status_code, 409)
+        start_service.assert_not_called()
+
+    def test_duet_service_start_uses_only_installed_manual_unit_and_never_enables(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            home = os.path.join(temp_dir, "teacher")
+            os.makedirs(os.path.join(home, ".config", "systemd", "user"))
+            project = os.path.dirname(os.path.dirname(os.path.abspath(server.__file__)))
+            controller = os.path.join(project, "vendor", "DUET", "deploy", "robots", "g1_23dof")
+            control_dir = os.path.join(home, ".cache", "uni-edu-duet")
+            unit_path = os.path.join(home, ".config", "systemd", "user", server.DUET_CONTROLLER_UNIT)
+            with open(unit_path, "w", encoding="utf-8") as unit_file:
+                unit_file.write(
+                    f"WorkingDirectory={controller}\n"
+                    f"ExecStart={controller}/build/g1_ctrl --network eth0\n"
+                    f"Environment=DUET_CONTROL_DIR={control_dir}\n"
+                    "Environment=DUET_GATEWAY_ENABLED=true\nRestart=no\n"
+                )
+            completed = [
+                subprocess.CompletedProcess([], 0, "inactive\n", ""),
+                subprocess.CompletedProcess([], 0, "", ""),
+                subprocess.CompletedProcess([], 0, "active\n", ""),
+                subprocess.CompletedProcess([], 0, "active\n", ""),
+            ]
+            with patch.object(server.Path, "home", return_value=server.Path(home)), \
+                    patch.dict(os.environ, {"DUET_CONTROL_DIR": control_dir}), \
+                    patch.object(server.subprocess, "run", side_effect=completed) as run:
+                state = server.start_duet_controller_service()
+
+        self.assertEqual(state, "active")
+        commands = [call.args[0] for call in run.call_args_list]
+        self.assertIn(["systemctl", "--user", "start", server.DUET_CONTROLLER_UNIT], commands)
+        self.assertFalse(any("enable" in command for command in commands))
+
     def test_classroom_code_library_includes_built_in_legacy_and_duet_starters(self):
         client = TestClient(app)
         with tempfile.TemporaryDirectory() as temp_dir, patch.object(
