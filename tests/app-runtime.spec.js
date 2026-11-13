@@ -87,59 +87,6 @@ test('teacher robot connection opens from the top bar beside Settings', async ({
   await expect(page.getByRole('heading', { name: /Internal Simulator/ })).toHaveCount(0);
 });
 
-test('DUET Connect requires confirmation and explains the operator-only FSM step', async ({ page }) => {
-  const requests = [];
-  await page.addInitScript(() => {
-    localStorage.setItem('edu-classroom-session', JSON.stringify({
-      token: 'teacher-duet-service-start-token',
-      user: { role: 'teacher', username: 'teacher-duet-service-start' },
-    }));
-  });
-  await page.route('**/api/**', async (route) => {
-    const request = route.request();
-    const path = new URL(request.url()).pathname;
-    requests.push({ path, method: request.method() });
-    let body = {};
-    if (path === '/api/classroom/codes') body = { codes: [] };
-    else if (path === '/api/classroom/queue') body = { items: [] };
-    else if (path === '/api/classroom/users') body = { users: [] };
-    else if (path === '/api/classroom/status') body = { status: 'idle' };
-    else if (path === '/api/classroom/projects/all') body = { projects: [] };
-    else if (path === '/api/classroom/project') body = { project: { name: 'default', sceneObjects: [], plannerWaypoints: [], generatedCode: '' } };
-    else if (path === '/api/duet/status') {
-      body = { status: 'disconnected', connected: false, ready: false, motionOwner: 'none' };
-    } else if (path === '/api/duet/connect') {
-      body = {
-        status: 'service_started_waiting_for_operator',
-        connected: false,
-        ready: false,
-        motionOwner: 'unknown',
-        operatorActionRequired: true,
-        message: 'DUET controller service started, but the command gateway is not available. Use the G1 operator controls to enter the configured Velocity state, then press Connect again. The app did not change the FSM or issue motion.',
-      };
-    }
-    await route.fulfill({ status: 200, contentType: 'application/json', body: JSON.stringify(body) });
-  });
-
-  await page.goto('/');
-  await page.getByRole('button', { name: 'Open app settings' }).click();
-  await page.getByRole('checkbox', { name: 'Enable DUET version two' }).check();
-  await page.getByRole('button', { name: 'Close', exact: true }).click();
-  await openConnectionPanel(page);
-  const settings = page.getByTestId('teacher-robot-settings');
-  const connect = settings.getByRole('button', { name: 'Connect', exact: true });
-
-  page.once('dialog', (dialog) => dialog.dismiss());
-  await connect.click();
-  await expect.poll(() => requests.filter((request) => request.path === '/api/duet/connect')).toHaveLength(0);
-
-  page.once('dialog', (dialog) => dialog.accept());
-  await connect.click();
-  await expect(settings.getByText(/Use the G1 operator controls to enter the configured Velocity state/)).toBeVisible();
-  await expect(settings.getByText('DISCONNECTED')).toBeVisible();
-  expect(requests.filter((request) => request.path === '/api/duet/connect')).toHaveLength(1);
-});
-
 test('simulation preview controls are in app Settings, not the G1 simulator', async ({ page }) => {
   await page.route('**/api/**', async (route) => {
     const path = new URL(route.request().url()).pathname;

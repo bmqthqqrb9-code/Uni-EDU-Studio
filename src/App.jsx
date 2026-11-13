@@ -2478,10 +2478,9 @@ export default function App() {
     }
     if (controllerVersion === 'duet' && !isRobotConnected) {
       const approved = window.confirm(
-        'Starting the DUET controller initializes the physical G1 controller process. '
-        + 'This will not transition the FSM into Velocity or issue a motion command. '
-        + 'Continue only with the G1 and area checked, an operator present at the robot, '
-        + 'and a clear path to the physical stop controls.',
+        'Start the DUET controller in its no-command handoff state? '
+        + 'The app will not change the FSM or issue motion. An onsite operator must verify '
+        + 'the G1 is stable before deliberately entering FixStand and Velocity with the controller.',
       );
       if (!approved) return;
     }
@@ -2492,7 +2491,7 @@ export default function App() {
 
     setIsRobotConnecting(true);
     setRobotConnectionStatus(controllerVersion === 'duet'
-      ? 'Connecting to the DUET G1 23-DOF controller gateway...'
+      ? 'Starting or connecting to the DUET G1 23-DOF controller...'
       : 'Connecting through the G1 host network interface...');
     try {
       if (controllerVersion === 'duet' && isRobotConnected) {
@@ -2513,7 +2512,7 @@ export default function App() {
         setIsDuetProgramActive(false);
         setIsRunning(false);
         setRobotConnectionStatus(connection.message || connection.error || (
-          'DUET service is running but the gateway is not ready. Use the G1 operator controls, then press Connect again.'
+          'DUET gateway is unavailable. Do not attempt a mode transition from the app; have a qualified operator verify the robot and follow its recovery procedure.'
         ));
         return;
       }
@@ -2955,11 +2954,11 @@ export default function App() {
       setIsRobotConnecting(true);
       try {
         const status = await duetRobotConnection.status();
-        if (status.motionOwner !== 'none') {
+        if (status.motionOwner !== 'none' || status.controllerServiceActive !== false) {
           throw new Error(
-            'DUET rt/lowcmd ownership is still active or cannot be verified. '
-            + 'Use the G1 operator controls to return the controller to Passive. '
-            + 'The app will not stop the DUET service; retry only after backend status confirms no DUET owner.',
+            'The DUET controller service is active or its state cannot be verified. '
+            + 'The app will not stop it; do not switch to legacy until an onsite operator has stopped DUET '
+            + 'and backend status confirms the service is inactive and ownership is released.',
           );
         }
       } catch (error) {

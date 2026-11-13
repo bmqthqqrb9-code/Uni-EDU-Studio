@@ -1,5 +1,7 @@
 FSM:
   _: # enabled fsms
+    Handoff:
+      id: 4
     Passive:
       id: 1
     FixStand:
@@ -11,6 +13,11 @@ FSM:
     # Mimic_Dance1_subject2:   # disabled: requires dance1_subject2.npz (not present)
     #   id: 5
     #   type: Mimic
+
+  Handoff:
+    transitions:
+      FixStand: "(LT + up.on_pressed) | F1.on_pressed"
+      # Same deliberate on-robot handoff as Passive; no command is published before it.
 
   Passive:
     transitions: 

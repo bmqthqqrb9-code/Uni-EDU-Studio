@@ -864,6 +864,15 @@ def start_duet_controller_service() -> str:
             f"DUET controller service is {state or 'in an unknown state'}; inspect its user journal "
             "instead of retrying startup."
         )
+    controller_dir = (
+        Path(__file__).resolve().parents[1]
+        / "vendor"
+        / "DUET"
+        / "deploy"
+        / "robots"
+        / "g1_23dof"
+    )
+    _validate_duet_handoff_build(controller_dir)
     started = _duet_systemctl("start", DUET_CONTROLLER_UNIT)
     if started.returncode != 0:
         detail = (started.stderr or started.stdout).strip()
@@ -879,11 +888,53 @@ def start_duet_controller_service() -> str:
     return state
 
 
+def _validate_duet_handoff_build(controller_dir: Path) -> None:
+    binary = controller_dir / "build" / "g1_ctrl"
+    sources = (
+        controller_dir / "main.cpp",
+        controller_dir / "config" / "config.yaml",
+        controller_dir.parents[1] / "include" / "FSM" / "State_Handoff.h",
+        controller_dir.parents[1] / "include" / "FSM" / "State_FixStand.h",
+        controller_dir.parents[1] / "include" / "FSM" / "CtrlFSM.h",
+    )
+    if not binary.is_file() or not os.access(binary, os.X_OK):
+        raise DuetControllerError(
+            "The DUET controller binary is missing or not executable. Run the G1 setup installer to build it."
+        )
+    try:
+        newest_source = max(source.stat().st_mtime_ns for source in sources)
+        binary_mtime = binary.stat().st_mtime_ns
+    except OSError as error:
+        raise DuetControllerError(f"Could not verify the DUET no-command handoff build: {error}") from error
+    if binary_mtime < newest_source:
+        raise DuetControllerError(
+            "The DUET controller binary predates the no-command handoff sources. "
+            "Run backend/install_g1_service.sh on the G1 host before connecting."
+        )
+
+
 def ensure_sdk_motion_available() -> None:
     duet_owns_motion, duet_ownership_error = duet_controller_owns_motion()
     if duet_owns_motion:
         detail = duet_ownership_error or "DUET owns the G1 motion controller; disconnect DUET before using SDK or ROS motion."
         raise HTTPException(status_code=409, detail=detail)
+    duet_unit_path = Path.home() / ".config" / "systemd" / "user" / DUET_CONTROLLER_UNIT
+    if duet_unit_path.exists() or duet_unit_path.is_symlink():
+        try:
+            duet_service_state = duet_controller_service_state()
+        except DuetControllerError as error:
+            raise HTTPException(
+                status_code=409,
+                detail=f"DUET service state cannot be verified; refusing SDK motion: {error}",
+            ) from error
+        if duet_service_state not in {"inactive", "dead"}:
+            raise HTTPException(
+                status_code=409,
+                detail=(
+                    f"DUET controller service is {duet_service_state or 'in an unknown state'}; "
+                    "stop and verify DUET ownership before using legacy SDK motion."
+                ),
+            )
     operation = active_navigation_operation()
     if operation:
         raise HTTPException(
@@ -3937,13 +3988,14 @@ def duet_connect(user: dict = Depends(auth_required)):
     if not _MOTION_START_LOCK.acquire(blocking=False):
         raise HTTPException(status_code=409, detail="Another robot motion operation is starting.")
     try:
+        sdk_status = robot_status()
+        if sdk_status.get("running"):
+            raise HTTPException(status_code=409, detail="Stop the active SDK robot program before connecting DUET.")
         current = duet_controller_status()
         if current.get("controlLease") and current.get("ready") and current.get("motionOwner") == "duet":
             return current
         if current.get("programActive"):
             raise HTTPException(status_code=409, detail="Stop the active DUET program before connecting.")
-        if robot_status().get("running"):
-            raise HTTPException(status_code=409, detail="Stop the active SDK robot program before connecting DUET.")
         if active_navigation_operation():
             raise HTTPException(status_code=409, detail="ROS navigation owns locomotion; stop it before connecting DUET.")
         scan = active_lidar_scan()
@@ -3961,27 +4013,30 @@ def duet_connect(user: dict = Depends(auth_required)):
                     "operatorActionRequired": True,
                     "message": (
                         "The DUET controller service is already running, but its motion gateway "
-                        "is unavailable. Do not start another controller. If the G1 is in Passive, "
-                        "use its operator controls to enter the configured Velocity state, then "
-                        "press Connect again. Otherwise verify its DDS/interface and service logs."
+                        "is unavailable and its controller startup state cannot be verified. "
+                        "Do not send commands or attempt a mode transition based on this status. "
+                        "Have an onsite operator verify the controller build, service logs, and "
+                        "the robot's physical state before taking further action."
                     ),
                 }
             raise HTTPException(
                 status_code=409,
                 detail=(
                     current.get("error")
-                    or "DUET ownership is unknown; refusing to start a second controller."
+                    or "DUET ownership is unknown; refusing to connect or change controller ownership."
                 ),
             )
         if current.get("motionOwner") not in {"none", None}:
             raise HTTPException(
                 status_code=409,
-                detail="DUET controller ownership is not confirmed released; refusing controller startup.",
+                detail="DUET controller ownership is not confirmed released; refusing to connect.",
             )
 
         service_state = duet_controller_service_state()
+        service_started = False
         if service_state in {"inactive", "dead"}:
             start_duet_controller_service()
+            service_started = True
         elif service_state != "active":
             raise HTTPException(
                 status_code=409,
@@ -3989,32 +4044,28 @@ def duet_connect(user: dict = Depends(auth_required)):
             )
 
         current = duet_controller_status()
-        if current.get("motionOwner") == "unknown":
+        if current.get("motionOwner") in {"unknown", "none"}:
             return {
                 **current,
-                "status": "service_started_waiting_for_operator",
+                "status": "service_active_gateway_unavailable",
                 "operatorActionRequired": True,
                 "message": (
-                    "DUET controller service started, but the command gateway is not available. "
-                    "The app did not change the FSM or issue motion. Use the G1 operator controls "
-                    "to enter the configured Velocity state, then press Connect again. If it is "
-                    "already there, check the DDS interface, shared DUET_CONTROL_DIR, and service logs."
+                    (
+                        "The DUET controller service started in its no-command handoff state. "
+                        "It did not publish low-level commands or change the FSM. Do not switch to "
+                        "FixStand if the robot is already standing in Velocity; that transition may "
+                        "change its posture. If it is already in Velocity, leave it there and press "
+                        "Connect again when the gateway is ready. If the current FSM cannot be verified, "
+                        "do not attempt a mode transition based on this status; have an onsite operator "
+                        "verify the controller and robot state."
+                        if service_started
+                        else "The DUET controller service is active, but its command gateway is unavailable "
+                        "and its startup state cannot be verified. Do not attempt a mode transition based "
+                        "on this status; have an onsite operator verify the controller build, logs, and "
+                        "robot's physical state."
+                    )
                 ),
             }
-        if current.get("motionOwner") == "none":
-            service_state = duet_controller_service_state()
-            if service_state == "active":
-                return {
-                    **current,
-                    "status": "service_started_waiting_for_operator",
-                    "operatorActionRequired": True,
-                    "message": (
-                        "DUET controller service started, but no command gateway is ready. "
-                        "Use the G1 operator controls to enter the configured Velocity state, "
-                        "then press Connect again. No FSM transition or motion was issued."
-                    ),
-                }
-            raise HTTPException(status_code=503, detail="DUET controller service did not remain active.")
         if current.get("ready") is not True:
             raise HTTPException(status_code=409, detail=current.get("error") or "DUET gateway is not ready.")
         return connect_duet_controller()
@@ -4041,7 +4092,22 @@ def get_duet_status(response: Response, user: dict = Depends(auth_required)):
     if user["role"] != "teacher":
         raise HTTPException(status_code=403, detail="Teacher role required")
     response.headers["Cache-Control"] = "no-store, max-age=0"
-    return duet_controller_status()
+    status = duet_controller_status()
+    unit_path = Path.home() / ".config" / "systemd" / "user" / DUET_CONTROLLER_UNIT
+    if not unit_path.exists() and not unit_path.is_symlink():
+        return {**status, "controllerServiceActive": False}
+    try:
+        service_state = duet_controller_service_state()
+    except DuetControllerError as error:
+        return {
+            **status,
+            "controllerServiceActive": None,
+            "controllerServiceError": str(error),
+        }
+    return {
+        **status,
+        "controllerServiceActive": service_state not in {"inactive", "dead"},
+    }
 
 
 @app.post("/api/duet/run")

@@ -531,16 +531,17 @@ class DuetRouteTests(unittest.TestCase):
     def test_duet_status_explains_when_the_local_gateway_is_not_running(self):
         with patch.dict(os.environ, {
             "DUET_CONTROL_DIR": os.path.join(self.temp_dir.name, "duet-control"),
-        }):
+        }), patch.object(server.Path, "home", return_value=server.Path(self.temp_dir.name)):
             response = self.client.get("/api/duet/status", headers=self.teacher)
 
         self.assertEqual(response.status_code, 200)
         self.assertFalse(response.json()["connected"])
         self.assertEqual(response.json()["motionOwner"], "none")
+        self.assertFalse(response.json()["controllerServiceActive"])
         self.assertIn("DUET_GATEWAY_ENABLED=true", response.json()["error"])
         self.assertIn("DUET_CONTROL_DIR", response.json()["error"])
 
-    def test_duet_connect_starts_controller_service_before_acquiring_gateway(self):
+    def test_duet_connect_attaches_to_already_active_controller_without_starting_it(self):
         connected = {
             "status": "connected",
             "connected": True,
@@ -551,7 +552,7 @@ class DuetRouteTests(unittest.TestCase):
         with patch.dict(os.environ, {"DUET_PHYSICAL_ENABLED": ""}), patch.object(
             server, "active_navigation_operation", return_value=None
         ), patch.object(server, "active_lidar_scan", return_value=None), patch.object(
-            server, "robot_status", return_value={"running": False}
+            server, "robot_status", return_value={"sdkAvailable": False, "running": False}
         ), patch.object(
             server, "duet_controller_status",
             side_effect=[
@@ -559,17 +560,14 @@ class DuetRouteTests(unittest.TestCase):
                 connected,
             ],
         ), patch.object(
-            server, "duet_controller_service_state", return_value="inactive"
+            server, "duet_controller_service_state", return_value="active"
         ), patch.object(
-            server, "start_duet_controller_service", return_value="active"
-        ) as start_service, patch.object(
             server, "connect_duet_controller", return_value=connected
         ) as connect_duet, patch.object(server, "connect_robot") as connect_sdk:
             response = self.client.post("/api/duet/connect", headers=self.teacher)
 
         self.assertEqual(response.status_code, 200)
         self.assertEqual(response.json(), connected)
-        start_service.assert_called_once_with()
         connect_duet.assert_called_once_with()
         connect_sdk.assert_not_called()
 

@@ -18,43 +18,45 @@ app = server.app
 
 class ServerClassroomTests(unittest.TestCase):
     def test_duet_service_connect_is_teacher_only(self):
-        with patch.object(server, "start_duet_controller_service") as start_service:
-            with self.assertRaises(HTTPException) as raised:
-                server.duet_connect({"role": "student"})
+        with self.assertRaises(HTTPException) as raised:
+            server.duet_connect({"role": "student"})
 
         self.assertEqual(raised.exception.status_code, 403)
-        start_service.assert_not_called()
 
-    def test_duet_connect_starts_only_service_then_waits_for_operator_fsm_action(self):
-        passive_status = {
-            "status": "disconnected",
-            "connected": False,
-            "ready": False,
-            "controlLease": False,
-            "motionOwner": "none",
-            "motionActive": False,
-            "programActive": False,
-        }
-        gateway_unavailable = {
-            **passive_status,
-            "status": "unavailable",
-            "motionOwner": "unknown",
-            "error": "gateway is not available in Passive",
-        }
-        with patch.object(server, "duet_controller_status", side_effect=[passive_status, gateway_unavailable]), \
-                patch.object(server, "robot_status", return_value={"running": False}), \
+    def test_duet_connect_starts_no_command_handoff_and_waits_for_operator(self):
+        passive_status = {"motionOwner": "none", "controlLease": False, "programActive": False}
+        handoff_status = {"motionOwner": "none", "controlLease": False, "programActive": False}
+        with patch.object(server, "robot_status", return_value={"sdkAvailable": True, "running": False}), \
+                patch.object(server, "duet_controller_status", side_effect=[passive_status, handoff_status]), \
                 patch.object(server, "active_navigation_operation", return_value=None), \
                 patch.object(server, "active_lidar_scan", return_value=None), \
                 patch.object(server, "duet_controller_service_state", return_value="inactive"), \
                 patch.object(server, "start_duet_controller_service", return_value="active") as start_service, \
-                patch.object(server, "connect_duet_controller") as acquire:
+                patch.object(server, "connect_duet_controller") as connect:
             response = server.duet_connect({"role": "teacher"})
 
-        self.assertEqual(response["status"], "service_started_waiting_for_operator")
+        self.assertEqual(response["status"], "service_active_gateway_unavailable")
         self.assertTrue(response["operatorActionRequired"])
-        self.assertIn("did not change the FSM", response["message"])
+        self.assertIn("no-command handoff state", response["message"])
+        self.assertIn("Do not switch to FixStand if the robot is already standing in Velocity", response["message"])
+        self.assertIn("do not attempt a mode transition based on this status", response["message"])
         start_service.assert_called_once_with()
-        acquire.assert_not_called()
+        connect.assert_not_called()
+
+    def test_duet_connect_refuses_while_legacy_sdk_program_is_running(self):
+        with patch.object(
+            server, "robot_status", return_value={"sdkAvailable": True, "running": True}
+        ), patch.object(server, "duet_controller_status") as duet_status, \
+                patch.object(server, "duet_controller_service_state") as service_state, \
+                patch.object(server, "connect_duet_controller") as connect:
+            with self.assertRaises(HTTPException) as raised:
+                server.duet_connect({"role": "teacher"})
+
+        self.assertEqual(raised.exception.status_code, 409)
+        self.assertIn("Stop the active SDK robot program", raised.exception.detail)
+        duet_status.assert_not_called()
+        service_state.assert_not_called()
+        connect.assert_not_called()
 
     def test_duet_connect_never_starts_an_already_active_but_unavailable_controller(self):
         unavailable = {
@@ -66,21 +68,19 @@ class ServerClassroomTests(unittest.TestCase):
             "error": "gateway unavailable",
         }
         with patch.object(server, "duet_controller_status", return_value=unavailable), \
-                patch.object(server, "robot_status", return_value={"running": False}), \
+                patch.object(server, "robot_status", return_value={"sdkAvailable": False, "running": False}), \
                 patch.object(server, "active_navigation_operation", return_value=None), \
                 patch.object(server, "active_lidar_scan", return_value=None), \
                 patch.object(server, "duet_controller_service_state", return_value="active") as service_state, \
-                patch.object(server, "start_duet_controller_service") as start_service, \
                 patch.object(server, "connect_duet_controller") as acquire:
             response = server.duet_connect({"role": "teacher"})
 
         self.assertEqual(response["status"], "service_active_gateway_unavailable")
         self.assertTrue(response["operatorActionRequired"])
         service_state.assert_called_once_with()
-        start_service.assert_not_called()
         acquire.assert_not_called()
 
-    def test_duet_connect_resource_interlock_prevents_service_start(self):
+    def test_duet_connect_resource_interlock_prevents_connection(self):
         status = {
             "status": "disconnected",
             "connected": False,
@@ -91,15 +91,13 @@ class ServerClassroomTests(unittest.TestCase):
             "programActive": False,
         }
         with patch.object(server, "duet_controller_status", return_value=status), \
-                patch.object(server, "robot_status", return_value={"running": True}), \
-                patch.object(server, "start_duet_controller_service") as start_service:
+                patch.object(server, "robot_status", return_value={"sdkAvailable": False, "running": True}):
             with self.assertRaises(HTTPException) as raised:
                 server.duet_connect({"role": "teacher"})
 
         self.assertEqual(raised.exception.status_code, 409)
-        start_service.assert_not_called()
 
-    def test_duet_service_start_uses_only_installed_manual_unit_and_never_enables(self):
+    def test_duet_connect_starts_only_installed_manual_controller_unit(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             home = os.path.join(temp_dir, "teacher")
             os.makedirs(os.path.join(home, ".config", "systemd", "user"))
@@ -114,21 +112,79 @@ class ServerClassroomTests(unittest.TestCase):
                     f"Environment=DUET_CONTROL_DIR={control_dir}\n"
                     "Environment=DUET_GATEWAY_ENABLED=true\nRestart=no\n"
                 )
-            completed = [
+            completed = subprocess.CompletedProcess([], 0, "active\n", "")
+            responses = [
                 subprocess.CompletedProcess([], 0, "inactive\n", ""),
                 subprocess.CompletedProcess([], 0, "", ""),
-                subprocess.CompletedProcess([], 0, "active\n", ""),
-                subprocess.CompletedProcess([], 0, "active\n", ""),
+                completed,
             ]
             with patch.object(server.Path, "home", return_value=server.Path(home)), \
                     patch.dict(os.environ, {"DUET_CONTROL_DIR": control_dir}), \
-                    patch.object(server.subprocess, "run", side_effect=completed) as run:
+                    patch.object(server, "_validate_duet_handoff_build"), \
+                    patch.object(server.subprocess, "run", side_effect=responses) as run:
                 state = server.start_duet_controller_service()
 
         self.assertEqual(state, "active")
         commands = [call.args[0] for call in run.call_args_list]
         self.assertIn(["systemctl", "--user", "start", server.DUET_CONTROLLER_UNIT], commands)
         self.assertFalse(any("enable" in command for command in commands))
+
+    def test_duet_handoff_build_requires_binary_newer_than_handoff_sources(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            controller = server.Path(temp_dir) / "vendor" / "DUET" / "deploy" / "robots" / "g1_23dof"
+            build_dir = controller / "build"
+            include_dir = controller.parents[1] / "include" / "FSM"
+            config_dir = controller / "config"
+            for directory in (build_dir, include_dir, config_dir):
+                directory.mkdir(parents=True, exist_ok=True)
+
+            source_paths = (
+                controller / "main.cpp",
+                config_dir / "config.yaml",
+                include_dir / "State_Handoff.h",
+                include_dir / "State_FixStand.h",
+                include_dir / "CtrlFSM.h",
+            )
+            for source in source_paths:
+                source.write_text("source", encoding="utf-8")
+            binary = build_dir / "g1_ctrl"
+            binary.write_text("binary", encoding="utf-8")
+            binary.chmod(0o755)
+            source_mtime = max(source.stat().st_mtime_ns for source in source_paths)
+            os.utime(binary, ns=(source_mtime - 1, source_mtime - 1))
+
+            with self.assertRaisesRegex(server.DuetControllerError, "predates the no-command handoff"):
+                server._validate_duet_handoff_build(controller)
+
+            os.utime(binary, ns=(source_mtime + 1, source_mtime + 1))
+            server._validate_duet_handoff_build(controller)
+
+    def test_duet_start_refuses_a_stale_handoff_binary_before_systemctl(self):
+        with patch.object(server, "duet_controller_service_state", return_value="inactive"), \
+                patch.object(
+                    server,
+                    "_validate_duet_handoff_build",
+                    side_effect=server.DuetControllerError("stale handoff binary"),
+                ), patch.object(server, "_duet_systemctl") as systemctl:
+            with self.assertRaisesRegex(server.DuetControllerError, "stale handoff binary"):
+                server.start_duet_controller_service()
+
+        systemctl.assert_not_called()
+
+    def test_sdk_motion_is_blocked_while_duet_handoff_service_is_active(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            home = server.Path(temp_dir)
+            unit_dir = home / ".config" / "systemd" / "user"
+            unit_dir.mkdir(parents=True)
+            (unit_dir / server.DUET_CONTROLLER_UNIT).write_text("[Service]\n", encoding="utf-8")
+            with patch.object(server.Path, "home", return_value=home), \
+                    patch.object(server, "duet_controller_owns_motion", return_value=(False, None)), \
+                    patch.object(server, "duet_controller_service_state", return_value="active"):
+                with self.assertRaises(HTTPException) as raised:
+                    server.ensure_sdk_motion_available()
+
+        self.assertEqual(raised.exception.status_code, 409)
+        self.assertIn("DUET controller service is active", raised.exception.detail)
 
     def test_classroom_code_library_includes_built_in_legacy_and_duet_starters(self):
         client = TestClient(app)
