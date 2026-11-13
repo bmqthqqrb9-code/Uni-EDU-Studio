@@ -1,0 +1,5 @@
+robot.stand()
+robot.arm_action("high five")
+robot.wait(2)
+robot.turn_around_180()
+robot.walk(2)

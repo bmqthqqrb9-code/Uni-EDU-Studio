@@ -1,21 +1,230 @@
 import React, { useState, useEffect, useRef, useCallback, useMemo } from 'react';
+import { createPortal } from 'react-dom';
 import { 
   Save, FolderOpen, Download, Settings, Play, Square,
-  Code, X, RefreshCw, FileJson, Check, Loader2, Globe,
-  Menu, Undo, Redo, Info, ChevronRight, Sidebar, MoreVertical,
-  Upload, FileText, Edit3, FunctionSquare
+  Code, X, RefreshCw, FileJson, Check, Loader2,
+  Menu, Undo, Redo, ChevronRight, Sidebar, MoreVertical, Trash2,
+  Upload, FileText, Edit3, FunctionSquare, Eye, EyeOff
 } from 'lucide-react';
 import * as Blockly from 'blockly/core';
 import { pythonGenerator } from 'blockly/python';
+pythonGenerator.INDENT = '    ';
 import * as En from 'blockly/msg/en';
 import * as Zh from 'blockly/msg/zh-hans';
 import 'blockly/blocks';
 import g1BasicConfigZh from '../block_configurations/g1_basic/g1_basic.json';
 import g1BasicConfigEn from '../block_configurations/g1_basic/g1_basic_en.json';
-import { G1_EDU_23_ENV, G1_MOTION_TEMPLATES, SIMULATOR_MODES, createEmptyG1Edu23State, simulateG1Edu23Program } from './sim/g1Edu23Env';
+import { SIMULATOR_MODES, buildPlannerMotionCommands, clampScenePoint, createEmptyG1Edu23State, simulateG1Edu23Program } from './sim/g1Edu23Env';
+import { getSceneObjectDimensions } from './sim/sceneObjects';
+import G1Simulation3D from './components/G1Simulation3D';
+import {
+  isWorldPointInKnownFreeSpace,
+  mapLocalToWorld,
+  occupancyAtMapLocalPoint,
+  worldToMapLocal,
+} from './navigation/mapCoordinates.js';
+import { compileMotionPrompt } from './sim/textToMotion';
+import { flattenG1Commands, formatG1Program, G1_ARM_PRESET_DESCRIPTIONS, G1_COMMANDS, G1_EXECUTABLE_COMMANDS, G1_NOMINAL_STEP_METERS, getG1BlocklyCommandBlocks, getG1BlocklyConditionBlocks, parseG1Program } from './sim/g1Commands';
+import {
+  DUET_COMMANDS,
+  compileDuetMotionPrompt,
+  formatDuetProgram,
+  getDuetBlocklyCommandBlocks,
+  getDuetCommandExamples,
+  parseDuetProgram,
+} from './sim/duetCommands.js';
+import {
+  getDuetArmMotionsStorageKey,
+  MAX_SAVED_DUET_ARM_MOTIONS,
+  parseSavedDuetArmMotions,
+  validateDuetArmMotion,
+} from './sim/duetArmMotions.js';
+import { simulateDuetG1Edu23Program } from './sim/duetG1Edu23Env.js';
+import { buildG1RecordedMotionFrames } from './sim/g1RecordedArmMotion.js';
+import { analyzeDuetVideo, captureDuetLiveMotion } from './sim/duetVisionMotion.js';
+import { createRobotConnection } from './robot/RobotConnection';
+import { DuetRobotConnection } from './robot/DuetRobotConnection.js';
+import TeacherArmMotionRecorder from './components/TeacherArmMotionRecorder.jsx';
 
 const blocklyRuntime = Object.assign({}, Blockly, { Python: pythonGenerator });
 window.Blockly = blocklyRuntime;
+
+const PLANNER_PATH_MODES = Object.freeze({
+  manual: 'manual',
+  sensor_corrected: 'sensor_corrected',
+  autonomous: 'autonomous',
+});
+
+const PLANNER_MODE_LABELS = Object.freeze({
+  manual: 'Normal path',
+  sensor_corrected: 'Sensor-corrected path',
+  autonomous: 'Autonomous obstacle-aware path',
+});
+
+function attachPlannerProjectMeta(code = '', meta = {}) {
+  if (!meta || typeof meta !== 'object' || !Object.keys(meta).length) {
+    return code || '';
+  }
+  const payload = JSON.stringify(meta, null, 0);
+  return `# __PLANNER_META__ ${payload}\n${code || ''}`.trimEnd() + '\n';
+}
+
+function stripPlannerProjectMeta(code = '') {
+  if (!code || typeof code !== 'string') return '';
+  return code.replace(/^# __PLANNER_META__ .*\n?/m, '').trim();
+}
+
+function parsePlannerProjectMeta(code = '') {
+  if (!code || typeof code !== 'string') return null;
+  const match = code.match(/^# __PLANNER_META__\s*(\{.*\})\s*\n?/m);
+  if (!match || !match[1]) return null;
+  try {
+    return JSON.parse(match[1]);
+  } catch {
+    return null;
+  }
+}
+
+function createLoginCardsPdf(accounts) {
+  const mmToPoints = (millimeters) => millimeters * 72 / 25.4;
+  const pageWidth = mmToPoints(210);
+  const pageHeight = mmToPoints(297);
+  const cardWidth = mmToPoints(85.6);
+  const cardHeight = mmToPoints(54);
+  const columnGap = mmToPoints(8);
+  const rowGap = mmToPoints(1.5);
+  const pageObjects = [];
+  const pdfObjects = [];
+  const escapePdfText = (value) => String(value).replace(/[\\()]/g, '\\$&');
+  const drawText = (font, size, x, y, value) => (
+    `BT /${font} ${size} Tf ${x.toFixed(2)} ${y.toFixed(2)} Td (${escapePdfText(value)}) Tj ET\n`
+  );
+
+  for (let pageIndex = 0; pageIndex * 10 < accounts.length; pageIndex += 1) {
+    let content = '';
+    const pageAccounts = accounts.slice(pageIndex * 10, pageIndex * 10 + 10);
+    const gridWidth = cardWidth * 2 + columnGap;
+    const left = (pageWidth - gridWidth) / 2;
+    pageAccounts.forEach(({ username, password }, cardIndex) => {
+      const column = cardIndex % 2;
+      const row = Math.floor(cardIndex / 2);
+      const x = left + column * (cardWidth + columnGap);
+      const y = pageHeight - mmToPoints(8) - cardHeight - row * (cardHeight + rowGap);
+      content += `q 0.35 0.42 0.52 RG 0.8 w [3 3] 0 d ${x.toFixed(2)} ${y.toFixed(2)} ${cardWidth.toFixed(2)} ${cardHeight.toFixed(2)} re S Q\n`;
+      content += `0.05 0.22 0.48 rg\n`;
+      content += drawText('F2', 9, x + 12, y + cardHeight - 22, 'STUDENT LOGIN');
+      content += `0.38 0.42 0.48 rg\n`;
+      content += drawText('F1', 7, x + 12, y + cardHeight - 35, 'Reusable classroom account');
+      content += drawText('F2', 7, x + 12, y + 67, 'USERNAME');
+      content += drawText('F2', 18, x + 12, y + 43, username);
+      content += drawText('F2', 7, x + 135, y + 67, 'PASSWORD');
+      content += drawText('F2', 15, x + 135, y + 43, password);
+      content += drawText('F1', 7, x + 12, y + 18, 'Keep this card for future classroom use.');
+    });
+
+    const pageObjectNumber = 5 + pageIndex * 2;
+    const streamObjectNumber = pageObjectNumber + 1;
+    pageObjects.push(`${pageObjectNumber} 0 R`);
+    pdfObjects[pageObjectNumber] = `<< /Type /Page /Parent 2 0 R /MediaBox [0 0 ${pageWidth.toFixed(2)} ${pageHeight.toFixed(2)}] /Resources << /Font << /F1 3 0 R /F2 4 0 R >> >> /Contents ${streamObjectNumber} 0 R >>`;
+    pdfObjects[streamObjectNumber] = `<< /Length ${content.length} >>\nstream\n${content}endstream`;
+  }
+
+  pdfObjects[1] = '<< /Type /Catalog /Pages 2 0 R >>';
+  pdfObjects[2] = `<< /Type /Pages /Kids [${pageObjects.join(' ')}] /Count ${pageObjects.length} >>`;
+  pdfObjects[3] = '<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>';
+  pdfObjects[4] = '<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica-Bold >>';
+
+  let pdf = '%PDF-1.4\n';
+  const offsets = [0];
+  for (let objectNumber = 1; objectNumber < pdfObjects.length; objectNumber += 1) {
+    offsets[objectNumber] = pdf.length;
+    pdf += `${objectNumber} 0 obj\n${pdfObjects[objectNumber]}\nendobj\n`;
+  }
+  const crossReferenceOffset = pdf.length;
+  pdf += `xref\n0 ${pdfObjects.length}\n0000000000 65535 f \n`;
+  for (let objectNumber = 1; objectNumber < pdfObjects.length; objectNumber += 1) {
+    pdf += `${String(offsets[objectNumber]).padStart(10, '0')} 00000 n \n`;
+  }
+  pdf += `trailer\n<< /Size ${pdfObjects.length} /Root 1 0 R >>\nstartxref\n${crossReferenceOffset}\n%%EOF`;
+  return pdf;
+}
+
+function downloadLoginCardsPdf(group) {
+  const blob = new Blob([createLoginCardsPdf(group.accounts)], { type: 'application/pdf' });
+  const url = URL.createObjectURL(blob);
+  const link = document.createElement('a');
+  link.href = url;
+  link.download = `class-${group.group_number}-login-cards.pdf`;
+  document.body.appendChild(link);
+  link.click();
+  link.remove();
+  window.setTimeout(() => URL.revokeObjectURL(url), 1000);
+}
+
+function buildSdkCommandsFromTrace(pathTrace = []) {
+  if (!Array.isArray(pathTrace) || pathTrace.length < 2) {
+    throw new Error('Nav2 did not provide enough executed localization samples to create an editable SDK path.');
+  }
+  const sampled = [pathTrace[0]];
+  pathTrace.slice(1).forEach((point) => {
+    const previous = sampled.at(-1);
+    if (Math.hypot(point.x - previous.x, point.y - previous.y) >= 0.2
+      || Math.abs(point.yaw_rad - previous.yaw_rad) >= 0.2) {
+      sampled.push(point);
+    }
+  });
+  if (sampled.length < 2) {
+    throw new Error('The recorded Nav2 route contains no measurable movement to convert.');
+  }
+  if (sampled.length > 200) {
+    throw new Error('The recorded Nav2 route is too detailed to safely convert to editable SDK commands.');
+  }
+  const commands = ['robot.stand()'];
+  for (let index = 1; index < sampled.length; index += 1) {
+    const from = sampled[index - 1];
+    const to = sampled[index];
+    const distance = Math.hypot(to.x - from.x, to.y - from.y);
+    const direction = Math.atan2(to.y - from.y, to.x - from.x);
+    const turnDelta = ((direction - from.yaw_rad + Math.PI) % (2 * Math.PI)) - Math.PI;
+    if (Math.abs(turnDelta) >= 0.08) {
+      commands.push(`robot.turn("${turnDelta > 0 ? 'left' : 'right'}", ${Math.min(180, Math.abs(turnDelta * 180 / Math.PI)).toFixed(2)})`);
+    }
+    let remaining = distance / 0.4;
+    while (remaining >= 0.1) {
+      const duration = Math.min(10, remaining);
+      commands.push(`robot.walktime(${duration.toFixed(3)})`);
+      remaining -= duration;
+    }
+  }
+  commands.push('robot.stand()');
+  if (commands.length > 400) {
+    throw new Error('The recorded Nav2 route exceeds the 400-command SDK editor limit.');
+  }
+  return commands;
+}
+
+function relativePlannerWaypointsFromTrace(pathTrace = []) {
+  if (!Array.isArray(pathTrace) || pathTrace.length < 2) return [];
+  const start = pathTrace[0];
+  const cosine = Math.cos(start.yaw_rad);
+  const sine = Math.sin(start.yaw_rad);
+  return pathTrace
+    .filter((point, index) => index === 0 || Math.hypot(point.x - pathTrace[index - 1].x, point.y - pathTrace[index - 1].y) >= 0.2)
+    .map((point, index) => {
+      const dx = point.x - start.x;
+      const dy = point.y - start.y;
+      return {
+        id: `planner-recorded-${index}`,
+        x: Number((dx * cosine + dy * sine).toFixed(2)),
+        y: Number((-dx * sine + dy * cosine).toFixed(2)),
+      };
+    });
+}
+
+function buildPlannerProjectName(mode) {
+  const suffix = PLANNER_MODE_LABELS[mode] || 'Path';
+  return `${suffix.toLowerCase().replace(/[^a-z0-9]+/g, '-')}`;
+}
 
 // ==========================================================================
 //  开发模式说明 (Development Mode)
@@ -157,16 +366,16 @@ const UI_TEXT = {
     appName: "Uni++ EDU Studio",
     version: "v2.1 Stable",
     menuFile: "文件", menuEdit: "编辑", menuView: "视图", menuHelp: "帮助",
-    actNew: "新建项目", actOpen: "打开项目 (.json)", actSave: "保存项目 (.json)", actExportPy: "导出 Python (.py)",
-    actUndo: "撤销", actRedo: "重做", actToggleCode: "切换代码预览", actAbout: "关于",
+    projectMenu: "项目", actSaveToAccount: "保存到账号", actNew: "新建项目", actImportJson: "导入 JSON", actExportJson: "导出 JSON", actImportPython: "导入 Python", actExportPy: "导出 Python (.py)",
+    actUndo: "撤销", actRedo: "重做", actClear: "清空工作区", actToggleCode: "切换代码预览", actAbout: "关于",
     actConfigImport: "导入配置", actConfigExport: "导出配置",
     configTitle: "机器人积木配置",
-    configDesc: "在此自定义机器人专属积木。系统积木和函数积木已内置，无需在此编辑。",
+    configDesc: "机器人命令由共享命令目录管理。旧配置仅供迁移参考，不能增加可执行命令。",
     applyBtn: "应用配置", closeBtn: "关闭", resetBtn: "恢复默认", confirmBtn: "确定", cancelBtn: "取消",
     codeTitle: "PYTHON 预览", loading: "正在加载引擎资源...",
     aboutContent: "Uni++ EDU Studio 是一个专为 Unitree 机器人设计的图形化编程环境。",
     editorTitle: "编辑代码内容", editorSave: "保存并关闭",
-    toolbox: { functions: "图形化函数", logic: "逻辑", loops: "循环", math: "数学", text: "文本", variables: "变量" },
+    toolbox: { functions: "图形化函数", logic: "逻辑", loops: "循环", math: "数学", text: "文本" },
     confirmClear: "确定要新建项目吗？当前未保存的进度将会丢失。",
     btnRun: "运行", btnStop: "停止", statusRunning: "运行中..."
   },
@@ -174,23 +383,23 @@ const UI_TEXT = {
     appName: "Uni++ EDU Studio",
     version: "v2.1 Stable",
     menuFile: "File", menuEdit: "Edit", menuView: "View", menuHelp: "Help",
-    actNew: "New Project", actOpen: "Open Project (.json)", actSave: "Save Project (.json)", actExportPy: "Export Python (.py)",
-    actUndo: "Undo", actRedo: "Redo", actToggleCode: "Toggle Code View", actAbout: "About",
+    projectMenu: "Project", actSaveToAccount: "Save to account", actNew: "New Project", actImportJson: "Import JSON", actExportJson: "Export JSON", actImportPython: "Import Python", actExportPy: "Export Python (.py)",
+    actUndo: "Undo", actRedo: "Redo", actClear: "Clear workspace", actToggleCode: "Toggle Code View", actAbout: "About",
     actConfigImport: "Import Config", actConfigExport: "Export Config",
     configTitle: "Robot Block Config",
-    configDesc: "Customize robot-specific blocks here. System blocks are built-in.",
+    configDesc: "Executable commands come from the shared G1 command catalog. Legacy configs are for migration only and cannot add robot commands.",
     applyBtn: "Apply Config", closeBtn: "Close", resetBtn: "Reset Default", confirmBtn: "OK", cancelBtn: "Cancel",
     codeTitle: "PYTHON PREVIEW", loading: "Loading Engine Resources...",
     aboutContent: "Uni++ EDU Studio is a graphical programming environment for Unitree Robots.",
     editorTitle: "Edit Code Content", editorSave: "Save & Close",
-    toolbox: { functions: "Functions", logic: "Logic", loops: "Loops", math: "Math", text: "Text", variables: "Variables" },
+    toolbox: { functions: "Functions", logic: "Logic", loops: "Loops", math: "Math", text: "Text" },
     confirmClear: "Are you sure you want to create a new project? Unsaved progress will be lost.",
     btnRun: "Run", btnStop: "Stop", statusRunning: "Running..."
   }
 };
 
-const MenuItem = ({ label, shortcut, onClick, icon: Icon, danger }) => (
-  <button onClick={onClick} className={`w-full text-left px-4 py-1.5 text-sm flex items-center justify-between hover:bg-blue-50 transition-colors ${danger ? 'text-red-600 hover:bg-red-50' : 'text-gray-700'}`}>
+const MenuItem = ({ label, shortcut, onClick, icon: Icon, danger, dark = false }) => (
+  <button onClick={onClick} className={`w-full text-left px-4 py-1.5 text-sm flex items-center justify-between transition-colors ${dark ? (danger ? 'text-red-300 hover:bg-slate-800' : 'text-slate-200 hover:bg-slate-800') : `hover:bg-blue-50 ${danger ? 'text-red-600 hover:bg-red-50' : 'text-gray-700'}`}`}>
     <div className="flex items-center gap-2">{Icon && <Icon size={14} className="opacity-70" />}<span>{label}</span></div>
     {shortcut && <span className="text-xs text-gray-400 font-mono ml-4">{shortcut}</span>}
   </button>
@@ -207,15 +416,70 @@ const OBJECT_LIBRARY = [
   { id: 'table', label: 'Table', icon: '◫', defaultRadius: 16, color: '#94a3b8' },
   { id: 'terrain', label: 'Terrain', icon: '◌', defaultRadius: 15, color: '#86efac' },
 ];
+const SIDEBAR_PANEL_IDS = ['blocks', 'ide', 'planner', 'prompt', 'camera'];
+
+function removeBlocklyVariableInitializers(code, initializers) {
+  const lines = code.split('\n');
+  let removedInitializer = false;
+  for (let index = lines.length - 1; index >= 0; index -= 1) {
+    if (initializers.has(lines[index])) {
+      lines.splice(index, 1);
+      removedInitializer = true;
+    }
+  }
+  return removedInitializer
+    ? lines.join('\n').replace(/^\n+/, '').replace(/\n{3,}/g, '\n\n')
+    : code;
+}
+
+function generateBlocklyPythonCode(workspace) {
+  const initializers = new Set();
+  workspace.getTopBlocks(true).forEach((topBlock) => {
+    let block = topBlock;
+    while (block) {
+      if (block.type === 'variables_set' && block.getInputTargetBlock('VALUE')?.type === 'logic_boolean') {
+        const variable = workspace.getVariableById(block.getFieldValue('VAR'));
+        if (variable) initializers.add(`${variable.getName()} = None`);
+      }
+      block = block.getNextBlock();
+    }
+  });
+  return removeBlocklyVariableInitializers(
+    pythonGenerator.workspaceToCode(workspace),
+    initializers,
+  );
+}
+
+function isNavigationWaypointInFreeSpace(waypoint, snapshot) {
+  return isWorldPointInKnownFreeSpace(waypoint.x, waypoint.y, snapshot);
+}
+
+function formatLidarDistanceSample(sample, label) {
+  if (!sample?.ready) return `${label} distance conditions disabled • ${sample?.error || 'provider status not reported'}`;
+  if (sample.calibrated !== true || sample.measurement !== 'footprint_clearance') {
+    return `${label} unavailable • provider sample is not calibrated to the robot footprint`;
+  }
+  if (sample.clear) return `${label} clear within ${sample.max_range_m} m`;
+  return `${label} clearance ${sample.distance_m.toFixed(2)} m from robot footprint • ${sample.age_ms} ms old`;
+}
+
+function formatLidarDistanceStatus(sensor) {
+  return [
+    formatLidarDistanceSample(sensor, 'Front'),
+    formatLidarDistanceSample(sensor?.rear, 'Rear'),
+  ].join(' • ');
+}
 
 const SAFE_COMMAND_LIMITS = {
   SPEED: { min: 0.5, max: 2 },
-  STEPS: { min: 1, max: 10 },
+  STEPS: { min: 1, max: 20 },
   ANGLE: { min: 5, max: 180 },
   DEGREES: { min: 0, max: 180 },
-  SECONDS: { min: 0.1, max: 5 },
+  SECONDS: { min: 0.1, max: 10 },
   TIME: { min: 0, max: 10 },
 };
+
+const boundedLoopCountFields = new WeakSet();
 
 const clampSafeValue = (fieldName, rawValue) => {
   const limiter = SAFE_COMMAND_LIMITS[fieldName];
@@ -233,103 +497,102 @@ const sanitizeRobotCode = (code = '') => {
 
   let sanitized = code;
   let changed = false;
-  sanitized = sanitized.replace(/robot\.walkForward\(([^)]+)\)/g, (_, value) => {
+  sanitized = sanitized.replace(/robot\.walkForward\(([^)]+)\)(;?)/g, (_, value, terminator) => {
     const safeValue = sanitizeNumber(value, 'SPEED');
     if (safeValue !== value.trim()) changed = true;
-    return `robot.walkForward(${safeValue});`;
+    return `robot.walkForward(${safeValue})${terminator}`;
   });
-  sanitized = sanitized.replace(/robot\.walkForwardSteps\(([^)]+)\)/g, (_, value) => {
+  sanitized = sanitized.replace(/robot\.walkForwardSteps\(([^)]+)\)(;?)/g, (_, value, terminator) => {
     const safeValue = sanitizeNumber(value, 'STEPS');
     if (safeValue !== value.trim()) changed = true;
-    return `robot.walkForward(${safeValue});`;
+    return `robot.walkForward(${safeValue})${terminator}`;
   });
-  sanitized = sanitized.replace(/robot\.walkBackward\(([^)]+)\)/g, (_, value) => {
+  sanitized = sanitized.replace(/robot\.walkBackward\(([^)]+)\)(;?)/g, (_, value, terminator) => {
     const safeValue = sanitizeNumber(value, 'SPEED');
     if (safeValue !== value.trim()) changed = true;
-    return `robot.walkBackward(${safeValue});`;
+    return `robot.walkBackward(${safeValue})${terminator}`;
   });
-  sanitized = sanitized.replace(/robot\.walkBackwardSteps\(([^)]+)\)/g, (_, value) => {
+  sanitized = sanitized.replace(/robot\.walkBackwardSteps\(([^)]+)\)(;?)/g, (_, value, terminator) => {
     const safeValue = sanitizeNumber(value, 'STEPS');
     if (safeValue !== value.trim()) changed = true;
-    return `robot.walkBackward(${safeValue});`;
+    return `robot.walkBackward(${safeValue})${terminator}`;
   });
-  sanitized = sanitized.replace(/robot\.walkSidewaysLeft\(([^)]+)\)/g, (_, value) => {
+  sanitized = sanitized.replace(/robot\.walkSidewaysLeft\(([^)]+)\)(;?)/g, (_, value, terminator) => {
     const safeValue = sanitizeNumber(value, 'SPEED');
     if (safeValue !== value.trim()) changed = true;
-    return `robot.walkSidewaysLeft(${safeValue});`;
+    return `robot.walkSidewaysLeft(${safeValue})${terminator}`;
   });
-  sanitized = sanitized.replace(/robot\.walkSidewaysLeftSteps\(([^)]+)\)/g, (_, value) => {
+  sanitized = sanitized.replace(/robot\.walkSidewaysLeftSteps\(([^)]+)\)(;?)/g, (_, value, terminator) => {
     const safeValue = sanitizeNumber(value, 'STEPS');
     if (safeValue !== value.trim()) changed = true;
-    return `robot.walkSidewaysLeft(${safeValue});`;
+    return `robot.walkSidewaysLeft(${safeValue})${terminator}`;
   });
-  sanitized = sanitized.replace(/robot\.walkSidewaysRight\(([^)]+)\)/g, (_, value) => {
+  sanitized = sanitized.replace(/robot\.walkSidewaysRight\(([^)]+)\)(;?)/g, (_, value, terminator) => {
     const safeValue = sanitizeNumber(value, 'SPEED');
     if (safeValue !== value.trim()) changed = true;
-    return `robot.walkSidewaysRight(${safeValue});`;
+    return `robot.walkSidewaysRight(${safeValue})${terminator}`;
   });
-  sanitized = sanitized.replace(/robot\.walkSidewaysRightSteps\(([^)]+)\)/g, (_, value) => {
+  sanitized = sanitized.replace(/robot\.walkSidewaysRightSteps\(([^)]+)\)(;?)/g, (_, value, terminator) => {
     const safeValue = sanitizeNumber(value, 'STEPS');
     if (safeValue !== value.trim()) changed = true;
-    return `robot.walkSidewaysRight(${safeValue});`;
+    return `robot.walkSidewaysRight(${safeValue})${terminator}`;
   });
-  sanitized = sanitized.replace(/robot\.turnLeft\(([^)]+)\)/g, (_, value) => {
+  sanitized = sanitized.replace(/robot\.turnLeft\(([^)]+)\)(;?)/g, (_, value, terminator) => {
     const safeValue = sanitizeNumber(value, 'ANGLE');
     if (safeValue !== value.trim()) changed = true;
-    return `robot.turnLeft(${safeValue});`;
+    return `robot.turnLeft(${safeValue})${terminator}`;
   });
-  sanitized = sanitized.replace(/robot\.turnRight\(([^)]+)\)/g, (_, value) => {
+  sanitized = sanitized.replace(/robot\.turnRight\(([^)]+)\)(;?)/g, (_, value, terminator) => {
     const safeValue = sanitizeNumber(value, 'ANGLE');
     if (safeValue !== value.trim()) changed = true;
-    return `robot.turnRight(${safeValue});`;
+    return `robot.turnRight(${safeValue})${terminator}`;
   });
-  sanitized = sanitized.replace(/robot\.raiseLeftArm\(([^)]+)\)/g, (_, value) => {
+  sanitized = sanitized.replace(/robot\.raiseLeftArm\(([^)]+)\)(;?)/g, (_, value, terminator) => {
     const parts = value.split(',').map((part) => part.trim());
     const position = parts[0] || 'mid';
     const degrees = sanitizeNumber(parts[1] || 90, 'DEGREES');
     if (degrees !== (parts[1] || '90').trim()) changed = true;
-    return `robot.raiseLeftArm(${position}, ${degrees});`;
+    return `robot.raiseLeftArm(${position}, ${degrees})${terminator}`;
   });
-  sanitized = sanitized.replace(/robot\.raiseRightArm\(([^)]+)\)/g, (_, value) => {
+  sanitized = sanitized.replace(/robot\.raiseRightArm\(([^)]+)\)(;?)/g, (_, value, terminator) => {
     const parts = value.split(',').map((part) => part.trim());
     const position = parts[0] || 'mid';
     const degrees = sanitizeNumber(parts[1] || 90, 'DEGREES');
     if (degrees !== (parts[1] || '90').trim()) changed = true;
-    return `robot.raiseRightArm(${position}, ${degrees});`;
+    return `robot.raiseRightArm(${position}, ${degrees})${terminator}`;
   });
-  sanitized = sanitized.replace(/robot\.raiseLeftLeg\(([^)]+)\)/g, (_, value) => {
+  sanitized = sanitized.replace(/robot\.raiseLeftLeg\(([^)]+)\)(;?)/g, (_, value, terminator) => {
     const parts = value.split(',').map((part) => part.trim());
     const position = parts[0] || 'mid';
     const degrees = sanitizeNumber(parts[1] || 90, 'DEGREES');
     if (degrees !== (parts[1] || '90').trim()) changed = true;
-    return `robot.raiseLeftLeg(${position}, ${degrees});`;
+    return `robot.raiseLeftLeg(${position}, ${degrees})${terminator}`;
   });
-  sanitized = sanitized.replace(/robot\.raiseRightLeg\(([^)]+)\)/g, (_, value) => {
+  sanitized = sanitized.replace(/robot\.raiseRightLeg\(([^)]+)\)(;?)/g, (_, value, terminator) => {
     const parts = value.split(',').map((part) => part.trim());
     const position = parts[0] || 'mid';
     const degrees = sanitizeNumber(parts[1] || 90, 'DEGREES');
     if (degrees !== (parts[1] || '90').trim()) changed = true;
-    return `robot.raiseRightLeg(${position}, ${degrees});`;
+    return `robot.raiseRightLeg(${position}, ${degrees})${terminator}`;
   });
-  sanitized = sanitized.replace(/robot\.wait\(([^)]+)\)/g, (_, value) => {
+  sanitized = sanitized.replace(/robot\.wait\(([^)]+)\)(;?)/g, (_, value, terminator) => {
     const safeValue = sanitizeNumber(value, 'SECONDS');
     if (safeValue !== value.trim()) changed = true;
-    return `robot.wait(${safeValue});`;
+    return `robot.wait(${safeValue})${terminator}`;
   });
-  sanitized = sanitized.replace(/robot\.waitSeconds\(([^)]+)\)/g, (_, value) => {
+  sanitized = sanitized.replace(/robot\.waitSeconds\(([^)]+)\)(;?)/g, (_, value, terminator) => {
     const safeValue = sanitizeNumber(value, 'SECONDS');
     if (safeValue !== value.trim()) changed = true;
-    return `robot.wait(${safeValue});`;
+    return `robot.wait(${safeValue})${terminator}`;
   });
   sanitized = sanitized.replace(/robot\.repeatLoop\(([^)]+)\)/g, (_, value) => {
     const safeValue = sanitizeNumber(value, 'STEPS');
     if (safeValue !== value.trim()) changed = true;
     return `for (let i = 0; i < ${safeValue}; i++) {\n  robot.raiseBothArms();\n}\n`;
   });
-  sanitized = sanitized.replace(/robot\.stop\(\)/g, () => 'robot.stop();');
-  sanitized = sanitized.replace(/robot\.sit\(\)/g, () => 'robot.sit();');
-  sanitized = sanitized.replace(/robot\.lowerBothArms\(\)/g, () => 'robot.lowerBothArms();');
-  sanitized = sanitized.replace(/robot\.waveRight\(\)/g, () => 'robot.waveRight();');
+  sanitized = sanitized.replace(/robot\.stop\(\)(;?)/g, (_, terminator) => `robot.stop()${terminator}`);
+  sanitized = sanitized.replace(/robot\.lowerBothArms\(\)(;?)/g, (_, terminator) => `robot.lowerBothArms()${terminator}`);
+  sanitized = sanitized.replace(/robot\.waveRight\(\)(;?)/g, (_, terminator) => `robot.waveRight()${terminator}`);
   return { code: sanitized, changed };
 };
 
@@ -377,7 +640,7 @@ const ROBOT_IDE_COMMAND_BLOCKS = [
   {
     type: 'robot_walk_forward_steps',
     message0: 'Walk Forward %1 steps',
-    args0: [{ type: 'field_number', name: 'STEPS', value: 3, min: 1, max: 10 }],
+    args0: [{ type: 'field_number', name: 'STEPS', value: 3, min: 1, max: 20 }],
     previousStatement: null,
     nextStatement: null,
     colour: 210,
@@ -386,7 +649,7 @@ const ROBOT_IDE_COMMAND_BLOCKS = [
   {
     type: 'robot_walk_back_steps',
     message0: 'Walk Back %1 steps',
-    args0: [{ type: 'field_number', name: 'STEPS', value: 3, min: 1, max: 10 }],
+    args0: [{ type: 'field_number', name: 'STEPS', value: 3, min: 1, max: 20 }],
     previousStatement: null,
     nextStatement: null,
     colour: 210,
@@ -395,7 +658,7 @@ const ROBOT_IDE_COMMAND_BLOCKS = [
   {
     type: 'robot_walk_sideways_left_steps',
     message0: 'Walk Left %1 steps',
-    args0: [{ type: 'field_number', name: 'STEPS', value: 2, min: 1, max: 10 }],
+    args0: [{ type: 'field_number', name: 'STEPS', value: 2, min: 1, max: 20 }],
     previousStatement: null,
     nextStatement: null,
     colour: 210,
@@ -404,7 +667,7 @@ const ROBOT_IDE_COMMAND_BLOCKS = [
   {
     type: 'robot_walk_sideways_right_steps',
     message0: 'Walk Right %1 steps',
-    args0: [{ type: 'field_number', name: 'STEPS', value: 2, min: 1, max: 10 }],
+    args0: [{ type: 'field_number', name: 'STEPS', value: 2, min: 1, max: 20 }],
     previousStatement: null,
     nextStatement: null,
     colour: 210,
@@ -511,21 +774,21 @@ const ROBOT_IDE_COMMAND_BLOCKS = [
   },
   {
     type: 'robot_wait',
-    message0: 'Wait %1 s',
-    args0: [{ type: 'field_number', name: 'SECONDS', value: 0.5, min: 0.1, precision: 0.1 }],
+    message0: 'Wait %1 seconds',
+    args0: [{ type: 'field_number', name: 'SECONDS', value: 1, min: 0.1, max: 10, precision: 0.001 }],
     previousStatement: null,
     nextStatement: null,
     colour: 210,
-    codeTemplate: 'robot.wait({{SECONDS}});\n',
+    codeTemplate: 'robot.wait({{SECONDS}})\n',
   },
   {
     type: 'robot_wait_seconds',
     message0: 'Wait %1 seconds',
-    args0: [{ type: 'field_number', name: 'SECONDS', value: 1, min: 0.1, max: 5, precision: 0.1 }],
+    args0: [{ type: 'field_number', name: 'SECONDS', value: 1, min: 0.1, max: 10, precision: 0.001 }],
     previousStatement: null,
     nextStatement: null,
     colour: 210,
-    codeTemplate: 'robot.waitSeconds({{SECONDS}});\n',
+    codeTemplate: 'robot.wait({{SECONDS}})\n',
   },
   {
     type: 'robot_repeat_loop',
@@ -543,14 +806,6 @@ const ROBOT_IDE_COMMAND_BLOCKS = [
     nextStatement: null,
     colour: 210,
     codeTemplate: 'robot.stop();\n',
-  },
-  {
-    type: 'robot_sit',
-    message0: 'Sit',
-    previousStatement: null,
-    nextStatement: null,
-    colour: 280,
-    codeTemplate: 'robot.sit();\n',
   },
   {
     type: 'robot_wave_left',
@@ -602,16 +857,32 @@ export default function App() {
   const codeEditorRef = useRef(null);
   const resizeObserverRef = useRef(null);
   const fileInputRef = useRef(null);
+  const pythonFileInputRef = useRef(null);
+  const compiledPlannerCodeRef = useRef(null);
+  const applyGeneratedCodeRef = useRef(null);
+  const syncBlocksFromGeneratedCodeRef = useRef(null);
+  const processedAutonomousOperationRef = useRef(null);
+  const sceneShellRef = useRef(null);
+  const workspacePanelRef = useRef(null);
   
   const [lang, setLang] = useState('en');
   const [robotConfig, setRobotConfig] = useState(DEFAULT_ROBOT_CONFIG_EN);
-  const [generatedCode, setGeneratedCode] = useState("");
+  const [generatedCode, setGeneratedCode] = useState('');
+  const generatedCodeRef = useRef('');
+  const [controllerVersion, setControllerVersion] = useState('legacy');
+  const controllerVersionRef = useRef('legacy');
+  controllerVersionRef.current = controllerVersion;
+  const codeByVersionRef = useRef({ legacy: '', duet: '' });
+  const duetProgramActiveRef = useRef(false);
+  const [isDuetProgramActive, setIsDuetProgramActive] = useState(false);
   const [configText, setConfigText] = useState(JSON.stringify(DEFAULT_ROBOT_CONFIG_EN, null, 2));
   
   const [activeMenu, setActiveMenu] = useState(null);
+  const [projectMenuPosition, setProjectMenuPosition] = useState(null);
   const [showConfigEditor, setShowConfigEditor] = useState(false);
-  const [showAbout, setShowAbout] = useState(false);
-  const [isCodeOpen, setIsCodeOpen] = useState(false);
+  const [showAppSettings, setShowAppSettings] = useState(false);
+  const [isArmMotionRecording, setIsArmMotionRecording] = useState(false);
+  const [recordedMotionPreview, setRecordedMotionPreview] = useState(null);
   const [isBlocklyLoaded, setIsBlocklyLoaded] = useState(false);
   
   const [promptState, setPromptState] = useState({ isOpen: false, message: '', defaultValue: '', callback: null, inputValue: '' });
@@ -620,20 +891,114 @@ export default function App() {
   // 运行状态管理
   const [isRunning, setIsRunning] = useState(false);
   const [mainTab, setMainTab] = useState('blocks');
-  const [toolPanelWidth, setToolPanelWidth] = useState(420);
+  const [ideCommandSearch, setIdeCommandSearch] = useState('');
+  const [toolPanelRect, setToolPanelRect] = useState({ top: 12, right: 16, width: 520, height: 760 });
   const [toolPanelCollapsed, setToolPanelCollapsed] = useState(false);
+  const [isSimulationVisible, setIsSimulationVisible] = useState(true);
+  const [isSimulationVisibilityLoading, setIsSimulationVisibilityLoading] = useState(true);
+  const [isSimulationVisibilitySaving, setIsSimulationVisibilitySaving] = useState(false);
+  const [simulationVisibilityError, setSimulationVisibilityError] = useState('');
+  const toolPanelInteractionRef = useRef(null);
+  const [lockedSidebarPanels, setLockedSidebarPanels] = useState(() => {
+    try {
+      const savedSession = JSON.parse(localStorage.getItem('edu-classroom-session') || 'null');
+      if (savedSession?.user?.role !== 'teacher') return [];
+      const savedPanels = JSON.parse(localStorage.getItem(`edu-locked-sidebar-panels:${savedSession.user.username}`) || '[]');
+      return Array.isArray(savedPanels)
+        ? savedPanels.filter((id) => SIDEBAR_PANEL_IDS.includes(id))
+        : [];
+    } catch (error) {
+      console.warn('Unable to initialize locked sidebar panels.', error);
+      return [];
+    }
+  });
+  const [isSidebarSettingsLoading, setIsSidebarSettingsLoading] = useState(true);
+  const [isSidebarSettingsSaving, setIsSidebarSettingsSaving] = useState(false);
+  const [lockedSidebarPanelsError, setLockedSidebarPanelsError] = useState('');
+  const [safeModeEnabled, setSafeModeEnabled] = useState(false);
+  const [isSafeModeSettingsLoading, setIsSafeModeSettingsLoading] = useState(true);
+  const [isSafeModeSettingsSaving, setIsSafeModeSettingsSaving] = useState(false);
+  const [safeModeSettingsError, setSafeModeSettingsError] = useState('');
+  const [speakerVolume, setSpeakerVolume] = useState(70);
+  const [speakerVolumeStatus, setSpeakerVolumeStatus] = useState('Read the current robot volume or choose a level and apply it.');
+  const [isSpeakerVolumeBusy, setIsSpeakerVolumeBusy] = useState(false);
+  useEffect(() => {
+    const keepToolPanelInViewport = () => {
+      const sceneBounds = sceneShellRef.current?.getBoundingClientRect();
+      if (!sceneBounds) return;
+      setToolPanelRect((rect) => {
+        const width = Math.min(rect.width, Math.max(48, sceneBounds.width - 16));
+        const height = Math.min(rect.height, Math.max(48, sceneBounds.height - 16));
+        const visibleWidth = toolPanelCollapsed ? 48 : width;
+        const visibleHeight = toolPanelCollapsed ? 48 : height;
+        const nextRect = {
+          ...rect,
+          width,
+          height,
+          right: Math.min(Math.max(8, rect.right), Math.max(8, sceneBounds.width - visibleWidth - 8)),
+          top: Math.min(Math.max(8, rect.top), Math.max(8, sceneBounds.height - visibleHeight - 8)),
+        };
+        return nextRect.width === rect.width
+          && nextRect.height === rect.height
+          && nextRect.right === rect.right
+          && nextRect.top === rect.top
+          ? rect
+          : nextRect;
+      });
+    };
+
+    const sceneShell = sceneShellRef.current;
+    if (!sceneShell) return undefined;
+    const observer = new ResizeObserver(keepToolPanelInViewport);
+    observer.observe(sceneShell);
+    window.addEventListener('resize', keepToolPanelInViewport);
+    keepToolPanelInViewport();
+    return () => {
+      observer.disconnect();
+      window.removeEventListener('resize', keepToolPanelInViewport);
+    };
+  }, [toolPanelCollapsed]);
+  const [isQueueOpen, setIsQueueOpen] = useState(false);
+  const [isConnectionPanelOnly, setIsConnectionPanelOnly] = useState(false);
+  const [isObjectPanelOpen, setIsObjectPanelOpen] = useState(false);
+  const [isLibraryOpen, setIsLibraryOpen] = useState(false);
+  const [motionPrompt, setMotionPrompt] = useState('Walk forward 3 steps, turn left 90 degrees, then wave');
+  const [motionPromptResult, setMotionPromptResult] = useState(null);
+  const [motionPromptStatus, setMotionPromptStatus] = useState('local');
+  const [duetMotionMode, setDuetMotionMode] = useState('library');
+  const [savedDuetMotions, setSavedDuetMotions] = useState([]);
+  const [duetMotionSaveName, setDuetMotionSaveName] = useState('');
+  const [duetMotionSaveError, setDuetMotionSaveError] = useState('');
+  const [duetMotionSaveBusy, setDuetMotionSaveBusy] = useState(false);
+  const [duetMotionReviewConfirmed, setDuetMotionReviewConfirmed] = useState(false);
+  const [lastSuccessfulDuetCode, setLastSuccessfulDuetCode] = useState('');
+  const [visionMotionStatus, setVisionMotionStatus] = useState('');
+  const [visionMotionPrompt, setVisionMotionPrompt] = useState('');
+  const [isVisionMotionAnalyzing, setIsVisionMotionAnalyzing] = useState(false);
+  const [visionMotionProgress, setVisionMotionProgress] = useState(0);
+  const [motionVideoUrl, setMotionVideoUrl] = useState('');
+  const motionVideoRef = useRef(null);
   const [simulatorMode, setSimulatorMode] = useState('kid-preview');
-  const [simulatorChallenge, setSimulatorChallenge] = useState('simple-path');
-  const [simulatorSidebarTab, setSimulatorSidebarTab] = useState('add-object');
+  const [objectPanelTab, setObjectPanelTab] = useState('add-object');
+  const [connectionTabTarget, setConnectionTabTarget] = useState(null);
   const [sceneObjects, setSceneObjects] = useState([]);
+  const [selectedSceneObjectId, setSelectedSceneObjectId] = useState(null);
   const [projectName, setProjectName] = useState('default');
   const [projectLibrary, setProjectLibrary] = useState([]);
+  const [editingProjectId, setEditingProjectId] = useState(null);
+  const [sharedMotions, setSharedMotions] = useState([]);
+  const [starterMotionEditor, setStarterMotionEditor] = useState(null);
   const [isPreviewPlaying, setIsPreviewPlaying] = useState(false);
-  const [plannerWaypoints, setPlannerWaypoints] = useState([
-    { id: 'planner-1', x: -8, y: 0 },
-    { id: 'planner-2', x: 0, y: 10 },
-    { id: 'planner-3', x: 14, y: 8 },
-  ]);
+  const [playbackProgress, setPlaybackProgress] = useState(0);
+  const [playbackSpeed, setPlaybackSpeed] = useState(1);
+  const [gridSize, setGridSize] = useState(20);
+  const [plannerWaypoints, setPlannerWaypoints] = useState([]);
+  const [pathPlannerMode, setPathPlannerMode] = useState(PLANNER_PATH_MODES.manual);
+  const [plannerRouteVariants, setPlannerRouteVariants] = useState({ initial: '', corrected: '', final: '' });
+  const [originalPlannerCode, setOriginalPlannerCode] = useState('');
+  const [selectedPlannerVariant, setSelectedPlannerVariant] = useState('final');
+  const [plannerProjectLabel, setPlannerProjectLabel] = useState('');
+  const [isWaypointPlacementEnabled, setIsWaypointPlacementEnabled] = useState(false);
   const [simulatorState, setSimulatorState] = useState(createEmptyG1Edu23State());
   const [session, setSession] = useState(() => {
     try {
@@ -643,83 +1008,217 @@ export default function App() {
       return null;
     }
   });
+  const [classroomDataReady, setClassroomDataReady] = useState(false);
   const currentUser = session?.user ?? { role: 'student', username: 'guest' };
+  const legacyCommandsForCurrentUser = useMemo(
+    () => G1_EXECUTABLE_COMMANDS.filter((command) => (
+      currentUser.role === 'teacher' || command.category !== 'Diagnostics'
+    )),
+    [currentUser.role],
+  );
+  const ideCommandEntries = useMemo(() => {
+    if (controllerVersion === 'duet') {
+      return getDuetCommandExamples(savedDuetMotions).map((example) => ({
+        ...example,
+        category: example.category || 'Commands',
+        script: example.code,
+        description: example.label,
+      }));
+    }
+    return legacyCommandsForCurrentUser.flatMap((command) => {
+      if (command.method === 'arm_action') {
+        return command.args[0].choices.map(([presetLabel, preset]) => ({
+          key: `arm_action_${preset}`,
+          category: command.category,
+          method: 'arm_action',
+          script: `robot.arm_action(${JSON.stringify(preset)})`,
+          label: `Arm preset: ${presetLabel.replace(/ \(\d+\)$/, '')}`,
+          description: G1_ARM_PRESET_DESCRIPTIONS[preset],
+          sdkMethod: command.sdkMethod,
+          adapters: command.adapters,
+        }));
+      }
+      const args = command.args.map((argument) => argument.kind === 'choice'
+        ? JSON.stringify(argument.value)
+        : argument.kind === 'text'
+          ? JSON.stringify(argument.value)
+          : String(argument.value));
+      return [{
+        key: command.method,
+        category: command.category,
+        method: command.method,
+        script: `robot.${command.method}(${args.join(', ')})`,
+        label: command.label,
+        description: command.description,
+        sdkMethod: command.sdkMethod,
+        adapters: command.adapters,
+      }];
+    });
+  }, [controllerVersion, legacyCommandsForCurrentUser, savedDuetMotions]);
+  const [savedDuetArmMotions, setSavedDuetArmMotions] = useState([]);
+  const [duetArmMotionName, setDuetArmMotionName] = useState('');
+  const [duetArmMotionError, setDuetArmMotionError] = useState('');
   const [savedCodes, setSavedCodes] = useState([]);
+  const [starterCodes, setStarterCodes] = useState([]);
   const [queueItems, setQueueItems] = useState([]);
+  const [queueReviewItem, setQueueReviewItem] = useState(null);
+  const [queueReviewError, setQueueReviewError] = useState('');
+  const [queueReviewStatus, setQueueReviewStatus] = useState('');
+  const [queueReviewSavedProject, setQueueReviewSavedProject] = useState(null);
+  const [queueReviewNavigationPreview, setQueueReviewNavigationPreview] = useState(null);
+  const [queueReviewNavigationOperation, setQueueReviewNavigationOperation] = useState(null);
+  const [isQueueReviewRunning, setIsQueueReviewRunning] = useState(false);
+  const [isQueueReviewPreviewing, setIsQueueReviewPreviewing] = useState(false);
   const [teacherRoster, setTeacherRoster] = useState([]);
-  const [loginForm, setLoginForm] = useState({ username: 'teacher', password: 'teacher', role: 'teacher' });
-  const [signupForm, setSignupForm] = useState({ username: '', password: '', role: 'student' });
-  const [authMode, setAuthMode] = useState('login');
+  const [loginForm, setLoginForm] = useState({ username: '', password: '' });
   const [loginError, setLoginError] = useState('');
+  const [isLoginPasswordVisible, setIsLoginPasswordVisible] = useState(false);
+  const [isRegistering, setIsRegistering] = useState(false);
+  const [newStudent, setNewStudent] = useState({ username: '', password: '', role: 'student' });
+  const [accountManagementError, setAccountManagementError] = useState('');
+  const [isCreatingStudent, setIsCreatingStudent] = useState(false);
+  const [deletingUsername, setDeletingUsername] = useState('');
+  const [classroomGroups, setClassroomGroups] = useState([]);
+  const classroomPasswordsByUsername = useMemo(
+    () => new Map(classroomGroups.flatMap((group) => (
+      group.accounts.map((account) => [account.username, account.password])
+    ))),
+    [classroomGroups],
+  );
+  const [newClassGroup, setNewClassGroup] = useState({ name: '', size: '25' });
+  const [isCreatingClassGroup, setIsCreatingClassGroup] = useState(false);
+  const [isClearingGuestData, setIsClearingGuestData] = useState(false);
+  const [deletingClassGroup, setDeletingClassGroup] = useState(null);
+  const [guestAccountStatus, setGuestAccountStatus] = useState('');
+  const [guestCardGroup, setGuestCardGroup] = useState(null);
   const [classroomStatus, setClassroomStatus] = useState('idle');
-  const [robotAddress, setRobotAddress] = useState('192.168.123.164');
   const [robotConnectionStatus, setRobotConnectionStatus] = useState('Not connected');
+  const [lidarTestStatus, setLidarTestStatus] = useState('Not tested');
+  const [navigationBridgeStatus, setNavigationBridgeStatus] = useState('Not checked');
+  const [navigationDiagnostics, setNavigationDiagnostics] = useState(null);
+  const [isNavigationMotionReady, setIsNavigationMotionReady] = useState(false);
+  const [isNavigationBridgeChecking, setIsNavigationBridgeChecking] = useState(false);
+  const [navigationMapSnapshot, setNavigationMapSnapshot] = useState(null);
+  const [navigationPlannerMode, setNavigationPlannerMode] = useState('static');
+  const navigationPlannerModeRef = useRef(navigationPlannerMode);
+  navigationPlannerModeRef.current = navigationPlannerMode;
+  const [liveNavigationObstacles, setLiveNavigationObstacles] = useState(null);
+  const [liveNavigationPose, setLiveNavigationPose] = useState(null);
+  const [isLiveAvoidanceReady, setIsLiveAvoidanceReady] = useState(false);
+  const [navigationMapStatus, setNavigationMapStatus] = useState('Map not loaded');
+  const [isNavigationMapLoading, setIsNavigationMapLoading] = useState(false);
+  const [isNavigationMapVisible, setIsNavigationMapVisible] = useState(false);
+  const [navigationRouteWaypoints, setNavigationRouteWaypoints] = useState([]);
+  const navigationRouteWaypointsRef = useRef(navigationRouteWaypoints);
+  navigationRouteWaypointsRef.current = navigationRouteWaypoints;
+  const [navigationRoutePreview, setNavigationRoutePreview] = useState(null);
+  const [isNavigationPreviewing, setIsNavigationPreviewing] = useState(false);
+  const [navigationPreviewStatus, setNavigationPreviewStatus] = useState('No route preview');
+  const [isNavigationGoalPlacementEnabled, setIsNavigationGoalPlacementEnabled] = useState(false);
+  const [navigationOperation, setNavigationOperation] = useState(null);
+  const [navigationExecutionStatus, setNavigationExecutionStatus] = useState('No navigation operation');
+  const [navigationHome, setNavigationHome] = useState(null);
+  const [navigationHomeStatus, setNavigationHomeStatus] = useState('No shared starting origin');
+  const [isNavigationStarting, setIsNavigationStarting] = useState(false);
+  const [isSettingNavigationHome, setIsSettingNavigationHome] = useState(false);
+  const [isReturningNavigationHome, setIsReturningNavigationHome] = useState(false);
+  const [lidarScanJob, setLidarScanJob] = useState(null);
+  const [lidarScanStatus, setLidarScanStatus] = useState('No room scan');
+  const [liveLidarScanPoints, setLiveLidarScanPoints] = useState([]);
+  const [isLidarScanStarting, setIsLidarScanStarting] = useState(false);
+  const [isLidarScanFinalizing, setIsLidarScanFinalizing] = useState(false);
+  const [sharedLidarOverlayEnabled, setSharedLidarOverlayEnabled] = useState(false);
+  const [sharedLidarMap, setSharedLidarMap] = useState(null);
+  const [isSharedLidarMapLoading, setIsSharedLidarMapLoading] = useState(false);
+  const [navigationLiveStatus, setNavigationLiveStatus] = useState('Live updates disconnected');
+  const sharedMapVersionRef = useRef(null);
+  const sharedMapLoadedRef = useRef(false);
+  const liveNavigationMapVersionRef = useRef(null);
+  const navigationMapSnapshotRef = useRef(null);
+  const navigationMapRefreshPendingRef = useRef(false);
+  const navigationMapRefreshStartedRef = useRef(0);
+  const navigationMapCoordinatesRef = useRef(null);
+  const navigationWaypointFrameRef = useRef(null);
   const [isRobotConnected, setIsRobotConnected] = useState(false);
+  const [isRobotConnecting, setIsRobotConnecting] = useState(false);
+  const [duetCommissioning, setDuetCommissioning] = useState(null);
+  const [isDuetCommissioningBusy, setIsDuetCommissioningBusy] = useState(false);
+  const [isDuetCommissioningAborting, setIsDuetCommissioningAborting] = useState(false);
+  const [duetCommissioningObserved, setDuetCommissioningObserved] = useState(false);
+  const [duetCommissioningObservedResult, setDuetCommissioningObservedResult] = useState('');
+  const [duetCommissioningNotes, setDuetCommissioningNotes] = useState('');
+  const [duetCommissioningEvidence, setDuetCommissioningEvidence] = useState(null);
+  const [duetCommissioningCopyStatus, setDuetCommissioningCopyStatus] = useState('');
+  const duetCommissioningEvidenceRef = useRef(null);
+  const [isLidarTesting, setIsLidarTesting] = useState(false);
+  const [sensorDiagnostics, setSensorDiagnostics] = useState(null);
+  const [isSensorDiscovering, setIsSensorDiscovering] = useState(false);
+  const [sensorOperationStatus, setSensorOperationStatus] = useState('');
+  const [sensorOperationBusy, setSensorOperationBusy] = useState('');
+  const [cameraInputSource, setCameraInputSource] = useState('device');
+  const [selectedRobotCameraTopic, setSelectedRobotCameraTopic] = useState('');
+  const [robotCameraStatus, setRobotCameraStatus] = useState('No robot camera selected');
+  const [robotCameraError, setRobotCameraError] = useState('');
+  const [deviceCameraStatus, setDeviceCameraStatus] = useState('Camera is off');
+  const [isDeviceCameraActive, setIsDeviceCameraActive] = useState(false);
+  const [deviceCameraError, setDeviceCameraError] = useState('');
+  const deviceCameraVideoRef = useRef(null);
+  const robotCameraCanvasRef = useRef(null);
+  const deviceCameraStreamRef = useRef(null);
+  const deviceCameraRequestRef = useRef(0);
   const [safetyNotice, setSafetyNotice] = useState('');
+  const [blockSyncError, setBlockSyncError] = useState('');
 
   const t = UI_TEXT[lang];
   const sceneObjectsKey = session?.user?.username ? `edu-scene-objects:${session.user.username}` : 'edu-scene-objects';
-  const insertRobotCommandWithValue = (commandType, defaultValue = 3, unitLabel = 'steps') => {
-    const valueText = window.prompt(`Enter ${unitLabel}:`, String(defaultValue));
-    if (valueText === null) return;
+  const duetArmMotionsKey = getDuetArmMotionsStorageKey(currentUser.username);
 
-    const numericValue = Number(valueText);
-    if (!Number.isFinite(numericValue)) {
-      alert(`Please enter a valid ${unitLabel}.`);
-      return;
+  useEffect(() => {
+    if (controllerVersion !== 'duet') return;
+    try {
+      setSavedDuetArmMotions(parseSavedDuetArmMotions(localStorage.getItem(duetArmMotionsKey)));
+      setDuetArmMotionError('');
+    } catch (error) {
+      setSavedDuetArmMotions([]);
+      setDuetArmMotionError(`Could not load saved DUET arm sequences: ${error.message}`);
     }
+  }, [controllerVersion, duetArmMotionsKey]);
 
-    const commandMap = {
-      walkForward: `robot.walkForward(${clampSafeValue('STEPS', numericValue)});`,
-      walkBackward: `robot.walkBackward(${clampSafeValue('STEPS', numericValue)});`,
-      walkSidewaysLeft: `robot.walkSidewaysLeft(${clampSafeValue('STEPS', numericValue)});`,
-      walkSidewaysRight: `robot.walkSidewaysRight(${clampSafeValue('STEPS', numericValue)});`,
-      wait: `robot.wait(${clampSafeValue('SECONDS', numericValue)});`,
-      repeat: `robot.repeatLoop(${clampSafeValue('STEPS', numericValue)});`,
-      raiseBothArms: 'robot.raiseBothArms();',
-      lowerBothArms: 'robot.lowerBothArms();',
-      stop: 'robot.stop();',
-      sit: 'robot.sit();',
-    };
+  useEffect(() => {
+    if (!motionVideoUrl) return undefined;
+    return () => URL.revokeObjectURL(motionVideoUrl);
+  }, [motionVideoUrl]);
 
-    const snippet = commandMap[commandType];
-    if (!snippet) return;
+  useEffect(() => {
+    if (
+      controllerVersion === 'duet'
+      && motionPrompt === 'Walk forward 3 steps, turn left 90 degrees, then wave'
+    ) {
+      setMotionPrompt('Move forward for 1 second, then wave left for 1 second');
+    } else if (
+      controllerVersion === 'legacy'
+      && motionPrompt === 'Move forward for 1 second, then wave left for 1 second'
+    ) {
+      setMotionPrompt('Walk forward 3 steps, turn left 90 degrees, then wave');
+    }
+  }, [controllerVersion, motionPrompt]);
 
-    insertRobotCommand(snippet);
-  };
-
-  const quickRobotCommands = [
-    { label: 'robot.stand();', snippet: 'robot.stand();' },
-    { label: 'robot.stop();', snippet: 'robot.stop();' },
-    { label: 'robot.sit();', snippet: 'robot.sit();' },
-    { label: 'robot.walkForward();', snippet: 'robot.walkForward();' },
-    { label: 'Walk Forward (steps)', action: () => insertRobotCommandWithValue('walkForward', 3, 'steps') },
-    { label: 'robot.walkBackward();', snippet: 'robot.walkBackward();' },
-    { label: 'Walk Back (steps)', action: () => insertRobotCommandWithValue('walkBackward', 3, 'steps') },
-    { label: 'Walk Left (steps)', action: () => insertRobotCommandWithValue('walkSidewaysLeft', 2, 'steps') },
-    { label: 'Walk Right (steps)', action: () => insertRobotCommandWithValue('walkSidewaysRight', 2, 'steps') },
-    { label: 'robot.turnLeft(90);', snippet: 'robot.turnLeft(90);' },
-    { label: 'robot.turnRight(90);', snippet: 'robot.turnRight(90);' },
-    { label: 'robot.raiseBothArms();', snippet: 'robot.raiseBothArms();' },
-    { label: 'robot.lowerBothArms();', snippet: 'robot.lowerBothArms();' },
-    { label: 'robot.raiseLeftArm("high", 90);', snippet: 'robot.raiseLeftArm("high", 90);' },
-    { label: 'robot.raiseRightArm("mid", 90);', snippet: 'robot.raiseRightArm("mid", 90);' },
-    { label: 'robot.raiseLeftKnee();', snippet: 'robot.raiseLeftKnee();' },
-    { label: 'robot.raiseRightKnee();', snippet: 'robot.raiseRightKnee();' },
-    { label: 'Wait (seconds)', action: () => insertRobotCommandWithValue('wait', 1, 'seconds') },
-    { label: 'Repeat (times)', action: () => insertRobotCommandWithValue('repeat', 3, 'times') },
-    { label: 'robot.waveLeft();', snippet: 'robot.waveLeft();' },
-    { label: 'robot.waveRight();', snippet: 'robot.waveRight();' },
-  ];
-
+  useEffect(() => {
+    generatedCodeRef.current = generatedCode;
+    codeByVersionRef.current[controllerVersion] = generatedCode;
+  }, [generatedCode, controllerVersion]);
   const overlayTabs = [
     { id: 'blocks', label: 'Blocks' },
-    { id: 'planner', label: 'Motion Planner' },
-    { id: 'camera', label: 'Camera Motion Tracker' },
     { id: 'ide', label: 'IDE' },
+    { id: 'planner', label: 'Path Planner' },
+    { id: 'prompt', label: 'Prompt to Motion' },
+    { id: 'camera', label: 'Vision to Motion' },
   ];
+  const configurableSidebarPanels = overlayTabs;
+  const unlockedOverlayTabs = overlayTabs.filter(({ id }) => !lockedSidebarPanels.includes(id));
+  const sidebarPanelIsLocked = (id) => lockedSidebarPanels.includes(id);
 
-  const apiFetch = async (url, options = {}) => {
+  const apiFetch = useCallback(async (url, options = {}) => {
     const headers = {
       'Content-Type': 'application/json',
       ...(session?.token ? { Authorization: `Bearer ${session.token}` } : {}),
@@ -731,33 +1230,375 @@ export default function App() {
     const data = text ? JSON.parse(text) : {};
 
     if (!res.ok) {
-      throw new Error(data.detail || data.message || 'Request failed');
+      if (res.status === 401 && data.detail === 'Invalid token' && session?.token) {
+        localStorage.removeItem('edu-classroom-session');
+        setSession(null);
+        throw new Error('Your session expired. Please sign in again.');
+      }
+      const error = new Error(data.detail || data.message || 'Request failed');
+      error.status = res.status;
+      throw error;
     }
     return data;
+  }, [session?.token]);
+
+  useEffect(() => {
+    if (!session?.token) {
+      setClassroomDataReady(false);
+      return undefined;
+    }
+
+    let active = true;
+    setClassroomDataReady(false);
+    apiFetch('/api/classroom/me')
+      .then(({ data_revision: dataRevision = 0 }) => {
+        if (!active) return;
+        const revision = String(dataRevision);
+        const revisionKey = `edu-classroom-data-revision:${session.user.username}`;
+        const savedRevision = localStorage.getItem(revisionKey);
+        if ((savedRevision ?? '0') !== revision) {
+          localStorage.removeItem(sceneObjectsKey);
+          localStorage.removeItem(duetArmMotionsKey);
+          setSceneObjects([]);
+          setSavedDuetArmMotions([]);
+          setPlannerWaypoints([]);
+          setProjectName('default');
+          setEditingProjectId(null);
+          generatedCodeRef.current = '';
+          setGeneratedCode('');
+          codeByVersionRef.current.legacy = '';
+          codeByVersionRef.current.duet = '';
+        }
+        localStorage.setItem(revisionKey, revision);
+        setClassroomDataReady(true);
+      })
+      .catch((error) => {
+        if (!active) return;
+        console.error('Unable to verify classroom account data revision.', error);
+        setSession(null);
+      });
+
+    return () => {
+      active = false;
+    };
+  }, [apiFetch, duetArmMotionsKey, sceneObjectsKey, session?.token, session?.user?.username]);
+
+  useEffect(() => {
+    if (currentUser.role !== 'teacher' || !session?.token) {
+      setLockedSidebarPanels([]);
+      setIsSidebarSettingsLoading(false);
+      return undefined;
+    }
+    let active = true;
+    setIsSidebarSettingsLoading(true);
+    const loadSidebarSettings = async () => {
+      try {
+        let settings = await apiFetch('/api/classroom/sidebar-settings');
+        if (!Array.isArray(settings.locked_panels)) {
+          throw new Error('Teacher sidebar settings response is invalid.');
+        }
+        if (!settings.configured) {
+          const legacyValue = localStorage.getItem(`edu-locked-sidebar-panels:${currentUser.username}`);
+          const legacyPanels = legacyValue ? JSON.parse(legacyValue) : [];
+          const validLegacyPanels = Array.isArray(legacyPanels)
+            ? [...new Set(legacyPanels.filter((panel) => SIDEBAR_PANEL_IDS.includes(panel)))]
+            : [];
+          if (validLegacyPanels.length > 0) {
+            settings = await apiFetch('/api/classroom/sidebar-settings', {
+              method: 'PUT',
+              body: JSON.stringify({ locked_panels: validLegacyPanels }),
+            });
+          }
+        }
+        const validPanels = SIDEBAR_PANEL_IDS;
+        const nextPanels = settings.locked_panels.filter((panel) => validPanels.includes(panel));
+        const visiblePanelIds = SIDEBAR_PANEL_IDS.filter((panel) => !nextPanels.includes(panel));
+        if (!active) return;
+        setLockedSidebarPanels(nextPanels);
+        setMainTab((tab) => {
+          if (visiblePanelIds.includes(tab)) return tab;
+          return visiblePanelIds[0] || tab;
+        });
+        setLockedSidebarPanelsError('');
+        setIsSidebarSettingsLoading(false);
+        try {
+          localStorage.setItem(`edu-locked-sidebar-panels:${currentUser.username}`, JSON.stringify(nextPanels));
+        } catch (error) {
+          console.warn('Unable to cache teacher sidebar settings locally.', error);
+        }
+      } catch (error) {
+        if (!active) return;
+        console.error('Unable to load teacher sidebar settings.', error);
+        setLockedSidebarPanelsError(`Teacher sidebar settings could not be loaded: ${error.message}`);
+        setIsSidebarSettingsLoading(false);
+      }
+    };
+    loadSidebarSettings();
+    return () => {
+      active = false;
+    };
+  }, [apiFetch, currentUser.role, currentUser.username, session?.token]);
+
+  useEffect(() => {
+    if (currentUser.role !== 'teacher' || !session?.token) {
+      setSafeModeEnabled(false);
+      setIsSafeModeSettingsLoading(false);
+      return undefined;
+    }
+    let active = true;
+    setIsSafeModeSettingsLoading(true);
+    apiFetch('/api/classroom/safe-mode')
+      .then((settings) => {
+        if (typeof settings.enabled !== 'boolean') {
+          throw new Error('Teacher Safe Mode settings response is invalid.');
+        }
+        if (!active) return;
+        setSafeModeEnabled(settings.enabled);
+        setSafeModeSettingsError('');
+      })
+      .catch((error) => {
+        if (!active) return;
+        console.error('Unable to load teacher Safe Mode settings.', error);
+        setSafeModeSettingsError(`Safe Mode settings could not be loaded: ${error.message}`);
+      })
+      .finally(() => {
+        if (active) setIsSafeModeSettingsLoading(false);
+      });
+    return () => {
+      active = false;
+    };
+  }, [apiFetch, currentUser.role, session?.token]);
+
+  useEffect(() => {
+    if (!session?.token) {
+      setIsSimulationVisible(true);
+      setIsSimulationVisibilityLoading(false);
+      return undefined;
+    }
+
+    let active = true;
+    setIsSimulationVisibilityLoading(true);
+    const loadSimulationVisibility = async () => {
+      try {
+        const settings = await apiFetch('/api/classroom/simulation-visibility');
+        if (typeof settings.show_simulation !== 'boolean') {
+          throw new Error('Simulation visibility response is invalid.');
+        }
+        if (!active) return;
+        setIsSimulationVisible(settings.show_simulation);
+        setSimulationVisibilityError('');
+      } catch (error) {
+        if (!active) return;
+        console.error('Unable to load shared simulation visibility.', error);
+        setSimulationVisibilityError(`Simulation visibility could not be loaded: ${error.message}`);
+      } finally {
+        if (active) setIsSimulationVisibilityLoading(false);
+      }
+    };
+
+    void loadSimulationVisibility();
+    const refreshInterval = currentUser.role === 'student'
+      ? window.setInterval(() => void loadSimulationVisibility(), 5000)
+      : null;
+    return () => {
+      active = false;
+      if (refreshInterval !== null) window.clearInterval(refreshInterval);
+    };
+  }, [apiFetch, currentUser.role, session?.token]);
+
+  const handleSafeModeToggle = async (enabled) => {
+    const previousValue = safeModeEnabled;
+    setSafeModeEnabled(enabled);
+    setIsSafeModeSettingsSaving(true);
+    try {
+      const settings = await apiFetch('/api/classroom/safe-mode', {
+        method: 'PUT',
+        body: JSON.stringify({ enabled }),
+      });
+      setSafeModeEnabled(settings.enabled);
+      setSafeModeSettingsError('');
+    } catch (error) {
+      setSafeModeEnabled(previousValue);
+      console.error('Unable to save teacher Safe Mode settings.', error);
+      setSafeModeSettingsError(`Safe Mode could not be saved: ${error.message}`);
+    } finally {
+      setIsSafeModeSettingsSaving(false);
+    }
   };
+
+  const handleSimulationVisibilityToggle = async (showSimulation) => {
+    const previousValue = isSimulationVisible;
+    setIsSimulationVisible(showSimulation);
+    if (!showSimulation) setToolPanelCollapsed(false);
+    setIsSimulationVisibilitySaving(true);
+    try {
+      const settings = await apiFetch('/api/classroom/simulation-visibility', {
+        method: 'PUT',
+        body: JSON.stringify({ show_simulation: showSimulation }),
+      });
+      setIsSimulationVisible(settings.show_simulation);
+      setSimulationVisibilityError('');
+    } catch (error) {
+      setIsSimulationVisible(previousValue);
+      console.error('Unable to save shared simulation visibility.', error);
+      setSimulationVisibilityError(`Simulation visibility could not be saved: ${error.message}`);
+    } finally {
+      setIsSimulationVisibilitySaving(false);
+    }
+  };
+
+  const handleSidebarPanelLockChange = async (panelId, isLocked) => {
+    const previousPanels = lockedSidebarPanels;
+    const nextPanels = isLocked
+      ? [...new Set([...previousPanels, panelId])]
+      : previousPanels.filter((id) => id !== panelId);
+    const visiblePanelIds = SIDEBAR_PANEL_IDS.filter((id) => !nextPanels.includes(id));
+    setLockedSidebarPanels(nextPanels);
+    setIsSidebarSettingsSaving(true);
+    setMainTab((tab) => visiblePanelIds.includes(tab) ? tab : visiblePanelIds[0] || tab);
+    try {
+      const settings = await apiFetch('/api/classroom/sidebar-settings', {
+        method: 'PUT',
+        body: JSON.stringify({ locked_panels: nextPanels }),
+      });
+      setLockedSidebarPanels(settings.locked_panels);
+      setLockedSidebarPanelsError('');
+      try {
+        localStorage.setItem(`edu-locked-sidebar-panels:${currentUser.username}`, JSON.stringify(settings.locked_panels));
+      } catch (error) {
+        console.warn('Unable to cache teacher sidebar settings locally.', error);
+      }
+    } catch (error) {
+      setLockedSidebarPanels(previousPanels);
+      console.error('Unable to save teacher sidebar settings.', error);
+      setLockedSidebarPanelsError(`Teacher sidebar settings could not be saved: ${error.message}`);
+    } finally {
+      setIsSidebarSettingsSaving(false);
+    }
+  };
+
+  const robotConnection = useMemo(
+    () => createRobotConnection('sdk', { request: apiFetch }),
+    [apiFetch],
+  );
+  const duetRobotConnection = useMemo(
+    () => new DuetRobotConnection(apiFetch),
+    [apiFetch],
+  );
+  const activeRobotConnection = controllerVersion === 'duet' ? duetRobotConnection : robotConnection;
+
+  useEffect(() => {
+    if (controllerVersion !== 'duet' || session?.user?.role !== 'teacher') {
+      setSavedDuetMotions([]);
+      return undefined;
+    }
+    let active = true;
+    apiFetch('/api/duet/motions', { cache: 'no-store' })
+      .then(({ motions }) => {
+        if (active) setSavedDuetMotions(Array.isArray(motions) ? motions : []);
+      })
+      .catch((error) => {
+        if (active) setDuetMotionSaveError(`Could not load saved DUET commands: ${error.message}`);
+      });
+    return () => {
+      active = false;
+    };
+  }, [apiFetch, controllerVersion, session?.user?.role]);
+
+  useEffect(() => {
+    if (controllerVersion !== 'duet' || session?.user?.role !== 'teacher') {
+      setDuetCommissioning(null);
+      return undefined;
+    }
+    let active = true;
+    duetRobotConnection.commissioningStatus()
+      .then((report) => {
+        if (active) setDuetCommissioning(report);
+      })
+      .catch((error) => {
+        if (active) setRobotConnectionStatus(`DUET commissioning report unavailable: ${error.message}`);
+      });
+    return () => {
+      active = false;
+    };
+  }, [controllerVersion, session?.user?.role, duetRobotConnection]);
+
+  useEffect(() => {
+    if (
+      controllerVersion !== 'duet'
+      || session?.user?.role !== 'teacher'
+      || !['passed', 'failed', 'aborted'].includes(duetCommissioning?.status)
+    ) {
+      setDuetCommissioningEvidence(null);
+      setDuetCommissioningCopyStatus('');
+      return undefined;
+    }
+    let active = true;
+    duetRobotConnection.commissioningEvidence()
+      .then((evidence) => {
+        if (active) setDuetCommissioningEvidence(evidence);
+      })
+      .catch((error) => {
+        if (active) {
+          setDuetCommissioningCopyStatus(`Full evidence could not be loaded: ${error.message}`);
+        }
+      });
+    return () => {
+      active = false;
+    };
+  }, [
+    controllerVersion,
+    session?.user?.role,
+    duetCommissioning?.report_id,
+    duetCommissioning?.updated_at,
+    duetCommissioning?.status,
+    duetRobotConnection,
+  ]);
 
   const refreshClassroomData = useCallback(async () => {
     if (!session?.token) return;
     try {
-      const [codesRes, queueRes, usersRes, statusRes, projectsRes] = await Promise.all([
+      const [codesRes, queueRes, usersRes, groupsRes, statusRes, projectsRes] = await Promise.all([
         apiFetch('/api/classroom/codes'),
         session.user.role === 'teacher' ? apiFetch('/api/classroom/queue') : Promise.resolve({ items: [] }),
         session.user.role === 'teacher' ? apiFetch('/api/classroom/users') : Promise.resolve({ users: [] }),
+        session.user.role === 'teacher' ? apiFetch('/api/classroom/groups') : Promise.resolve({ groups: [] }),
         apiFetch('/api/classroom/status'),
-        session.user.role === 'teacher' ? apiFetch('/api/classroom/projects/all') : apiFetch('/api/classroom/projects')
+        apiFetch('/api/classroom/projects')
       ]);
       setSavedCodes(codesRes.codes || []);
+      setStarterCodes(codesRes.starter_codes || []);
+      setSharedMotions(codesRes.shared_motions || []);
       setQueueItems(queueRes.items || []);
       setTeacherRoster(usersRes.users || []);
+      setClassroomGroups(groupsRes.groups || []);
       setClassroomStatus(statusRes.status || 'idle');
       setProjectLibrary(projectsRes.projects || []);
+      return queueRes.items || [];
     } catch (err) {
       console.error('Failed to refresh classroom data:', err);
+      if (session.user.role === 'teacher') {
+        setAccountManagementError(`Could not load classroom data: ${err.message}`);
+      }
+      return [];
     }
-  }, [session]);
+  }, [session, apiFetch]);
 
   useEffect(() => {
-    if (session) {
+    if (!session?.token) return;
+    apiFetch('/api/planner/settings')
+      .then(({ active_mode: mode }) => {
+        if (Object.prototype.hasOwnProperty.call(PLANNER_PATH_MODES, mode)) {
+          setPathPlannerMode(mode);
+        }
+      })
+      .catch((error) => {
+        setNavigationExecutionStatus(`Could not load the teacher-selected planner mode • ${error.message}`);
+      });
+  }, [session?.token, apiFetch]);
+
+  useEffect(() => {
+    if (session && classroomDataReady) {
       localStorage.setItem('edu-classroom-session', JSON.stringify(session));
       const savedSceneObjects = localStorage.getItem(sceneObjectsKey);
       if (savedSceneObjects) {
@@ -770,6 +1611,22 @@ export default function App() {
         setSceneObjects([]);
       }
       refreshClassroomData();
+      if (session.user.role === 'teacher') {
+        robotConnection.status()
+          .then((status) => {
+            setIsRobotConnected(status.sdkAvailable);
+            if (status.sdkAvailable) {
+              const sensorText = `MID-360 distance conditions ${status.distanceSensor?.ready ? 'ready' : 'disabled'} • ${formatLidarDistanceStatus(status.distanceSensor)}`;
+              setRobotConnectionStatus(`SDK connected on ${status.interface} • ${sensorText}`);
+            } else {
+              setRobotConnectionStatus('Disconnected • backend must run on the G1 computer • LiDAR status is available without SDK motion');
+            }
+          })
+          .catch((error) => {
+            setIsRobotConnected(false);
+            setRobotConnectionStatus(`Robot status unavailable: ${error.message}`);
+          });
+      }
       apiFetch('/api/classroom/project?name=default')
         .then((response) => {
           if (response.project && Array.isArray(response.project.sceneObjects)) {
@@ -778,26 +1635,89 @@ export default function App() {
           if (response.project && Array.isArray(response.project.plannerWaypoints)) {
             setPlannerWaypoints(response.project.plannerWaypoints);
           }
+          if (response.project && response.project.plannerMode
+            && Object.prototype.hasOwnProperty.call(PLANNER_PATH_MODES, response.project.plannerMode)) {
+            setPathPlannerMode(response.project.plannerMode);
+            setPlannerProjectLabel(response.project.plannerLabel || response.project.name || '');
+            setPlannerRouteVariants(response.project.plannerVariants || { initial: '', corrected: '', final: '' });
+            setSelectedPlannerVariant(response.project.selectedPlannerVariant || 'final');
+            setOriginalPlannerCode(response.project.plannerMode === PLANNER_PATH_MODES.sensor_corrected
+              ? response.project.plannerVariants?.initial || ''
+              : '');
+          }
           if (response.project && typeof response.project.generatedCode === 'string') {
-            setGeneratedCode(response.project.generatedCode);
+            codeByVersionRef.current.legacy = response.project.generatedCode;
+          }
+          if (response.project && typeof response.project.duetCode === 'string') {
+            codeByVersionRef.current.duet = response.project.duetCode;
+          }
+          if (response.project) {
+            const selectedCode = controllerVersionRef.current === 'duet'
+              ? codeByVersionRef.current.duet
+              : codeByVersionRef.current.legacy;
+            if (controllerVersionRef.current === 'duet') {
+              try {
+                parseDuetProgram(selectedCode);
+              } catch (error) {
+                setBlockSyncError(`Saved DUET project code is invalid: ${error.message}`);
+                return;
+              }
+            }
+            compiledPlannerCodeRef.current = selectedCode;
+            applyGeneratedCodeRef.current?.(selectedCode, { syncBlocks: true });
           }
         })
         .catch(() => {
           // fallback to local storage only if no backend project exists
         });
-    } else {
+    } else if (!session) {
       localStorage.removeItem('edu-classroom-session');
     }
-  }, [session, refreshClassroomData, sceneObjectsKey]);
+  }, [session, classroomDataReady, refreshClassroomData, sceneObjectsKey, robotConnection, apiFetch]);
 
   useEffect(() => {
-    if (session?.user?.username) {
+    if (controllerVersion !== 'duet' || !isDuetProgramActive) return undefined;
+    let active = true;
+    const refreshDuetExecutionStatus = async () => {
+      if (!isDuetProgramActive) return;
+      try {
+        const status = await duetRobotConnection.status();
+        if (!active) return;
+        if (status.motionActive === false) {
+          duetProgramActiveRef.current = false;
+          setIsDuetProgramActive(false);
+          setIsRunning(false);
+          setIsRobotConnected(status.connected === true && status.ready === true);
+          setRobotConnectionStatus(status.connected === true
+            ? 'DUET program finished; controller remains connected.'
+            : 'DUET program finished and controller is disconnected.');
+        } else if (status.motionActive === true) {
+          setRobotConnectionStatus('DUET program is active; stop remains available.');
+        } else {
+          setRobotConnectionStatus(`DUET execution state is unverified; keeping the run locked. ${status.error || ''}`.trim());
+        }
+      } catch (error) {
+        if (active) {
+          setRobotConnectionStatus(`DUET execution status unavailable; keeping the run locked. ${error.message}`);
+        }
+      }
+    };
+    refreshDuetExecutionStatus();
+    const timer = window.setInterval(refreshDuetExecutionStatus, 1000);
+    return () => {
+      active = false;
+      window.clearInterval(timer);
+    };
+  }, [controllerVersion, duetRobotConnection, isDuetProgramActive]);
+
+  useEffect(() => {
+    if (session?.user?.username && classroomDataReady) {
       localStorage.setItem(sceneObjectsKey, JSON.stringify(sceneObjects));
     }
-  }, [sceneObjects, sceneObjectsKey, session]);
+  }, [sceneObjects, sceneObjectsKey, session, classroomDataReady]);
 
   useEffect(() => {
-    if (!session?.user?.username) return;
+    if (!session?.user?.username || !classroomDataReady) return;
     const timer = setTimeout(() => {
       apiFetch('/api/classroom/project/save', {
         method: 'POST',
@@ -805,14 +1725,196 @@ export default function App() {
           name: projectName,
           sceneObjects,
           plannerWaypoints,
-          generatedCode,
+          generatedCode: attachPlannerProjectMeta(codeByVersionRef.current.legacy, {
+            plannerMode: pathPlannerMode,
+            plannerLabel: plannerProjectLabel,
+            plannerVariants: plannerRouteVariants,
+            selectedPlannerVariant,
+          }),
+          duetCode: codeByVersionRef.current.duet,
+          plannerMode: pathPlannerMode,
+          plannerLabel: plannerProjectLabel,
+          plannerVariants: plannerRouteVariants,
+          selectedPlannerVariant,
         }),
       }).catch(() => {
         // keep the local app responsive even if the backend sync is delayed
       });
     }, 250);
     return () => clearTimeout(timer);
-  }, [session, projectName, sceneObjects, plannerWaypoints, generatedCode]);
+  }, [session, classroomDataReady, projectName, sceneObjects, plannerWaypoints, generatedCode, controllerVersion, pathPlannerMode, plannerProjectLabel, plannerRouteVariants, selectedPlannerVariant, apiFetch]);
+
+  useEffect(() => {
+    if (!session?.token) {
+      setLidarScanJob(null);
+      setLiveLidarScanPoints([]);
+      setSharedLidarMap(null);
+      setNavigationLiveStatus('Live updates disconnected');
+      setNavigationDiagnostics(null);
+      setIsNavigationMotionReady(false);
+      setLiveNavigationObstacles(null);
+      setLiveNavigationPose(null);
+      setIsLiveAvoidanceReady(false);
+      sharedMapVersionRef.current = null;
+      sharedMapLoadedRef.current = false;
+      liveNavigationMapVersionRef.current = null;
+      navigationMapSnapshotRef.current = null;
+      navigationWaypointFrameRef.current = null;
+      setNavigationRoutePreview(null);
+      setNavigationPreviewStatus('No route preview');
+      return undefined;
+    }
+
+    let active = true;
+    let socket = null;
+    let reconnectTimer = null;
+    let reconnectDelayMs = 1000;
+    Promise.all([
+      apiFetch('/api/lidar/settings'),
+      apiFetch('/api/lidar/map'),
+    ]).then(([settings, sharedMap]) => {
+      if (!active) return;
+      setSharedLidarOverlayEnabled(settings.show_shared_overlay === true);
+      setSharedLidarMap(sharedMap.map ? sharedMap : null);
+      sharedMapVersionRef.current = sharedMap.map?.map?.version || null;
+      sharedMapLoadedRef.current = Boolean(sharedMap.map);
+    }).catch((error) => {
+      if (active) setNavigationLiveStatus(`Live map unavailable • ${error.message}`);
+    });
+
+    const handleLiveMessage = (event) => {
+      if (!active) return;
+      try {
+        const update = JSON.parse(event.data);
+        const scan = update.scan;
+        if (scan) {
+          setLidarScanJob(scan);
+          setLiveLidarScanPoints(Array.isArray(scan.preview_points) ? scan.preview_points : []);
+          setLidarScanStatus(
+            scan.error
+              ? `Scan ${scan.status} • ${scan.error}`
+              : `Scan ${scan.status} • ${scan.point_count || 0} unique 3D points`,
+          );
+        }
+        setSharedLidarOverlayEnabled(update.shared_overlay_enabled === true);
+        setIsNavigationMotionReady(update.navigation?.motion_ready === true);
+        setIsLiveAvoidanceReady(update.navigation?.live_avoidance_ready === true);
+        setLiveNavigationObstacles(update.navigation?.live_obstacles || null);
+        setLiveNavigationPose(update.navigation?.localization?.pose
+          ? {
+            ...update.navigation.localization.pose,
+            frame_id: update.navigation.localization.frame_id,
+          }
+          : null);
+        if (update.navigation?.diagnostics) {
+          setNavigationDiagnostics(update.navigation.diagnostics);
+        }
+        setNavigationLiveStatus(
+          update.navigation?.ready
+            ? `Live • ${update.navigation.map?.map_id} ${update.navigation.map?.version} • ${update.navigation.localization?.age_ms ?? '—'} ms localization • MID-360 ${update.navigation.pointcloud_age_ms ?? '—'} ms old • ${update.navigation.motion_ready ? 'robot link and e-stop healthy' : [update.navigation.robot_health?.error, update.navigation.estop?.error].filter(Boolean).join(' • ') || 'robot/e-stop health unverified'}`
+            : `Live • navigation unavailable${update.navigation?.error ? ` • ${update.navigation.error}` : ''}`,
+        );
+        const sharedVersion = update.shared_map_version || null;
+        if (sharedVersion && sharedVersion !== sharedMapVersionRef.current) {
+          sharedMapVersionRef.current = sharedVersion;
+          if (session.user.role === 'teacher' || update.shared_overlay_enabled) {
+            apiFetch('/api/lidar/map')
+              .then((result) => {
+                if (!active) return;
+                setSharedLidarMap(result.map ? result : null);
+                sharedMapLoadedRef.current = Boolean(result.map);
+              })
+              .catch((error) => {
+                if (active) setNavigationLiveStatus(`Published map refresh failed • ${error.message}`);
+              });
+          }
+        } else if (update.shared_overlay_enabled && !sharedMapLoadedRef.current) {
+          apiFetch('/api/lidar/map')
+            .then((result) => {
+              if (!active) return;
+              setSharedLidarMap(result.map ? result : null);
+              sharedMapLoadedRef.current = Boolean(result.map);
+              sharedMapVersionRef.current = result.map?.map?.version || null;
+            })
+            .catch((error) => {
+              if (active) setNavigationLiveStatus(`Published map refresh failed • ${error.message}`);
+            });
+        }
+        const liveMapVersion = update.navigation?.map?.version || null;
+        if (
+          session.user.role === 'teacher'
+          && navigationPlannerModeRef.current === 'live'
+          && liveNavigationMapVersionRef.current
+          && liveMapVersion
+          && liveMapVersion !== liveNavigationMapVersionRef.current
+          && !navigationMapRefreshPendingRef.current
+          && Date.now() - navigationMapRefreshStartedRef.current >= 1000
+        ) {
+          navigationMapRefreshPendingRef.current = true;
+          navigationMapRefreshStartedRef.current = Date.now();
+          apiFetch('/api/navigation/map')
+            .then((result) => {
+              if (!active) return;
+              const previousSnapshot = navigationMapSnapshotRef.current;
+              const waypointFrame = previousSnapshot?.map || navigationWaypointFrameRef.current;
+              const sameFrame = waypointFrame?.map_id === result.map.map_id
+                && waypointFrame?.frame_id === result.map.frame_id;
+              if (!sameFrame) {
+                navigationRouteWaypointsRef.current = [];
+                setNavigationRouteWaypoints([]);
+                setIsNavigationGoalPlacementEnabled(false);
+              }
+              navigationMapSnapshotRef.current = result;
+              setNavigationMapSnapshot(result);
+              liveNavigationMapVersionRef.current = result.map.version;
+              setNavigationRoutePreview(null);
+              setNavigationPreviewStatus('Map changed • preview the route again');
+              setNavigationMapStatus(!sameFrame
+                ? `Live map frame changed • destinations cleared • version ${result.map.version}`
+                : `Live map updated • ${result.map.width} × ${result.map.height} cells • destinations stay fixed in map coordinates • version ${result.map.version}`);
+            })
+            .catch((error) => {
+              if (active) setNavigationMapStatus(`Live map refresh failed • ${error.message}`);
+            })
+            .finally(() => {
+              navigationMapRefreshPendingRef.current = false;
+            });
+        }
+      } catch (error) {
+        setNavigationLiveStatus(`Invalid live update • ${error.message}`);
+      }
+    };
+
+    const connectLiveSocket = () => {
+      if (!active) return;
+      const socketScheme = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
+      socket = new WebSocket(
+        `${socketScheme}//${window.location.host}/api/lidar/live`,
+        [`edu-auth.${session.token}`],
+      );
+      socket.onopen = () => {
+        reconnectDelayMs = 1000;
+        if (active) setNavigationLiveStatus('Live LiDAR and navigation updates connected');
+      };
+      socket.onmessage = handleLiveMessage;
+      socket.onerror = () => {
+        if (active) setNavigationLiveStatus('Live updates unavailable • checking the authenticated backend connection');
+      };
+      socket.onclose = () => {
+        if (!active) return;
+        setNavigationLiveStatus('Live updates disconnected • reconnecting');
+        reconnectTimer = window.setTimeout(connectLiveSocket, reconnectDelayMs);
+        reconnectDelayMs = Math.min(reconnectDelayMs * 2, 15000);
+      };
+    };
+    connectLiveSocket();
+
+    return () => {
+      active = false;
+      if (reconnectTimer !== null) window.clearTimeout(reconnectTimer);
+      socket?.close();
+    };
+  }, [session?.token, session?.user?.role, apiFetch]);
 
   const handleLogin = async (event) => {
     event.preventDefault();
@@ -820,7 +1922,7 @@ export default function App() {
     try {
       const response = await apiFetch('/api/classroom/login', {
         method: 'POST',
-        body: JSON.stringify(loginForm)
+        body: JSON.stringify({ username: loginForm.username, password: loginForm.password })
       }, false);
       setSession({ token: response.token, user: response.user });
     } catch (err) {
@@ -828,16 +1930,15 @@ export default function App() {
     }
   };
 
-  const handleSignup = async (event) => {
+  const handleRegisterStudent = async (event) => {
     event.preventDefault();
     setLoginError('');
     try {
-      const response = await apiFetch('/api/classroom/signup', {
+      const response = await apiFetch('/api/classroom/register', {
         method: 'POST',
-        body: JSON.stringify(signupForm)
+        body: JSON.stringify({ username: loginForm.username, password: loginForm.password }),
       }, false);
       setSession({ token: response.token, user: response.user });
-      setAuthMode('login');
     } catch (err) {
       setLoginError(err.message);
     }
@@ -846,13 +1947,130 @@ export default function App() {
   const handleLogout = () => {
     setSession(null);
     setSavedCodes([]);
+    setStarterCodes([]);
+    setSharedMotions([]);
+    setProjectLibrary([]);
+    setEditingProjectId(null);
     setQueueItems([]);
+    setTeacherRoster([]);
+    setClassroomGroups([]);
     setClassroomStatus('idle');
+  };
+
+  const handleCreateStudent = async (event) => {
+    event.preventDefault();
+    setAccountManagementError('');
+    setIsCreatingStudent(true);
+    try {
+      await apiFetch('/api/classroom/users', {
+        method: 'POST',
+        body: JSON.stringify(newStudent),
+      });
+      setNewStudent({ username: '', password: '', role: 'student' });
+      await refreshClassroomData();
+    } catch (error) {
+      setAccountManagementError(error.message);
+    } finally {
+      setIsCreatingStudent(false);
+    }
+  };
+
+  const handleDeleteUser = async (username) => {
+    if (!window.confirm(
+      `Delete ${username}? Their saved programs, projects, queue submissions, and account-owned operation records will be permanently removed.`,
+    )) return;
+    setAccountManagementError('');
+    setDeletingUsername(username);
+    try {
+      await apiFetch(`/api/classroom/users/${encodeURIComponent(username)}`, { method: 'DELETE' });
+      await refreshClassroomData();
+    } catch (error) {
+      setAccountManagementError(error.message);
+    } finally {
+      setDeletingUsername('');
+    }
+  };
+
+  const handleCreateClassGroup = async (event) => {
+    event.preventDefault();
+    setAccountManagementError('');
+    setIsCreatingClassGroup(true);
+    try {
+      const response = await apiFetch('/api/classroom/groups', {
+        method: 'POST',
+        body: JSON.stringify({
+          name: newClassGroup.name,
+          size: Number(newClassGroup.size),
+        }),
+      });
+      setGuestAccountStatus(
+        `${response.group.name} created with ${response.group.accounts.length} student accounts.`,
+      );
+      setNewClassGroup({ name: '', size: '25' });
+      await refreshClassroomData();
+    } catch (error) {
+      setAccountManagementError(error.message);
+    } finally {
+      setIsCreatingClassGroup(false);
+    }
+  };
+
+  const handleRenameClassGroup = async (group) => {
+    const name = window.prompt('Name this class', group.name);
+    if (name === null || !name.trim()) return;
+    setAccountManagementError('');
+    try {
+      await apiFetch(`/api/classroom/groups/${group.group_number}`, {
+        method: 'PUT',
+        body: JSON.stringify({ name: name.trim() }),
+      });
+      setGuestAccountStatus(`Class renamed to ${name.trim()}.`);
+      await refreshClassroomData();
+    } catch (error) {
+      setAccountManagementError(error.message);
+    }
+  };
+
+  const handleClearClassData = async (group) => {
+    if (!window.confirm(
+      `Clear saved programs, projects, submissions, and operation records for ${group.name}? This affects only this class. Student accounts and their passwords will remain. Active sessions for this class will be signed out.`,
+    )) return;
+    setAccountManagementError('');
+    setIsClearingGuestData(true);
+    try {
+      const response = await apiFetch(`/api/classroom/groups/${group.group_number}/clear-data`, { method: 'POST' });
+      setGuestAccountStatus(
+        `Cleared ${response.total_deleted} saved records from ${group.name}. Accounts and passwords are unchanged.`,
+      );
+      await refreshClassroomData();
+    } catch (error) {
+      setAccountManagementError(error.message);
+    } finally {
+      setIsClearingGuestData(false);
+    }
+  };
+
+  const handleDeleteClassGroup = async (group) => {
+    if (!window.confirm(
+      `Delete ${group.name} and its ${group.accounts.length} student accounts? Their saved work will also be deleted. Recreating the same class number and account positions will reuse the same passwords.`,
+    )) return;
+    setAccountManagementError('');
+    setDeletingClassGroup(group.group_number);
+    try {
+      await apiFetch(`/api/classroom/groups/${group.group_number}`, { method: 'DELETE' });
+      setGuestAccountStatus(`${group.name} and its accounts were deleted. Account passwords are saved for reuse.`);
+      await refreshClassroomData();
+    } catch (error) {
+      setAccountManagementError(error.message);
+    } finally {
+      setDeletingClassGroup(null);
+    }
   };
 
   const handleSaveCodeToAccount = async () => {
     if (!session) return;
-    const codeName = `${session.user.username}-program-${new Date().toISOString().slice(0, 10)}`;
+    const versionSuffix = controllerVersion === 'duet' ? '-duet' : '';
+    const codeName = `${session.user.username}-program${versionSuffix}-${new Date().toISOString().slice(0, 10)}`;
     try {
       await apiFetch('/api/classroom/save-code', {
         method: 'POST',
@@ -865,6 +2083,18 @@ export default function App() {
     }
   };
 
+  const buildProjectSnapshot = () => ({
+    name: projectName,
+    sceneObjects,
+    plannerWaypoints,
+    generatedCode: codeByVersionRef.current.legacy || '',
+    duetCode: codeByVersionRef.current.duet || '',
+    plannerMode: pathPlannerMode,
+    plannerLabel: plannerProjectLabel,
+    plannerVariants: plannerRouteVariants,
+    selectedPlannerVariant,
+  });
+
   const handleSubmitToQueue = async () => {
     if (!session) return;
     try {
@@ -872,32 +2102,198 @@ export default function App() {
         method: 'POST',
         body: JSON.stringify({
           name: `${session.user.username}-submission-${new Date().toLocaleTimeString()}`,
-          code: generatedCode || '# No code generated yet'
+          code: generatedCode || '# No code generated yet',
+          controller_version: controllerVersion,
+          project_snapshot: buildProjectSnapshot(),
         })
       });
       await refreshClassroomData();
-      alert('Submitted to the teacher queue.');
+      alert('Submitted to the teacher for review. The queued code preview is visible before a teacher can run it.');
     } catch (e) {
       alert('Submission failed: ' + e.message);
     }
   };
 
-  const handleRunNext = async () => {
-    try {
-      const response = await apiFetch('/api/classroom/run-next', { method: 'POST' });
-      setClassroomStatus(response.status || 'running');
-      await refreshClassroomData();
-      alert('Started the next queued student job.');
-    } catch (e) {
-      alert('Could not start next queue item: ' + e.message);
+  const handleSubmitPlannerRequest = async () => {
+    if (!session) return;
+    if (controllerVersion !== 'legacy') {
+      setNavigationExecutionStatus('Path planner requests require the G1 SDK controller. DUET programs can still be submitted from Blocks or IDE.');
+      return;
     }
+    if (pathPlannerMode === PLANNER_PATH_MODES.autonomous) {
+      if (!navigationMapSnapshot?.map || navigationRouteWaypoints.length < 1) {
+        setNavigationExecutionStatus('Load a map and add at least one destination before sending an autonomous request to the teacher.');
+        return;
+      }
+      if (navigationPlannerMode !== 'live') {
+        setNavigationExecutionStatus('Autonomous obstacle-aware requests require the Live adaptive Nav2 planner mode.');
+        return;
+      }
+    } else if (plannerWaypoints.length < 2 || !plannerRouteVariants.initial) {
+      setNavigationExecutionStatus('Add at least two grid waypoints and compile the initial SDK path before requesting teacher review.');
+      return;
+    }
+    const navigation = pathPlannerMode === PLANNER_PATH_MODES.autonomous
+      ? {
+        map_id: navigationMapSnapshot?.map?.map_id,
+        version: navigationMapSnapshot?.map?.version,
+        frame_id: navigationMapSnapshot?.map?.frame_id,
+        planner_mode: navigationPlannerMode,
+        waypoints: navigationRouteWaypoints.map(({ x, y }) => ({ x, y })),
+      }
+      : null;
+    const plannerRequest = {
+      planner_mode: pathPlannerMode,
+      planner_label: PLANNER_MODE_LABELS[pathPlannerMode],
+      planner_waypoints: plannerWaypoints.map(({ x, y }) => ({ x, y })),
+      route_variants: plannerRouteVariants,
+      selected_variant: selectedPlannerVariant,
+      navigation,
+    };
+    try {
+      await apiFetch('/api/classroom/submit-code', {
+        method: 'POST',
+        body: JSON.stringify({
+          name: `${session.user.username}-${PLANNER_MODE_LABELS[pathPlannerMode]}-${new Date().toLocaleTimeString()}`,
+          code: generatedCode || '',
+          controller_version: controllerVersion,
+          planner_request: plannerRequest,
+          project_snapshot: buildProjectSnapshot(),
+        }),
+      });
+      await refreshClassroomData();
+      setNavigationExecutionStatus(
+        'Planner request sent to the teacher with its mode, waypoints, map identity, route variants, and exact generated code preview.',
+      );
+    } catch (error) {
+      setNavigationExecutionStatus(`Planner request was not submitted • ${error.message}`);
+    }
+  };
+
+  const handleLoadQueueItemForReview = (item) => {
+    setQueueReviewItem(item);
+    setQueueReviewError('');
+    setQueueReviewStatus('');
+    setQueueReviewSavedProject(item.result_project || null);
+    setQueueReviewNavigationPreview(null);
+    setQueueReviewNavigationOperation(null);
+    setLastSuccessfulDuetCode('');
+    setDuetMotionReviewConfirmed(false);
+  };
+
+  const handlePreviewQueuedNavigation = async () => {
+    const navigation = queueReviewItem?.planner_request?.navigation;
+    if (!navigation) return;
+    setIsQueueReviewPreviewing(true);
+    setQueueReviewError('');
+    try {
+      const preview = await apiFetch('/api/navigation/plan', {
+        method: 'POST',
+        body: JSON.stringify(navigation),
+      });
+      setQueueReviewNavigationPreview(preview);
+      setQueueReviewStatus(`Route preview ready • ${preview.path?.length || 0} path points • no motion sent`);
+    } catch (error) {
+      setQueueReviewNavigationPreview(null);
+      setQueueReviewError(`Route preview unavailable • ${error.message}`);
+    } finally {
+      setIsQueueReviewPreviewing(false);
+    }
+  };
+
+  const handleApproveQueuedExecution = async () => {
+    if (!queueReviewItem || queueReviewItem.status !== 'queued') return;
+    if (queueReviewItem.planner_request?.planner_mode === PLANNER_PATH_MODES.autonomous
+      && !queueReviewNavigationPreview) {
+      setQueueReviewError('Preview the autonomous route before approving movement.');
+      return;
+    }
+    setIsQueueReviewRunning(true);
+    if (queueReviewItem.controller_version === 'duet') {
+      setLastSuccessfulDuetCode('');
+      setDuetMotionReviewConfirmed(false);
+    }
+    setQueueReviewError('');
+    setQueueReviewStatus('Teacher approved • starting the queued request…');
+    try {
+      const result = await apiFetch('/api/classroom/run-next', {
+        method: 'POST',
+        body: JSON.stringify({ item_id: queueReviewItem.id }),
+      });
+      if (
+        queueReviewItem.controller_version === 'duet'
+        && result.status === 'completed'
+        && typeof queueReviewItem.code === 'string'
+        && queueReviewItem.code.trim()
+        && !queueReviewItem.code.includes('duet.saved_motion(')
+      ) {
+        setLastSuccessfulDuetCode(queueReviewItem.code);
+        setDuetMotionReviewConfirmed(false);
+      }
+      setQueueReviewStatus(result.status === 'completed'
+        ? result.process?.saved_project_error
+          ? `Request completed, but its project could not be saved • ${result.process.saved_project_error}`
+          : result.process?.saved_project
+            ? `Request completed and saved as ${result.process.saved_project.name}. Physical movement is not independently verified.`
+            : 'Request completed. Physical movement is not independently verified.'
+        : result.status === 'paused'
+          ? 'Request was stopped and paused.'
+        : 'Request approved and running. Waiting for the controller terminal status.');
+      if (result.item) setQueueReviewItem(result.item);
+      const savedProject = result.saved_project || result.item?.result_project;
+      if (savedProject) setQueueReviewSavedProject(savedProject);
+      if (result.operation?.operation_id) setQueueReviewNavigationOperation(result.operation);
+      const items = await refreshClassroomData();
+      const refreshedItem = items.find((item) => item.id === queueReviewItem.id);
+      setQueueReviewItem(refreshedItem || result.item || queueReviewItem);
+      if (refreshedItem?.result_project) setQueueReviewSavedProject(refreshedItem.result_project);
+    } catch (error) {
+      setQueueReviewError(`Execution was not started • ${error.message}`);
+      const items = await refreshClassroomData();
+      const refreshedItem = items.find((item) => item.id === queueReviewItem.id);
+      if (refreshedItem) setQueueReviewItem(refreshedItem);
+    } finally {
+      setIsQueueReviewRunning(false);
+    }
+  };
+
+  const handleStopQueuedExecution = async () => {
+    setQueueReviewError('');
+    try {
+      if (queueReviewNavigationOperation?.operation_id) {
+        const operation = await apiFetch(
+          `/api/navigation/operation/${queueReviewNavigationOperation.operation_id}/stop`,
+          { method: 'POST' },
+        );
+        setQueueReviewNavigationOperation(operation);
+        setQueueReviewStatus('Nav2 stop requested. Waiting for its terminal status.');
+      } else if (queueReviewItem?.controller_version === 'duet') {
+        const result = await apiFetch('/api/duet/stop', { method: 'POST' });
+        setQueueReviewStatus(`DUET stop ${result.status || 'requested'}. Waiting for the queue result.`);
+      } else {
+        await apiFetch('/api/classroom/stop-current', { method: 'POST' });
+        setQueueReviewStatus('G1 SDK stop requested. Waiting for the queue result.');
+      }
+      await refreshClassroomData();
+    } catch (error) {
+      setQueueReviewError(`Stop request failed • ${error.message}`);
+    }
+  };
+
+  const handleRunNext = async () => {
+    const nextItem = queueItems.find((item) => item.status === 'queued');
+    if (!nextItem) {
+      alert('There are no queued requests to approve.');
+      return;
+    }
+    handleLoadQueueItemForReview(nextItem);
   };
 
   const handleStopCurrent = async () => {
     try {
       await apiFetch('/api/classroom/stop-current', { method: 'POST' });
       await refreshClassroomData();
-      alert('Robot run paused.');
+      alert('Locomotion stop requested and queue paused. An active arm preset may continue until its motion ends.');
     } catch (e) {
       alert('Pause failed: ' + e.message);
     }
@@ -912,33 +2308,1502 @@ export default function App() {
     }
   };
 
-  const handleClearQueue = async () => {
+  const handleRenameProject = async (project) => {
+    const newName = window.prompt('Rename project', project.name)?.trim();
+    if (!newName || newName === project.name) return;
     try {
-      await apiFetch('/api/classroom/clear-queue', { method: 'POST' });
+      await apiFetch('/api/classroom/project/rename', {
+        method: 'POST',
+        body: JSON.stringify({ owner: project.username, name: project.name, new_name: newName }),
+      });
+      if (editingProjectId === project.id) {
+        setProjectName(newName);
+        setPlannerProjectLabel(newName);
+      } else if (project.username === currentUser.username && projectName === project.name) {
+        setProjectName(newName);
+        setPlannerProjectLabel(newName);
+      }
       await refreshClassroomData();
+    } catch (error) {
+      alert(`Could not rename project: ${error.message}`);
+    }
+  };
+
+  const handleDeleteProject = async (project) => {
+    if (!window.confirm(`Delete ${project.name} from ${project.username}'s project library?`)) return;
+    try {
+      await apiFetch('/api/classroom/project/delete', {
+        method: 'POST',
+        body: JSON.stringify({ owner: project.username, name: project.name }),
+      });
+      if (editingProjectId === project.id) {
+        setEditingProjectId(null);
+        setProjectName('default');
+      } else if (project.username === currentUser.username && projectName === project.name) {
+        setProjectName('default');
+      }
+      await refreshClassroomData();
+    } catch (error) {
+      alert(`Could not delete project: ${error.message}`);
+    }
+  };
+
+  const approveSharedProject = async (project) => {
+    try {
+      await apiFetch(`/api/classroom/project/${project.id}/approve`, { method: 'POST' });
+      await refreshClassroomData();
+    } catch (error) {
+      alert(`Could not approve project: ${error.message}`);
+    }
+  };
+
+  const saveNamedProject = async (name, projectId = null) => {
+    const trimmedName = name.trim();
+    if (!trimmedName) return;
+    try {
+      const response = await apiFetch('/api/classroom/project/save-named', {
+        method: 'POST',
+        body: JSON.stringify({
+          ...buildProjectSnapshot(),
+          name: trimmedName,
+          project_id: currentUser.role === 'teacher' ? projectId : null,
+        }),
+      });
+      setProjectName(response.project.name);
+      setPlannerProjectLabel(response.project.plannerLabel || response.project.name);
+      setEditingProjectId(currentUser.role === 'teacher' ? response.project.id : null);
+      await refreshClassroomData();
+      alert(response.project.status === 'pending'
+        ? `Saved “${response.project.name}” for teacher approval. It will appear in the shared Projects library after approval.`
+        : `Saved project “${response.project.name}”.`);
+    } catch (error) {
+      alert(`Could not save project: ${error.message}`);
+    }
+  };
+
+  const promptSaveNamedProject = () => {
+    const enteredName = window.prompt('Name this project', projectName === 'default' ? '' : projectName);
+    if (enteredName?.trim()) {
+      void saveNamedProject(enteredName, currentUser.role === 'teacher' ? editingProjectId : null);
+    }
+  };
+
+  const saveAsStarterMotion = async () => {
+    const name = window.prompt('Name this starter motion');
+    if (!name?.trim()) return;
+    try {
+      const response = await apiFetch('/api/classroom/starter-motions', {
+        method: 'POST',
+        body: JSON.stringify({
+          name: name.trim(),
+          code: generatedCode,
+          controller_version: controllerVersion,
+        }),
+      });
+      setSharedMotions((motions) => [...motions, response.motion]);
+      await refreshClassroomData();
+      alert(`Saved “${response.motion.name}” as a ${controllerVersion.toUpperCase()} starter motion.`);
+    } catch (error) {
+      alert(`Could not save starter motion: ${error.message}`);
+    }
+  };
+
+  const openStarterMotionEditor = (motion) => {
+    setStarterMotionEditor({ ...motion });
+  };
+
+  const saveStarterMotionEdit = async () => {
+    if (!starterMotionEditor) return;
+    try {
+      const response = await apiFetch(
+        `/api/classroom/starter-motions/${encodeURIComponent(starterMotionEditor.id)}`,
+        {
+          method: 'PUT',
+          body: JSON.stringify({
+            name: starterMotionEditor.name,
+            code: starterMotionEditor.code,
+          }),
+        },
+      );
+      setSharedMotions((motions) => motions.map((motion) => (
+        motion.id === response.motion.id ? response.motion : motion
+      )));
+      setStarterMotionEditor(null);
+      await refreshClassroomData();
+    } catch (error) {
+      alert(`Could not save starter motion: ${error.message}`);
+    }
+  };
+
+  const duplicateStarterMotion = async (motion) => {
+    try {
+      await apiFetch(`/api/classroom/starter-motions/${encodeURIComponent(motion.id)}/duplicate`, {
+        method: 'POST',
+        body: JSON.stringify({}),
+      });
+      await refreshClassroomData();
+    } catch (error) {
+      alert(`Could not duplicate starter motion: ${error.message}`);
+    }
+  };
+
+  const deleteStarterMotion = async (motion) => {
+    if (!window.confirm(`Delete the shared ${motion.controller_version.toUpperCase()} motion “${motion.name}”?`)) return;
+    try {
+      await apiFetch(`/api/classroom/starter-motions/${encodeURIComponent(motion.id)}`, {
+        method: 'DELETE',
+      });
+      setSharedMotions((motions) => motions.filter((entry) => entry.id !== motion.id));
+      await refreshClassroomData();
+    } catch (error) {
+      alert(`Could not delete starter motion: ${error.message}`);
+    }
+  };
+
+  const handleClearQueue = async () => {
+    if (!window.confirm('Clear all waiting and finished queue items? A currently running job will be kept.')) return;
+    try {
+      const result = await apiFetch('/api/classroom/clear-queue', { method: 'POST' });
+      setQueueItems(result.remaining || []);
+      alert(`Cleared ${result.deleted} queue item${result.deleted === 1 ? '' : 's'}.`);
     } catch (e) {
       alert('Clear queue failed: ' + e.message);
     }
   };
 
-  const handleConnectRobot = () => {
+  const handleConnectRobot = async () => {
     if (!session || session.user.role !== 'teacher') {
       alert('Teacher login is required to connect the robot.');
       return;
     }
-
-    const cleanAddress = robotAddress.trim();
-    if (!cleanAddress) {
-      alert('Please enter the G1 IP address first.');
+    if (controllerVersion === 'duet' && !isRobotConnected) {
+      const approved = window.confirm(
+        'Start the DUET controller in its no-command Handoff state? '
+        + 'Connect will not change the FSM or put the robot into Velocity, and Handoff does not '
+        + 'actively hold the robot posture. An idle legacy SDK connection may remain initialized, but its '
+        + 'motion commands are blocked while DUET is active. Connect does not change the FSM. '
+        + 'Do not use FixStand as a generic Ready step. '
+        + 'Continue only if a qualified onsite operator has verified the robot and its active controller state.',
+      );
+      if (!approved) return;
+    }
+    if (controllerVersion === 'duet' && isRobotConnected && isDuetProgramActive) {
+      alert('Stop the active DUET program and wait for confirmed completion before disconnecting.');
       return;
     }
 
-    setRobotConnectionStatus(`Connecting to ${cleanAddress}...`);
-    setTimeout(() => {
+    setIsRobotConnecting(true);
+    setRobotConnectionStatus(controllerVersion === 'duet'
+      ? 'Starting or connecting to the DUET G1 23-DOF controller...'
+      : 'Connecting through the G1 host network interface...');
+    try {
+      if (controllerVersion === 'duet' && isRobotConnected) {
+        const disconnected = await duetRobotConnection.disconnect();
+        setIsRobotConnected(false);
+        duetProgramActiveRef.current = false;
+        setIsDuetProgramActive(false);
+        setIsRunning(false);
+        setRobotConnectionStatus(disconnected.status === 'released'
+          ? 'DUET lease released; arm pose cleared; joystick input may resume. Stop the DUET process before using legacy SDK.'
+          : 'DUET control lease release was not confirmed.');
+        return;
+      }
+      const connection = await activeRobotConnection.connect();
+      if (controllerVersion === 'duet' && connection.operatorActionRequired === true) {
+        setIsRobotConnected(false);
+        duetProgramActiveRef.current = false;
+        setIsDuetProgramActive(false);
+        setIsRunning(false);
+        setRobotConnectionStatus(connection.message || connection.error || (
+          'DUET gateway is unavailable. Do not attempt a mode transition from the app; have a qualified operator verify the robot and follow its recovery procedure.'
+        ));
+        return;
+      }
+      if (connection.status !== 'connected' || (controllerVersion === 'duet' && connection.ready !== true)) {
+        throw new Error('Backend did not confirm a connected robot.');
+      }
       setIsRobotConnected(true);
-      setRobotConnectionStatus(`Connected to ${cleanAddress} • ready for classroom queue`);
-    }, 400);
+      if (controllerVersion === 'duet') {
+        duetProgramActiveRef.current = connection.motionActive === true;
+        setIsDuetProgramActive(duetProgramActiveRef.current);
+        setIsRunning(duetProgramActiveRef.current);
+        const armCapability = connection.capabilities?.includes('arm_targets')
+          ? 'bounded arm-target gateway enabled'
+          : 'bounded arm targets unavailable on this gateway';
+        setRobotConnectionStatus(`Connected • DUET ${connection.policyId} • ${connection.robotModel} • sole lowcmd owner confirmed • ${armCapability}`);
+      } else {
+        const sensorText = `MID-360 distance conditions ${connection.distanceSensor?.ready ? 'ready' : 'disabled'} • ${formatLidarDistanceStatus(connection.distanceSensor)}`;
+        setRobotConnectionStatus(`Connected • SDK on ${connection.interface}, domain ${connection.domain} • ${sensorText}${connection.logFile ? ` • session log: ${connection.logFile}` : ''}`);
+      }
+    } catch (error) {
+      setIsRobotConnected(false);
+      setRobotConnectionStatus(`${controllerVersion === 'duet' ? 'DUET connection' : 'Connection'} failed: ${error.message}`);
+      alert(`Robot connection failed: ${error.message}`);
+    } finally {
+      setIsRobotConnecting(false);
+    }
   };
+
+  const handleTestRobotMotion = async () => {
+    if (!isRobotConnected) {
+      alert(`Connect the ${controllerVersion === 'duet' ? 'DUET controller' : 'G1 SDK'} before testing motion.`);
+      return;
+    }
+    const testDescription = controllerVersion === 'duet'
+      ? 'Teacher approval required. Exact command: duet.move(0.1, 0, 0, 0.5). Only continue if the G1 is upright and stable, the area is clear, and someone is ready at the emergency stop. The app cannot verify physical movement.'
+      : 'Teacher approval required. Exact command: robot.slowwalktime(0.5). Only continue if the G1 is upright and stable, the area is clear, and someone is ready at the emergency stop. The app cannot verify physical movement.';
+    if (!window.confirm(testDescription)) return;
+
+    setIsRunning(true);
+    setRobotConnectionStatus(controllerVersion === 'duet'
+      ? 'Sending a brief DUET motion test...'
+      : 'Sending a brief slow-motion test...');
+    let keepDuetRunLock = false;
+    try {
+      const result = await activeRobotConnection.run(controllerVersion === 'duet'
+        ? 'duet.move(0.1, 0, 0, 0.5)'
+        : 'robot.slowwalktime(0.5)');
+      const adapter = controllerVersion === 'duet' ? 'DUET' : 'SDK';
+      if (controllerVersion === 'duet' && result.status === 'accepted') {
+        duetProgramActiveRef.current = true;
+        setIsDuetProgramActive(true);
+        keepDuetRunLock = true;
+        setRobotConnectionStatus('DUET accepted the motion test; waiting for controller completion. Physical movement is not verified.');
+      } else {
+        if (controllerVersion === 'duet') {
+          duetProgramActiveRef.current = false;
+          setIsDuetProgramActive(false);
+        }
+        setRobotConnectionStatus(`${adapter} accepted the motion test (${result.commandsExecuted} command). Physical movement is not verified.`);
+      }
+    } catch (error) {
+      setRobotConnectionStatus(`${controllerVersion === 'duet' ? 'DUET motion' : 'Motion'} test failed: ${error.message}`);
+      alert(`Motion test failed: ${error.message}`);
+    } finally {
+      if (!keepDuetRunLock) setIsRunning(false);
+    }
+  };
+
+  const handleStartDuetCommissioning = async () => {
+    if (!isRobotConnected || currentUser.role !== 'teacher') {
+      setRobotConnectionStatus('Connect DUET and sign in as a teacher before commissioning.');
+      return;
+    }
+    const confirmed = window.confirm(
+      'Start the teacher-only DUET commissioning sequence? It tests every approved arm pose, authored arm command, legacy gesture and mirror, bounded base direction, concurrent control, velocity lease expiry, and STOP/reset. Each movement will pause for your physical review. Keep the G1 upright, clear the full arm and walking area, stay at the emergency stop, and stop immediately if motion is unexpected.',
+    );
+    if (!confirmed) return;
+    setIsDuetCommissioningBusy(true);
+    setRobotConnectionStatus('Starting DUET commissioning preflight…');
+    try {
+      const report = await duetRobotConnection.startCommissioning();
+      setDuetCommissioning(report);
+      setDuetCommissioningObserved(false);
+      setDuetCommissioningObservedResult('');
+      setDuetCommissioningNotes('');
+      setRobotConnectionStatus(
+        `DUET commissioning started • ${report.steps.length} supervised test steps • report ${report.report_id}`,
+      );
+    } catch (error) {
+      setRobotConnectionStatus(`Could not start DUET commissioning: ${error.message}`);
+    } finally {
+      setIsDuetCommissioningBusy(false);
+    }
+  };
+
+  const handleRunDuetCommissioningStep = async (retry = false) => {
+    const stepIndex = duetCommissioning?.current_step;
+    const step = duetCommissioning?.steps?.[stepIndex];
+    if (!step || !isRobotConnected || currentUser.role !== 'teacher') return;
+    const confirmed = window.confirm(
+      `${retry ? 'Run this test again' : `Run test ${stepIndex + 1} of ${duetCommissioning.steps.length}`}: ${step.title}\n\n${step.expected}\n\nCommand:\n${step.code || 'Gateway lease/STOP test'}\n\nProceed only while the robot and area are clear and you can reach the emergency stop.`,
+    );
+    if (!confirmed) return;
+    setIsDuetCommissioningBusy(true);
+    setRobotConnectionStatus(`Running DUET commissioning step ${stepIndex + 1}/${duetCommissioning.steps.length}…`);
+    try {
+      const report = await duetRobotConnection.runCommissioningStep(stepIndex);
+      setDuetCommissioning(report);
+      setDuetCommissioningObserved(false);
+      setDuetCommissioningObservedResult('');
+      setDuetCommissioningNotes('');
+      setRobotConnectionStatus(`Step ${stepIndex + 1} completed at the controller; physically review the robot and logged joint feedback before continuing.`);
+    } catch (error) {
+      let failureMessage = `DUET commissioning step failed: ${error.message}`;
+      try {
+        setDuetCommissioning(await duetRobotConnection.commissioningStatus());
+      } catch (refreshError) {
+        failureMessage += ` The saved report could not be refreshed: ${refreshError.message}`;
+      }
+      setRobotConnectionStatus(failureMessage);
+    } finally {
+      setIsDuetCommissioningBusy(false);
+    }
+  };
+
+  const handleReviewDuetCommissioningStep = async (passed) => {
+    const stepIndex = duetCommissioning?.current_step;
+    if (!Number.isInteger(stepIndex) || currentUser.role !== 'teacher') return;
+    if (passed && !duetCommissioningObserved) {
+      setRobotConnectionStatus('Confirm that you physically observed the expected result before passing this step.');
+      return;
+    }
+    if (!duetCommissioningObservedResult.trim()) {
+      setRobotConnectionStatus('Record what actually occurred before reviewing this test step.');
+      return;
+    }
+    setIsDuetCommissioningBusy(true);
+    try {
+      const report = await duetRobotConnection.reviewCommissioningStep(stepIndex, {
+        passed,
+        observed: duetCommissioningObserved,
+        observedResult: duetCommissioningObservedResult,
+        notes: duetCommissioningNotes,
+      });
+      setDuetCommissioning(report);
+      setDuetCommissioningObserved(false);
+      setDuetCommissioningObservedResult('');
+      setDuetCommissioningNotes('');
+      setRobotConnectionStatus(report.status === 'passed'
+        ? `DUET commissioning passed and teacher-reviewed • report ${report.acceptance_id}. Normal DUET runs remain locked until a qualified operator records separate hardware acceptance.`
+        : passed
+          ? `Step passed • ${report.current_step} of ${report.steps.length} reviewed.`
+          : `Commissioning failed at step ${stepIndex + 1}; controller STOP/reset was requested. Review the report before restarting.`);
+    } catch (error) {
+      setRobotConnectionStatus(`Could not save DUET commissioning review: ${error.message}`);
+    } finally {
+      setIsDuetCommissioningBusy(false);
+    }
+  };
+
+  const handleAbortDuetCommissioning = async () => {
+    if (!window.confirm('Abort DUET commissioning and request controller STOP plus arm reset?')) return;
+    setIsDuetCommissioningAborting(true);
+    setIsDuetCommissioningBusy(true);
+    try {
+      const report = await duetRobotConnection.abortCommissioning();
+      setDuetCommissioning(report);
+      setRobotConnectionStatus('DUET commissioning aborted; controller STOP/reset was requested. Physical immobility is not verified.');
+    } catch (error) {
+      setRobotConnectionStatus(`Could not abort DUET commissioning safely: ${error.message}`);
+    } finally {
+      setIsDuetCommissioningBusy(false);
+      setIsDuetCommissioningAborting(false);
+    }
+  };
+
+  const handleCopyDuetCommissioningEvidence = async () => {
+    if (!duetCommissioningEvidence) return;
+    const text = JSON.stringify({
+      report: duetCommissioningEvidence.report,
+      event_log: duetCommissioningEvidence.event_log,
+    }, null, 2);
+    try {
+      if (navigator.clipboard?.writeText) {
+        await navigator.clipboard.writeText(text);
+      } else if (duetCommissioningEvidenceRef.current) {
+        duetCommissioningEvidenceRef.current.focus();
+        duetCommissioningEvidenceRef.current.select();
+        if (!document.execCommand('copy')) throw new Error('Clipboard access is unavailable.');
+      } else {
+        throw new Error('Clipboard access is unavailable.');
+      }
+      setDuetCommissioningCopyStatus('Full report and event log copied.');
+    } catch (error) {
+      setDuetCommissioningCopyStatus(`Could not copy evidence: ${error.message}. Select the text below and copy it manually.`);
+    }
+  };
+
+  const handleTestLidar = async () => {
+    if (!session || session.user.role !== 'teacher') {
+      alert('Teacher login is required to test the LiDAR connection.');
+      return;
+    }
+    setIsLidarTesting(true);
+    setLidarTestStatus('Reading a fresh MID-360 sample…');
+    try {
+      const status = await robotConnection.status();
+      const sensor = status.distanceSensor;
+      if (sensor?.ready) {
+        const sampleTime = sensor.timestamp ? ` • ${new Date(sensor.timestamp).toLocaleTimeString()}` : '';
+        setLidarTestStatus(`${formatLidarDistanceStatus(sensor)} • ${sensor.frame_id} base frame • ${sensor.sensor_frame_id} sensor frame${sampleTime}`);
+      } else {
+        const rear = sensor?.rear?.ready
+          ? sensor.rear.clear
+            ? `Rear distance conditions ready; no returns within ${sensor.rear.max_range_m} m`
+            : `Rear footprint clearance • ${sensor.rear.distance_m.toFixed(2)} m`
+          : `Rear distance conditions disabled • ${sensor?.rear?.error || 'provider status not reported'}`;
+        setLidarTestStatus(`Front distance conditions disabled • ${sensor?.error || 'Backend did not report LiDAR status.'} • ${rear}`);
+      }
+    } catch (error) {
+      setLidarTestStatus(`Test failed • ${error.message}`);
+    } finally {
+      setIsLidarTesting(false);
+    }
+  };
+
+  const handleSpeakerVolume = async (operation) => {
+    if (currentUser.role !== 'teacher' || controllerVersion !== 'legacy' || !isRobotConnected) return;
+    setIsSpeakerVolumeBusy(true);
+    setSpeakerVolumeStatus(operation === 'read' ? 'Reading speaker volume…' : 'Applying speaker volume…');
+    try {
+      const code = operation === 'read'
+        ? 'robot.getvolume()'
+        : `robot.setvolume(${speakerVolume})`;
+      const result = await apiFetch('/api/run', {
+        method: 'POST',
+        body: JSON.stringify({ code }),
+      });
+      if (result.status !== 'completed') {
+        throw new Error('The G1 SDK did not confirm the speaker-volume operation.');
+      }
+      if (operation === 'read') {
+        const volume = result.results?.find((item) => item.command === 'getvolume')?.value?.volume;
+        if (!Number.isInteger(volume) || volume < 0 || volume > 100) {
+          throw new Error('The G1 SDK returned an invalid speaker-volume value.');
+        }
+        setSpeakerVolume(volume);
+        setSpeakerVolumeStatus(`Current speaker volume: ${volume}/100.`);
+      } else {
+        setSpeakerVolumeStatus(`Speaker volume set to ${speakerVolume}/100.`);
+      }
+    } catch (error) {
+      setSpeakerVolumeStatus(`Could not ${operation === 'read' ? 'read' : 'set'} speaker volume: ${error.message}`);
+    } finally {
+      setIsSpeakerVolumeBusy(false);
+    }
+  };
+
+  const stopDeviceCamera = useCallback(() => {
+    deviceCameraRequestRef.current += 1;
+    deviceCameraStreamRef.current?.getTracks().forEach((track) => track.stop());
+    deviceCameraStreamRef.current = null;
+    if (deviceCameraVideoRef.current) {
+      deviceCameraVideoRef.current.srcObject = null;
+    }
+    setIsDeviceCameraActive(false);
+    setDeviceCameraStatus('Camera is off');
+  }, []);
+
+  useEffect(() => {
+    if (mainTab !== 'camera' || cameraInputSource !== 'device') {
+      stopDeviceCamera();
+    }
+    return () => stopDeviceCamera();
+  }, [mainTab, cameraInputSource, stopDeviceCamera]);
+
+  useEffect(() => {
+    if (
+      mainTab !== 'camera'
+      || cameraInputSource !== 'robot'
+      || currentUser.role !== 'teacher'
+      || !selectedRobotCameraTopic
+      || !session?.token
+    ) {
+      setRobotCameraStatus('No robot camera selected');
+      setRobotCameraError('');
+      return undefined;
+    }
+    let active = true;
+    let timer = null;
+    const abortController = new AbortController();
+    const fetchFrame = async () => {
+      try {
+        const response = await fetch(
+          `/api/sensors/camera/frame?topic=${encodeURIComponent(selectedRobotCameraTopic)}`,
+          {
+            headers: { Authorization: `Bearer ${session.token}` },
+            cache: 'no-store',
+            signal: abortController.signal,
+          },
+        );
+        if (!response.ok) {
+          const error = await response.json().catch(() => ({}));
+          throw new Error(error.detail || `Camera frame request failed (${response.status}).`);
+        }
+        const width = Number(response.headers.get('X-Camera-Width'));
+        const height = Number(response.headers.get('X-Camera-Height'));
+        const step = Number(response.headers.get('X-Camera-Step'));
+        const encoding = response.headers.get('X-Camera-Encoding');
+        const frameId = response.headers.get('X-Camera-Frame-Id') || 'unknown frame';
+        const stampAgeMs = Number(response.headers.get('X-Camera-Stamp-Age-Ms'));
+        const receiveAgeMs = Number(response.headers.get('X-Camera-Receive-Age-Ms'));
+        const channelCount = { rgb8: 3, bgr8: 3, rgba8: 4, bgra8: 4, mono8: 1 }[encoding];
+        if (
+          !Number.isInteger(width) || width < 1 || width > 1280
+          || !Number.isInteger(height) || height < 1 || height > 720
+          || !Number.isInteger(step) || step < width * channelCount
+          || !channelCount
+        ) {
+          throw new Error('Camera frame metadata is invalid or unsupported.');
+        }
+        const bytes = new Uint8Array(await response.arrayBuffer());
+        if (bytes.length !== step * height || bytes.length > 4 * 1024 * 1024) {
+          throw new Error('Camera frame payload exceeds its configured bounds.');
+        }
+        if (!active || !robotCameraCanvasRef.current) return;
+        const canvas = robotCameraCanvasRef.current;
+        canvas.width = width;
+        canvas.height = height;
+        const context = canvas.getContext('2d');
+        const image = context.createImageData(width, height);
+        for (let row = 0; row < height; row += 1) {
+          for (let column = 0; column < width; column += 1) {
+            const input = row * step + column * channelCount;
+            const output = (row * width + column) * 4;
+            if (encoding === 'rgb8' || encoding === 'rgba8') {
+              image.data[output] = bytes[input];
+              image.data[output + 1] = bytes[input + 1];
+              image.data[output + 2] = bytes[input + 2];
+            } else if (encoding === 'bgr8' || encoding === 'bgra8') {
+              image.data[output] = bytes[input + 2];
+              image.data[output + 1] = bytes[input + 1];
+              image.data[output + 2] = bytes[input];
+            } else {
+              image.data[output] = bytes[input];
+              image.data[output + 1] = bytes[input];
+              image.data[output + 2] = bytes[input];
+            }
+            image.data[output + 3] = channelCount === 4
+              ? bytes[input + 3]
+              : 255;
+          }
+        }
+        context.putImageData(image, 0, 0);
+        setRobotCameraError('');
+        setRobotCameraStatus(
+          `${selectedRobotCameraTopic} · ${frameId} · stamp ${Math.round(stampAgeMs)} ms · receive ${Math.round(receiveAgeMs)} ms`,
+        );
+      } catch (error) {
+        if (active) {
+          setRobotCameraError(error.message);
+          setRobotCameraStatus('Camera stream unavailable');
+        }
+      } finally {
+        if (active) timer = window.setTimeout(fetchFrame, 750);
+      }
+    };
+    fetchFrame();
+    return () => {
+      active = false;
+      abortController.abort();
+      if (timer !== null) window.clearTimeout(timer);
+    };
+  }, [cameraInputSource, currentUser.role, mainTab, selectedRobotCameraTopic, session?.token]);
+
+  const startDeviceCamera = async () => {
+    setDeviceCameraError('');
+    if (!window.isSecureContext && !['localhost', '127.0.0.1'].includes(window.location.hostname)) {
+      setDeviceCameraError('Safari requires a trusted HTTPS connection before it can open this device camera.');
+      return;
+    }
+    if (!navigator.mediaDevices?.getUserMedia) {
+      setDeviceCameraError('This browser does not provide camera access. Check Safari permissions and secure-context support.');
+      return;
+    }
+    stopDeviceCamera();
+    const requestId = deviceCameraRequestRef.current;
+    setDeviceCameraStatus('Requesting camera permission…');
+    try {
+      const stream = await navigator.mediaDevices.getUserMedia({
+        audio: false,
+        video: { facingMode: { ideal: 'user' } },
+      });
+      if (
+        requestId !== deviceCameraRequestRef.current
+        || mainTab !== 'camera'
+        || cameraInputSource !== 'device'
+      ) {
+        stream.getTracks().forEach((track) => track.stop());
+        return;
+      }
+      deviceCameraStreamRef.current = stream;
+      if (deviceCameraVideoRef.current) {
+        deviceCameraVideoRef.current.srcObject = stream;
+        await deviceCameraVideoRef.current.play();
+      }
+      setIsDeviceCameraActive(true);
+      setDeviceCameraStatus('Live preview active; frames are not recorded or uploaded.');
+    } catch (error) {
+      if (requestId !== deviceCameraRequestRef.current) return;
+      stopDeviceCamera();
+      setDeviceCameraError(`Could not open this device camera: ${error.message}`);
+    }
+  };
+
+  const handleDiscoverSensors = async () => {
+    if (currentUser.role !== 'teacher') return;
+    setIsSensorDiscovering(true);
+    setSensorOperationStatus('Checking available sensors…');
+    try {
+      const diagnostics = await apiFetch('/api/sensors/discover', { method: 'POST' });
+      setSensorDiagnostics(diagnostics);
+      setSensorOperationStatus('Discovery finished. Each sensor is reported independently.');
+    } catch (error) {
+      setSensorOperationStatus(`Discovery failed: ${error.message}`);
+    } finally {
+      setIsSensorDiscovering(false);
+    }
+  };
+
+  const handleControllerVersionChange = async (useDuetVersion) => {
+    const nextVersion = useDuetVersion ? 'duet' : 'legacy';
+    if (nextVersion === controllerVersion) return;
+    if (isRunning || isRobotConnecting || isDuetProgramActive) {
+      alert('Wait for the current robot operation or connection attempt to finish before switching versions.');
+      return;
+    }
+    if (controllerVersion === 'duet' && nextVersion === 'legacy') {
+      setIsRobotConnecting(true);
+      try {
+        const status = await duetRobotConnection.status();
+        if (status.motionOwner !== 'none' || status.controllerServiceActive !== false) {
+          throw new Error(
+            'The DUET controller service is active or its state cannot be verified. '
+            + 'The app will not stop it; do not switch to legacy until an onsite operator has stopped DUET '
+            + 'and backend status confirms the service is inactive and ownership is released.',
+          );
+        }
+      } catch (error) {
+        setRobotConnectionStatus(`Cannot switch to legacy mode: ${error.message}`);
+        alert(`Cannot switch to legacy mode: ${error.message}`);
+        return;
+      } finally {
+        setIsRobotConnecting(false);
+      }
+    }
+
+    codeByVersionRef.current[controllerVersion] = generatedCodeRef.current;
+    const nextCode = codeByVersionRef.current[nextVersion] || '';
+    if (nextVersion === 'duet' && nextCode.trim()) {
+      try {
+        parseDuetProgram(nextCode);
+      } catch (error) {
+        alert(`Saved DUET code is invalid and was not loaded: ${error.message}`);
+        return;
+      }
+    }
+    const nextConnection = nextVersion === 'duet' ? duetRobotConnection : robotConnection;
+    controllerVersionRef.current = nextVersion;
+    duetProgramActiveRef.current = false;
+    setIsDuetProgramActive(false);
+    setControllerVersion(nextVersion);
+    generatedCodeRef.current = nextCode;
+    setGeneratedCode(nextCode);
+    setBlockSyncError('');
+    setSafetyNotice('');
+    setIsRobotConnected(false);
+
+    if (!session || session.user.role !== 'teacher') {
+      setRobotConnectionStatus(nextVersion === 'duet'
+        ? 'DUET preview selected • teacher login required for physical connection.'
+        : 'Legacy version selected.');
+      return;
+    }
+
+    setIsRobotConnecting(true);
+    try {
+      const status = await nextConnection.status();
+      const connected = nextVersion === 'duet'
+        ? status.connected === true
+          && status.ready === true
+          && status.controlLease === true
+          && status.motionOwner === 'duet'
+        : status.sdkAvailable === true;
+      if (nextVersion === 'duet') {
+        const motionActive = status.motionActive === true;
+        duetProgramActiveRef.current = motionActive;
+        setIsDuetProgramActive(motionActive);
+        setIsRunning(motionActive);
+      }
+      setIsRobotConnected(connected);
+      setRobotConnectionStatus(nextVersion === 'duet'
+        ? connected
+          ? `Connected • DUET ${status.policyId} • ${status.robotModel} • sole lowcmd owner confirmed • ${status.capabilities?.includes('arm_pose') ? 'arm-pose gateway enabled' : 'arm-pose blocks are preview-only'}`
+          : `DUET not connected • ${status.error || 'connect the DUET controller before physical execution'}`
+        : connected
+          ? `SDK connected on ${status.interface}`
+          : 'Disconnected • connect the G1 SDK before physical execution');
+    } catch (error) {
+      setRobotConnectionStatus(error.status === 401
+        ? `${nextVersion === 'duet' ? 'DUET' : 'Legacy'} preview selected • session expired. Sign in again before checking robot status or sending physical commands.`
+        : `${nextVersion === 'duet' ? 'DUET' : 'SDK'} status unavailable: ${error.message}`);
+    } finally {
+      setIsRobotConnecting(false);
+    }
+  };
+
+  const handleLoadStarterCode = async (entry) => {
+    if (!entry || !['legacy', 'duet'].includes(entry.controller_version)) return;
+    if (entry.controller_version === controllerVersion) {
+      updateGeneratedCode(entry.code);
+      setIsLibraryOpen(false);
+      return;
+    }
+    codeByVersionRef.current[entry.controller_version] = entry.code;
+    await handleControllerVersionChange(entry.controller_version === 'duet');
+    setIsLibraryOpen(false);
+  };
+
+  const renderStarterMotionLibrary = () => (
+    <div className="rounded-xl border border-blue-200 bg-blue-50 p-3">
+      <p className="text-[10px] uppercase tracking-wide text-blue-800 font-semibold">Starter motion library</p>
+      <p className="mt-1 text-[9px] font-semibold uppercase tracking-wide text-blue-700">Built-in examples</p>
+      <p className="mt-1 text-[10px] leading-relaxed text-blue-900">
+        Examples load into the editor only. Check the controller mode, inspect the code, and require teacher approval before any physical run.
+      </p>
+      <div className="mt-2 space-y-2">
+        {starterCodes.map((entry) => (
+          <div key={`${entry.controller_version}-${entry.name}`} className="rounded-lg border border-blue-100 bg-white p-2">
+            <div className="flex items-start justify-between gap-2">
+              <span className="min-w-0 break-words text-xs font-semibold text-slate-800">{entry.name}</span>
+              <span className="shrink-0 rounded-full bg-slate-100 px-2 py-0.5 text-[9px] uppercase text-slate-600">{entry.controller_version}</span>
+            </div>
+            <p className="mt-1 text-[10px] text-slate-600">{entry.description}</p>
+            <button type="button" onClick={() => handleLoadStarterCode(entry)} className="mt-2 text-xs font-semibold text-blue-700 hover:text-blue-900">Load into editor</button>
+          </div>
+        ))}
+        {starterCodes.length === 0 && <p className="text-xs text-slate-500">Starter motion examples are unavailable.</p>}
+      </div>
+      <div className="mt-4 border-t border-blue-200 pt-3">
+        <div className="flex items-center justify-between gap-2">
+          <p className="text-[10px] uppercase tracking-wide text-blue-800 font-semibold">
+            Shared {controllerVersion.toUpperCase()} motions
+          </p>
+          <span className="text-[9px] text-blue-700">{sharedMotions.filter((motion) => motion.controller_version === controllerVersion).length} available</span>
+        </div>
+        <div className="mt-2 space-y-2">
+          {sharedMotions
+            .filter((motion) => motion.controller_version === controllerVersion)
+            .map((motion) => (
+              <div key={motion.id} className="rounded-lg border border-blue-100 bg-white p-2">
+                <div className="flex items-start justify-between gap-2">
+                  <span className="min-w-0 break-words text-xs font-semibold text-slate-800">{motion.name}</span>
+                  <span className="shrink-0 rounded-full bg-slate-100 px-2 py-0.5 text-[9px] uppercase text-slate-600">{motion.controller_version}</span>
+                </div>
+                <details className="mt-2">
+                  <summary className="cursor-pointer text-[10px] font-semibold text-blue-700">Preview sequence</summary>
+                  <pre className="mt-1 max-h-40 overflow-auto whitespace-pre-wrap break-words rounded bg-slate-50 p-2 font-mono text-[10px] text-slate-700">{motion.code}</pre>
+                </details>
+                <div className="mt-2 flex flex-wrap items-center gap-3">
+                  <button
+                    type="button"
+                    onClick={() => handleLoadStarterCode({
+                      name: motion.name,
+                      code: motion.code,
+                      controller_version: motion.controller_version,
+                    })}
+                    className="text-xs font-semibold text-blue-700 hover:text-blue-900"
+                  >
+                    Load sequence
+                  </button>
+                  {currentUser.role === 'teacher' && (
+                    <>
+                      <button type="button" onClick={() => openStarterMotionEditor(motion)} className="text-xs text-slate-600 hover:text-slate-900">Edit</button>
+                      <button type="button" onClick={() => duplicateStarterMotion(motion)} className="text-xs text-slate-600 hover:text-slate-900">Duplicate</button>
+                      <button type="button" onClick={() => deleteStarterMotion(motion)} className="text-xs text-red-600 hover:text-red-700">Delete</button>
+                    </>
+                  )}
+                </div>
+              </div>
+            ))}
+          {sharedMotions.filter((motion) => motion.controller_version === controllerVersion).length === 0 && (
+            <p className="text-xs text-slate-500">No shared motions for this controller yet.</p>
+          )}
+        </div>
+      </div>
+    </div>
+  );
+
+  const renderProjectLibrary = () => (
+    <div className="rounded-xl border border-slate-200 bg-slate-50 p-3">
+      <h3 className="text-sm font-semibold uppercase tracking-wide text-slate-700">Shared project library</h3>
+      <div className="mt-2 space-y-2">
+        {projectLibrary.length === 0 ? (
+          <p className="text-xs text-slate-500">No saved projects yet.</p>
+        ) : projectLibrary.map((project) => (
+          <div key={project.id || `${project.username}-${project.name}`} className="rounded-lg border border-slate-200 bg-white p-3">
+            <div className="flex items-center justify-between gap-2">
+              <span className="min-w-0 truncate text-sm font-medium text-slate-800">{project.name}</span>
+              <div className="flex shrink-0 items-center gap-1">
+                {project.status === 'pending' && (
+                  <span className="rounded-full bg-amber-100 px-2 py-1 text-[9px] uppercase text-amber-800">Pending approval</span>
+                )}
+                {project.plannerMode && (
+                  <span className="rounded-full bg-cyan-100 px-2 py-1 text-[9px] uppercase text-cyan-800">
+                    {PLANNER_MODE_LABELS[project.plannerMode] || project.plannerMode}
+                  </span>
+                )}
+                <span className="rounded-full bg-slate-100 px-2 py-1 text-[10px] uppercase text-slate-600">{project.username}</span>
+              </div>
+            </div>
+            <div className="mt-2 flex flex-wrap items-center gap-3">
+              <button type="button" onClick={() => loadProjectFromLibrary(project)} className="text-xs text-blue-600 hover:text-blue-700">Open project</button>
+              {currentUser.role === 'teacher' && (
+                <>
+                  {project.status === 'pending' && (
+                    <button type="button" onClick={() => approveSharedProject(project)} className="text-xs font-semibold text-emerald-700 hover:text-emerald-900">Approve & share</button>
+                  )}
+                  <button type="button" onClick={() => loadProjectFromLibrary(project, { duplicate: true })} className="text-xs text-slate-600 hover:text-slate-900">Duplicate</button>
+                  <button type="button" onClick={() => handleRenameProject(project)} className="text-xs text-slate-600 hover:text-slate-900">Rename</button>
+                  <button type="button" onClick={() => handleDeleteProject(project)} className="text-xs text-red-600 hover:text-red-700">Delete</button>
+                </>
+              )}
+            </div>
+          </div>
+        ))}
+      </div>
+    </div>
+  );
+
+  const handleSensorServiceOperation = async (sensorId, operation) => {
+    if (currentUser.role !== 'teacher') return;
+    const operationKey = `${sensorId}:${operation}`;
+    setSensorOperationBusy(operationKey);
+    setSensorOperationStatus(`${operation} requested for ${sensorId}…`);
+    try {
+      await apiFetch('/api/sensors/service', {
+        method: 'POST',
+        body: JSON.stringify({ sensor_id: sensorId, operation }),
+      });
+      setSensorOperationStatus(`${operation} completed for ${sensorId}.`);
+      try {
+        const diagnostics = await apiFetch('/api/sensors/status', { cache: 'no-store' });
+        setSensorDiagnostics(diagnostics);
+      } catch (error) {
+        setSensorOperationStatus(
+          `${operation} completed for ${sensorId}, but diagnostics could not be refreshed: ${error.message}`,
+        );
+      }
+    } catch (error) {
+      setSensorOperationStatus(`${operation} failed for ${sensorId}: ${error.message}`);
+    } finally {
+      setSensorOperationBusy('');
+    }
+  };
+
+  const handleCheckNavigationBridge = async () => {
+    if (!session || session.user.role !== 'teacher') {
+      setNavigationBridgeStatus('Teacher login is required to check the navigation bridge.');
+      return;
+    }
+    setIsNavigationBridgeChecking(true);
+    setIsNavigationMotionReady(false);
+    setNavigationDiagnostics(null);
+    setNavigationBridgeStatus('Checking bridge, fresh MID-360 data, localization, map metadata, and e-stop health…');
+    try {
+      const result = await apiFetch('/api/navigation/status');
+      setIsNavigationMotionReady(result.motionReady === true);
+      setNavigationDiagnostics(result.diagnostics || null);
+      if (result.activeOperation) {
+        setNavigationOperation(result.activeOperation);
+        setNavigationExecutionStatus(
+          `Recovered navigation operation ${result.activeOperation.operation_id} • ${result.activeOperation.status}`,
+        );
+      } else {
+        setNavigationOperation(null);
+      }
+      setNavigationHome(result.home || null);
+      if (!result.ready) {
+        setNavigationBridgeStatus(`Unavailable • ${result.error || 'Bridge is not ready.'}`);
+        return;
+      }
+      const { map, localization } = result;
+      setNavigationBridgeStatus(
+        `Ready • map ${map.map_id} • version ${map.version} • ${map.frame_id} • `
+        + `pose ${localization.pose.x.toFixed(2)}, ${localization.pose.y.toFixed(2)} m `
+        + `(${localization.age_ms} ms old) • MID-360 ${result.pointcloudAgeMs} ms old • `
+        + (result.motionReady
+          ? `robot link and e-stop healthy (${result.robotHealth.age_ms}/${result.estop.age_ms} ms old)`
+          : [result.robotHealth?.error, result.estop?.error].filter(Boolean).join(' • ') || 'robot/e-stop health unverified; motion locked'),
+      );
+    } catch (error) {
+      setIsNavigationMotionReady(false);
+      setNavigationBridgeStatus(`Check failed • ${error.message}`);
+    } finally {
+      setIsNavigationBridgeChecking(false);
+    }
+  };
+
+  const handleSetNavigationHome = async () => {
+    if (!session || session.user.role !== 'teacher') {
+      setNavigationHomeStatus('Teacher login is required to set the shared origin.');
+      return;
+    }
+    if (navigationOperation && ['accepted', 'starting', 'running', 'cancel_requested'].includes(navigationOperation.status)) {
+      setNavigationHomeStatus('Stop the active navigation before setting a new shared origin.');
+      return;
+    }
+    if (lidarScanJob?.status === 'scanning') {
+      setNavigationHomeStatus('Complete or cancel the active LiDAR scan before saving a new origin.');
+      return;
+    }
+    setIsSettingNavigationHome(true);
+    setNavigationHomeStatus('Capturing the current localized pose as the shared starting origin…');
+    try {
+      const result = await apiFetch('/api/navigation/home', {
+        method: 'POST',
+      });
+      setNavigationHome(result.home);
+      setNavigationHomeStatus(
+        `Shared origin saved • ${result.home.map_id} ${result.home.map_version} • (${result.home.x.toFixed(2)}, ${result.home.y.toFixed(2)}) • yaw ${result.home.yaw_rad.toFixed(2)} rad`,
+      );
+    } catch (error) {
+      setNavigationHomeStatus(`Origin was not saved • ${error.message}`);
+    } finally {
+      setIsSettingNavigationHome(false);
+    }
+  };
+
+  const handleReturnNavigationHome = async () => {
+    if (!session || session.user.role !== 'teacher') {
+      setNavigationHomeStatus('Teacher login is required to return to the shared origin.');
+      return;
+    }
+    if (!navigationHome) {
+      setNavigationHomeStatus('Set the shared starting origin before returning to it.');
+      return;
+    }
+    if (!isNavigationMotionReady) {
+      setNavigationHomeStatus(
+        `Return blocked • ${navigationDiagnostics?.execution_enabled === false
+          ? 'physical motion is disabled by deployment configuration.'
+          : navigationDiagnostics?.controller?.error || 'verify fresh localization, robot-link, and e-stop readiness first.'}`,
+      );
+      return;
+    }
+    if (navigationOperation && ['accepted', 'starting', 'running', 'cancel_requested'].includes(navigationOperation.status)) {
+      setNavigationHomeStatus('A navigation operation is already active. Stop it before returning to the origin.');
+      return;
+    }
+    const confirmed = window.confirm(
+      `Teacher approval required: return to the saved origin at ${navigationHome.map_id} ${navigationHome.map_version} (${navigationHome.x.toFixed(2)}, ${navigationHome.y.toFixed(2)}) with heading ${navigationHome.yaw_rad.toFixed(2)} rad using live adaptive Nav2?`,
+    );
+    if (!confirmed) return;
+    setIsReturningNavigationHome(true);
+    setNavigationHomeStatus('Submitting a live Nav2 return to the saved origin…');
+    try {
+      const result = await apiFetch('/api/navigation/home/return', {
+        method: 'POST',
+      });
+      setNavigationOperation(result);
+      const alignment = result.origin_alignment;
+      const alignmentText = alignment?.status === 'same_reference_grid'
+        ? 'saved map reference matches'
+        : alignment
+          ? `map aligned • score ${Number(alignment.score).toFixed(2)} • overlap ${Math.round(Number(alignment.overlap_ratio) * 100)}%`
+          : 'map alignment unavailable';
+      setNavigationHomeStatus(`Return to origin requested • ${alignmentText} • operation ${result.operation_id} • ${result.status}`);
+      setNavigationExecutionStatus(
+        `Return to origin ${result.operation_id} • ${result.status}; controller status will be polled.`,
+      );
+    } catch (error) {
+      setNavigationHomeStatus(`Return to origin rejected • ${error.message}`);
+    } finally {
+      setIsReturningNavigationHome(false);
+    }
+  };
+
+  const handleLoadNavigationMap = async () => {
+    if (!session) {
+      setNavigationMapStatus('Sign in to load the map preview.');
+      return;
+    }
+    setIsNavigationMapLoading(true);
+    setNavigationMapStatus(
+      navigationPlannerMode === 'static'
+        ? 'Loading the published 360° scan map…'
+        : 'Loading the live SLAM occupancy map…',
+    );
+    try {
+      let result;
+      if (navigationPlannerMode === 'static') {
+        const published = await apiFetch('/api/lidar/map');
+        result = published.map;
+        if (!result?.ready || !result.map || !Array.isArray(result.data)) {
+          throw new Error('No validated 360° scan map has been published for planning.');
+        }
+      } else {
+        result = await apiFetch('/api/navigation/map');
+      }
+      const previous = navigationMapSnapshotRef.current?.map || navigationWaypointFrameRef.current;
+      const sameFrame = previous?.map_id === result.map.map_id
+        && previous?.frame_id === result.map.frame_id;
+      if (
+        navigationMapSnapshotRef.current?.map?.version !== result.map.version
+        || navigationMapSnapshotRef.current?.map?.frame_id !== result.map.frame_id
+      ) {
+        setNavigationRoutePreview(null);
+        setNavigationPreviewStatus('Map changed • preview the route again');
+      }
+      if (!sameFrame && previous) {
+        navigationRouteWaypointsRef.current = [];
+        setNavigationRouteWaypoints([]);
+        setIsNavigationGoalPlacementEnabled(false);
+      }
+      navigationMapSnapshotRef.current = result;
+      navigationWaypointFrameRef.current = {
+        map_id: result.map.map_id,
+        frame_id: result.map.frame_id,
+      };
+      setNavigationMapSnapshot(result);
+      liveNavigationMapVersionRef.current = result.map.version;
+      setIsNavigationMapVisible(true);
+      setNavigationMapStatus(
+        `${navigationPlannerMode === 'static' ? 'Static scan map loaded' : 'Live SLAM map loaded'} • `
+        + `${result.map.width} × ${result.map.height} cells • map ${result.map.map_id} • version ${result.map.version}`
+        + (navigationRouteWaypointsRef.current.length
+          ? ' • existing waypoints remain fixed in map coordinates'
+          : ''),
+      );
+    } catch (error) {
+      navigationMapSnapshotRef.current = null;
+      liveNavigationMapVersionRef.current = null;
+      setNavigationMapSnapshot(null);
+      setIsNavigationMapVisible(false);
+      setNavigationMapStatus(`Unavailable • ${error.message}`);
+    } finally {
+      setIsNavigationMapLoading(false);
+    }
+  };
+
+  const handleNavigationPlannerModeChange = (mode) => {
+    if (mode === navigationPlannerMode) return;
+    setNavigationPlannerMode(mode);
+    setNavigationRoutePreview(null);
+    setNavigationPreviewStatus('Planner mode changed • load the selected map and preview again');
+    navigationMapSnapshotRef.current = null;
+    liveNavigationMapVersionRef.current = null;
+    setNavigationMapSnapshot(null);
+    setIsNavigationMapVisible(false);
+    setNavigationMapStatus(
+      mode === 'static'
+        ? 'Load the published 360° scan map to place waypoints.'
+        : 'Load the live SLAM map; adaptive mode needs commissioned Nav2 obstacle avoidance.',
+    );
+  };
+
+  const handlePathPlannerModeChange = async (mode) => {
+    if (!Object.prototype.hasOwnProperty.call(PLANNER_PATH_MODES, mode)) return;
+    if (session?.user?.role !== 'teacher') {
+      setNavigationExecutionStatus('Only a teacher can change the classroom path planner mode.');
+      return;
+    }
+    setPathPlannerMode(mode);
+    setPlannerRouteVariants({ initial: '', corrected: '', final: '' });
+    setSelectedPlannerVariant('initial');
+    if (mode === PLANNER_PATH_MODES.autonomous) {
+      setNavigationPlannerMode('live');
+    }
+    try {
+      await apiFetch('/api/planner/settings', {
+        method: 'PUT',
+        body: JSON.stringify({ active_mode: mode }),
+      });
+    } catch (error) {
+      setNavigationExecutionStatus(`Planner mode was not saved for the classroom • ${error.message}`);
+    }
+  };
+
+  const handleStartLidarScan = async () => {
+    if (session?.user?.role !== 'teacher') return;
+    if (!isNavigationMotionReady) {
+      setLidarScanStatus(
+        `Scan blocked • ${navigationDiagnostics?.execution_enabled === false
+          ? 'physical motion is disabled by deployment configuration.'
+          : navigationDiagnostics?.controller?.error || 'verify fresh healthy robot-link and e-stop signals first.'}`,
+      );
+      return;
+    }
+    const confirmed = window.confirm(
+      'The G1 will rotate in place through 360° while the LiDAR captures the room. Continue only after confirming the robot is stable, the rotation area is clear, a teacher is supervising, and the independent emergency stop is immediately available.',
+    );
+    if (!confirmed) return;
+    setIsLidarScanStarting(true);
+    setLidarScanStatus('Checking localization, LiDAR, map, and Nav2 Spin readiness…');
+    try {
+      const scan = await apiFetch('/api/lidar/scan', {
+        method: 'POST',
+        body: JSON.stringify({ confirm_rotation: true }),
+      });
+      setLidarScanJob(scan);
+      setLiveLidarScanPoints([]);
+      setLidarScanStatus('G1 is rotating in place • capturing LiDAR in the SLAM map frame');
+    } catch (error) {
+      setLidarScanStatus(`Scan could not start • ${error.message}`);
+    } finally {
+      setIsLidarScanStarting(false);
+    }
+  };
+
+  const handleCompleteLidarScan = async () => {
+    if (!lidarScanJob?.job_id || session?.user?.role !== 'teacher') return;
+    setIsLidarScanFinalizing(true);
+    setLidarScanStatus('Validating 3D point cloud and metric occupancy grid…');
+    try {
+      const result = await apiFetch(`/api/lidar/scan/${lidarScanJob.job_id}/complete`, {
+        method: 'POST',
+      });
+      setLidarScanJob(result);
+      setLidarScanStatus(
+        `360° scan complete • ${result.point_count} 3D points • ${result.map.width} × ${result.map.height} cells at ${result.map.resolution_m} m/cell`,
+      );
+    } catch (error) {
+      setLidarScanStatus(`Scan finalization failed • ${error.message}`);
+    } finally {
+      setIsLidarScanFinalizing(false);
+    }
+  };
+
+  const handleCancelLidarScan = async () => {
+    if (!lidarScanJob?.job_id || session?.user?.role !== 'teacher') return;
+    setIsLidarScanFinalizing(true);
+    try {
+      const result = await apiFetch(`/api/lidar/scan/${lidarScanJob.job_id}/cancel`, {
+        method: 'POST',
+      });
+      setLidarScanJob(result);
+      setLiveLidarScanPoints([]);
+      setLidarScanStatus(result.status === 'scanning'
+        ? 'Nav2 rotation cancellation requested • waiting for confirmed stop'
+        : 'Room scan canceled • no map was published');
+    } catch (error) {
+      setLidarScanStatus(`Scan cancellation failed • ${error.message}`);
+    } finally {
+      setIsLidarScanFinalizing(false);
+    }
+  };
+
+  const handlePublishLidarMap = async () => {
+    if (!lidarScanJob?.job_id || session?.user?.role !== 'teacher') return;
+    try {
+      const result = await apiFetch('/api/lidar/map/publish', {
+        method: 'POST',
+        body: JSON.stringify({ job_id: lidarScanJob.job_id }),
+      });
+      const sharedMap = await apiFetch('/api/lidar/map');
+      setSharedLidarMap(sharedMap);
+      sharedMapVersionRef.current = result.map.version;
+      sharedMapLoadedRef.current = Boolean(sharedMap.map);
+      setLidarScanStatus(
+        `Published shared room map • ${result.map.width * result.map.resolution_m} m × ${result.map.height * result.map.resolution_m} m`,
+      );
+    } catch (error) {
+      setLidarScanStatus(`Map publication failed • ${error.message}`);
+    }
+  };
+
+  const handleRefreshSharedLidarMap = async () => {
+    setIsSharedLidarMapLoading(true);
+    try {
+      const result = await apiFetch('/api/lidar/map');
+      setSharedLidarMap(result.map ? result : null);
+      sharedMapVersionRef.current = result.map?.map?.version || null;
+      sharedMapLoadedRef.current = Boolean(result.map);
+    } catch (error) {
+      setNavigationLiveStatus(`Shared map unavailable • ${error.message}`);
+    } finally {
+      setIsSharedLidarMapLoading(false);
+    }
+  };
+
+  const handleSharedLidarOverlayToggle = async (enabled) => {
+    if (session?.user?.role !== 'teacher') return;
+    const previousValue = sharedLidarOverlayEnabled;
+    setSharedLidarOverlayEnabled(enabled);
+    try {
+      const result = await apiFetch('/api/lidar/settings', {
+        method: 'PUT',
+        body: JSON.stringify({ show_shared_overlay: enabled }),
+      });
+      setSharedLidarOverlayEnabled(result.show_shared_overlay);
+    } catch (error) {
+      setSharedLidarOverlayEnabled(previousValue);
+      setNavigationLiveStatus(`Shared overlay setting was not saved • ${error.message}`);
+    }
+  };
+
+  useEffect(() => {
+    const jobId = lidarScanJob?.job_id;
+    if (!jobId || lidarScanJob.status !== 'scanning' || session?.user?.role !== 'teacher') return undefined;
+    let active = true;
+    let requestInFlight = false;
+    const pollScan = async () => {
+      if (requestInFlight) return;
+      requestInFlight = true;
+      try {
+        const result = await apiFetch(`/api/lidar/scan/${jobId}`);
+        if (!active) return;
+        setLidarScanJob(result);
+        setLiveLidarScanPoints(Array.isArray(result.preview_points) ? result.preview_points : []);
+        const rotationStatus = result.rotation_status === 'completed'
+          ? `360° rotation confirmed (${result.rotation_radians.toFixed(2)} rad) • ready to validate`
+          : result.rotation_status === 'cancel_requested' || result.rotation_status === 'uncertain'
+            ? `Rotation stopping • ${result.error || 'waiting for Nav2 terminal confirmation'}`
+            : `G1 rotating in place • ${result.rotation_radians.toFixed(2)} rad captured`;
+        setLidarScanStatus(
+          `${result.rotation_status === 'submitted'
+            ? 'Waiting for Nav2 to accept the in-place rotation'
+            : rotationStatus} • ${result.point_count || 0} unique 3D points${result.error ? ` • ${result.error}` : ''}`,
+        );
+      } catch (error) {
+        if (active) setLidarScanStatus(`Scan status unavailable • ${error.message}`);
+      } finally {
+        requestInFlight = false;
+      }
+    };
+    pollScan();
+    const timer = window.setInterval(pollScan, 100);
+    return () => {
+      active = false;
+      window.clearInterval(timer);
+    };
+  }, [lidarScanJob?.job_id, lidarScanJob?.status, session?.user?.role, apiFetch]);
+
+
+  const handleNavigationMapClick = (event) => {
+    if (!isNavigationGoalPlacementEnabled || !navigationMapSnapshot?.map) return;
+    const mapGroup = navigationMapCoordinatesRef.current;
+    if (!mapGroup) return;
+    const screenPoint = mapGroup.ownerSVGElement.createSVGPoint();
+    screenPoint.x = event.clientX;
+    screenPoint.y = event.clientY;
+    const localPoint = screenPoint.matrixTransform(mapGroup.getScreenCTM().inverse());
+    const { map } = navigationMapSnapshot;
+    const mapWidth = map.width * map.resolution_m;
+    const mapHeight = map.height * map.resolution_m;
+    if (localPoint.x < 0 || localPoint.y < 0 || localPoint.x >= mapWidth || localPoint.y >= mapHeight) return;
+    const mapLocalY = localPoint.y;
+    const occupancy = occupancyAtMapLocalPoint(
+      localPoint.x, mapLocalY, map, navigationMapSnapshot.data,
+    );
+    if (!Number.isInteger(occupancy) || occupancy < 0 || occupancy >= 65) {
+      setNavigationExecutionStatus('Destination rejected • choose a known free map cell.');
+      return;
+    }
+    const { x, y } = mapLocalToWorld(localPoint.x, mapLocalY, map);
+    navigationWaypointFrameRef.current = {
+      map_id: map.map_id,
+      frame_id: map.frame_id,
+    };
+    setNavigationRouteWaypoints((points) => [
+      ...points,
+      { id: `nav-${Date.now()}-${points.length}`, x, y },
+    ]);
+    setNavigationRoutePreview(null);
+    setNavigationPreviewStatus('Destinations changed • preview the route again');
+    setNavigationExecutionStatus('Destination added • route will be checked against the current map before start.');
+  };
+
+  const handlePreviewNavigationRoute = async () => {
+    if (!session) {
+      setNavigationPreviewStatus('Sign in to preview a route.');
+      return;
+    }
+    if (!navigationMapSnapshot?.map || navigationRouteWaypoints.length < 1) {
+      setNavigationPreviewStatus('Load the map and add at least one destination before previewing.');
+      return;
+    }
+    if (navigationPlannerMode === 'live' && !isLiveAvoidanceReady) {
+      setNavigationPreviewStatus(
+        `Live adaptive preview unavailable • ${liveNavigationObstacles?.error || 'Nav2 local obstacle avoidance is not commissioned.'}`,
+      );
+      return;
+    }
+    setIsNavigationPreviewing(true);
+    setNavigationRoutePreview(null);
+    setNavigationPreviewStatus('Requesting a non-motion path preview from Nav2…');
+    try {
+      const result = await apiFetch('/api/navigation/plan', {
+        method: 'POST',
+        body: JSON.stringify({
+          map_id: navigationMapSnapshot.map.map_id,
+          version: navigationMapSnapshot.map.version,
+          frame_id: navigationMapSnapshot.map.frame_id,
+          planner_mode: navigationPlannerMode,
+          waypoints: navigationRouteWaypoints.map(({ x, y }) => ({ x, y })),
+        }),
+      });
+      if (
+        result.map_id !== navigationMapSnapshot.map.map_id
+        || result.version !== navigationMapSnapshot.map.version
+        || result.frame_id !== navigationMapSnapshot.map.frame_id
+      ) {
+        throw new Error('The map changed while Nav2 was planning. Reload it and preview again.');
+      }
+      setNavigationRoutePreview(result);
+      setNavigationPreviewStatus(
+        `Preview ready • ${result.path.length} path points • ${result.planner_id} • no motion sent`,
+      );
+    } catch (error) {
+      setNavigationPreviewStatus(`Route preview unavailable • ${error.message}`);
+    } finally {
+      setIsNavigationPreviewing(false);
+    }
+  };
+
+  const handleStartNavigation = async () => {
+    if (!session || session.user.role !== 'teacher') {
+      setNavigationExecutionStatus('Teacher login is required to start navigation.');
+      return;
+    }
+    if (!isNavigationMotionReady) {
+      setNavigationExecutionStatus(
+        `Physical start blocked • ${navigationDiagnostics?.execution_enabled === false
+          ? 'physical motion is disabled by deployment configuration.'
+          : navigationDiagnostics?.controller?.error || 'verify a fresh healthy e-stop and robot-link signal first.'}`,
+      );
+      return;
+    }
+    if (navigationPlannerMode === 'live' && !isLiveAvoidanceReady) {
+      setNavigationExecutionStatus(
+        `Physical start blocked • ${liveNavigationObstacles?.error || 'Nav2 local obstacle avoidance is not commissioned.'}`,
+      );
+      return;
+    }
+    if (pathPlannerMode === PLANNER_PATH_MODES.autonomous && navigationPlannerMode !== 'live') {
+      setNavigationExecutionStatus('Autonomous path mode requires Live adaptive Nav2 with commissioned obstacle avoidance.');
+      return;
+    }
+    if (!navigationMapSnapshot?.map || navigationRouteWaypoints.length < 1) {
+      setNavigationExecutionStatus('Load the map and add at least one destination before starting.');
+      return;
+    }
+    if (
+      !navigationRoutePreview
+      || navigationRoutePreview.map_id !== navigationMapSnapshot.map.map_id
+      || navigationRoutePreview.version !== navigationMapSnapshot.map.version
+      || navigationRoutePreview.frame_id !== navigationMapSnapshot.map.frame_id
+    ) {
+      setNavigationExecutionStatus('Preview the current route on the latest map before starting Nav2.');
+      return;
+    }
+    if (navigationOperation && ['accepted', 'starting', 'running', 'cancel_requested'].includes(navigationOperation.status)) {
+      setNavigationExecutionStatus('A navigation operation is already active.');
+      return;
+    }
+    const plannedPoints = (navigationRoutePreview.path || [])
+      .map((point, index) => `${index + 1}. (${Number(point.x).toFixed(2)}, ${Number(point.y).toFixed(2)})`)
+      .join('\n');
+    if (!window.confirm(
+      `Teacher approval required: start ${navigationPlannerMode === 'live' ? 'live adaptive' : 'static scan-map'} ROS navigation on map ${navigationMapSnapshot.map.map_id} (${navigationMapSnapshot.map.version}) `
+      + `with ${navigationRouteWaypoints.length} destination(s)?\n\nPlanner path preview (map-frame coordinates, not motor commands):\n${plannedPoints || '(no path points returned)'}\n\nKeep the robot area clear and the physical emergency stop accessible.`,
+    )) return;
+
+    setIsNavigationStarting(true);
+    setNavigationExecutionStatus('Submitting route to the ROS Nav2 controller…');
+    try {
+      const result = await apiFetch('/api/navigation/start', {
+        method: 'POST',
+        body: JSON.stringify({
+          map_id: navigationMapSnapshot.map.map_id,
+          version: navigationMapSnapshot.map.version,
+          frame_id: navigationMapSnapshot.map.frame_id,
+          planner_mode: navigationPlannerMode,
+          waypoints: navigationRouteWaypoints.map(({ x, y }) => ({ x, y })),
+        }),
+      });
+      setNavigationOperation(result);
+      setNavigationExecutionStatus(
+        `Route ${result.operation_id} • ${result.status}; controller status will be polled.`,
+      );
+      setIsNavigationGoalPlacementEnabled(false);
+    } catch (error) {
+      setNavigationExecutionStatus(`Navigation start rejected • ${error.message}`);
+    } finally {
+      setIsNavigationStarting(false);
+    }
+  };
+
+  const handleStopNavigation = async () => {
+    if (!navigationOperation?.operation_id) return;
+    setNavigationExecutionStatus('Requesting Nav2 cancellation…');
+    try {
+      const result = await apiFetch(`/api/navigation/operation/${navigationOperation.operation_id}/stop`, {
+        method: 'POST',
+      });
+      setNavigationOperation((current) => current
+        ? { ...current, status: result.status }
+        : current);
+      setNavigationExecutionStatus(
+        `Cancellation requested • waiting for Nav2 terminal status (${navigationOperation.operation_id}).`,
+      );
+    } catch (error) {
+      setNavigationExecutionStatus(`Cancellation request failed • ${error.message}`);
+    }
+  };
+
+  useEffect(() => {
+    const operationId = navigationOperation?.operation_id;
+    if (!operationId) return undefined;
+    if (['completed', 'succeeded', 'canceled', 'failed'].includes(navigationOperation.status)) {
+      if (
+        navigationOperation.status === 'completed'
+        && pathPlannerMode === PLANNER_PATH_MODES.autonomous
+        && processedAutonomousOperationRef.current !== operationId
+      ) {
+        processedAutonomousOperationRef.current = operationId;
+        const saveCompletedRoute = async () => {
+          try {
+            if (navigationOperation.path_trace_truncated || navigationOperation.path_trace_error) {
+              throw new Error(navigationOperation.path_trace_error || 'The executed route trace was truncated.');
+            }
+            const pathTrace = navigationOperation.path_trace || [];
+            const code = buildSdkCommandsFromTrace(pathTrace).join('\n');
+            const safeCode = sanitizeRobotCode(code).code;
+            if (!safeCode) throw new Error('The recorded route did not produce validated SDK commands.');
+            const waypoints = relativePlannerWaypointsFromTrace(pathTrace);
+            const projectLabel = (plannerProjectLabel || buildPlannerProjectName(PLANNER_PATH_MODES.autonomous)).trim();
+            const saved = await apiFetch('/api/classroom/project/save-execution', {
+              method: 'POST',
+              body: JSON.stringify({
+                name: projectLabel,
+                sceneObjects,
+                plannerWaypoints: waypoints,
+                generatedCode: safeCode,
+                duetCode: codeByVersionRef.current.duet || '',
+                plannerMode: PLANNER_PATH_MODES.autonomous,
+                plannerLabel: projectLabel,
+                plannerVariants: { corrected: safeCode, final: safeCode },
+                selectedPlannerVariant: 'final',
+              }),
+            });
+            await refreshClassroomData();
+            setNavigationExecutionStatus(
+              `Nav2 completed with ${pathTrace.length} localization feedback samples. Saved ${saved.project.name} to the shared project library; the active Blocks/IDE workspace was left unchanged.`,
+            );
+          } catch (error) {
+            setNavigationExecutionStatus(`Nav2 completed, but its executed path could not be saved as an SDK project • ${error.message}`);
+          }
+        };
+        saveCompletedRoute();
+      }
+      return undefined;
+    }
+    let active = true;
+    const pollOperation = async () => {
+      try {
+        const result = await apiFetch(`/api/navigation/operation/${operationId}`);
+        if (!active) return;
+        setNavigationOperation(result);
+        {
+          let statusText = `Navigation ${result.status}`;
+          if (result.status === 'succeeded') statusText = `Navigation completed${result.current_waypoint ? ` • destination ${result.current_waypoint}` : ''}`;
+          else if (result.status === 'failed') statusText = `Navigation failed${result.current_waypoint ? ` • destination ${result.current_waypoint}` : ''}`;
+          else if (result.status === 'canceled') statusText = `Navigation canceled${result.current_waypoint ? ` • destination ${result.current_waypoint}` : ''}`;
+          setNavigationExecutionStatus(statusText);
+        }
+      } catch (error) {
+        if (active) setNavigationExecutionStatus(`Navigation status unavailable • ${error.message}; execution remains locked.`);
+      }
+    };
+    pollOperation();
+    const timer = window.setInterval(pollOperation, 1500);
+    return () => {
+      active = false;
+      window.clearInterval(timer);
+    };
+  }, [navigationOperation, pathPlannerMode, plannerProjectLabel, sceneObjects, apiFetch, refreshClassroomData]);
 
   useEffect(() => {
     const handleClickOutside = () => setActiveMenu(null);
@@ -955,11 +3820,20 @@ export default function App() {
 
   useEffect(() => {
     if (typeof window !== 'undefined') {
-      window.Blockly = Object.assign({}, Blockly, { Python: pythonGenerator });
-      window.Blockly.setLocale(lang === 'zh' ? Zh : En);
-      window.Blockly.Msg["PROCEDURES_DEFNORETURN_TITLE"] = lang === 'zh' ? "功能名称：" : "Function Name:";
-      window.Blockly.Msg["PROCEDURES_DEFRETURN_TITLE"] = lang === 'zh' ? "功能名称：" : "Function Name:";
-      setIsBlocklyLoaded(true);
+      try {
+        window.Blockly = Object.assign({}, Blockly, { Python: pythonGenerator });
+        if (typeof window.Blockly.setLocale === 'function') {
+          window.Blockly.setLocale(lang === 'zh' ? Zh : En);
+        }
+        if (window.Blockly.Msg) {
+          window.Blockly.Msg["PROCEDURES_DEFNORETURN_TITLE"] = lang === 'zh' ? "功能名称：" : "Function Name:";
+          window.Blockly.Msg["PROCEDURES_DEFRETURN_TITLE"] = lang === 'zh' ? "功能名称：" : "Function Name:";
+        }
+      } catch (error) {
+        console.error('Blockly startup configuration failed; continuing with default locale.', error);
+      } finally {
+        setIsBlocklyLoaded(true);
+      }
     }
   }, [lang]);
 
@@ -977,57 +3851,86 @@ export default function App() {
     setRobotConfig(targetDefault);
   };
 
-  const generateToolboxXML = useCallback((robotCategories, language) => {
-    const cats = UI_TEXT[language].toolbox;
-    const systemCategories = language === 'zh' ? SYSTEM_CONFIG_ZH : SYSTEM_CONFIG_EN;
-    const fullCategories = [...systemCategories, ...robotCategories];
-    const robotIdeCategory = `
-      <category name="Robot IDE" colour="210">
-        ${ROBOT_IDE_COMMAND_BLOCKS.map(block => `<block type="${block.type}"></block>`).join('')}
-      </category>
-    `;
+  const legacySharedMotionBlocks = useMemo(
+    () => sharedMotions
+      .filter((motion) => motion.controller_version === 'legacy')
+      .map((motion) => ({
+        type: `g1_shared_motion_${motion.id}`,
+        category: 'Shared motions',
+        message0: `Run shared motion: ${motion.name.replaceAll('%', ' percent ')}`,
+        previousStatement: null,
+        nextStatement: null,
+        colour: 35,
+        tooltip: motion.code,
+        codeTemplate: `robot.shared_motion(${JSON.stringify(motion.id)})\n`,
+      })),
+    [sharedMotions],
+  );
 
-    const customCategoriesXml = fullCategories.map(cat => {
-      const blocksXml = cat.blocks.map(block => {
-        const inputs = block.args0?.filter(arg => arg.type === 'input_value') || [];
-        let innerXml = '';
-        inputs.forEach(input => {
-          if (input.check === 'Number') innerXml += `<value name="${input.name}"><shadow type="math_number"><field name="NUM">0</field></shadow></value>`;
-        });
-        return `<block type="${block.type}">${innerXml}</block>`;
-      }).join('');
-      return `<category name="${cat.category}" colour="${cat.colour}">${blocksXml}</category>`;
+  const getDuetSharedMotions = useCallback(
+    () => sharedMotions.filter((motion) => motion.controller_version === 'duet'),
+    [sharedMotions],
+  );
+
+  const generateToolboxXML = useCallback((language) => {
+    const cats = UI_TEXT[language].toolbox;
+    const isDuetVersion = controllerVersion === 'duet';
+    const commandBlocks = isDuetVersion
+      ? getDuetBlocklyCommandBlocks(savedDuetMotions, getDuetSharedMotions())
+      : [...getG1BlocklyCommandBlocks(legacyCommandsForCurrentUser), ...legacySharedMotionBlocks];
+    const categories = [...new Set(commandBlocks.map((definition) => definition.category))];
+    const commandCategoriesXml = categories.map((category) => {
+      const blocks = commandBlocks
+        .filter((block) => block.category === category)
+        .map((block) => `<block type="${block.type}"></block>`)
+        .join('');
+      const colour = category === 'Concurrent actions'
+        ? 210
+        : category === 'Gestures' || category === 'Arm gestures' || category === 'Arm poses'
+        ? 280
+        : category === 'Control' ? 190 : 160;
+      return `<category name="${category}" colour="${colour}">${blocks}</category>`;
     }).join('');
 
     return `
     <xml xmlns="https://developers.google.com/blockly/xml">
-      ${customCategoriesXml}
-      ${robotIdeCategory}
-      <category name="${cats.functions}" colour="290" custom="PROCEDURE"></category>
+      ${commandCategoriesXml}
+      ${isDuetVersion ? `
+        <category name="Conditions" colour="200">
+          <block type="controls_if"></block>
+          <block type="controls_if"><mutation else="1"></mutation></block>
+          <block type="logic_boolean"><field name="BOOL">TRUE</field></block>
+          <block type="logic_boolean"><field name="BOOL">FALSE</field></block>
+          <block type="logic_compare"></block>
+          <block type="duet_front_distance_m"></block>
+          <block type="duet_rear_distance_m"></block>
+          <block type="math_number"><field name="NUM">1</field></block>
+        </category>
+      ` : `
+        <category name="${language === 'zh' ? '条件' : 'Conditions'}" colour="200">
+          <block type="controls_if"></block>
+          <block type="controls_if"><mutation else="1"></mutation></block>
+          <block type="logic_boolean"><field name="BOOL">TRUE</field></block>
+          <block type="logic_boolean"><field name="BOOL">FALSE</field></block>
+          <block type="logic_compare"></block>
+          <block type="g1_front_distance_m"></block>
+          <block type="g1_rear_distance_m"></block>
+          <block type="math_number"><field name="NUM">1</field></block>
+        </category>
+      `}
       <sep></sep>
-      <category name="${cats.logic}" colour="210">
-        <block type="controls_if"></block>
-        <block type="logic_compare"></block>
-        <block type="logic_operation"></block>
-        <block type="logic_boolean"></block>
-      </category>
       <category name="${cats.loops}" colour="120">
         <block type="controls_repeat_ext"><value name="TIMES"><shadow type="math_number"><field name="NUM">10</field></shadow></value></block>
-        <block type="controls_whileUntil"></block>
       </category>
-      <category name="${cats.math}" colour="230">
-        <block type="math_number"></block>
-        <block type="math_arithmetic"></block>
-        <block type="math_random_int"></block>
-      </category>
-      <category name="${cats.text}" colour="160">
-        <block type="text"></block>
-        <block type="text_print"></block>
-      </category>
-      <category name="${cats.variables}" colour="330" custom="VARIABLE"></category>
     </xml>
     `;
-  }, []);
+  }, [
+    controllerVersion,
+    getDuetSharedMotions,
+    legacyCommandsForCurrentUser,
+    legacySharedMotionBlocks,
+    savedDuetMotions,
+  ]);
 
   const registerBlocks = useCallback((robotCategories) => {
     if (!Blockly || !pythonGenerator) return;
@@ -1058,12 +3961,35 @@ export default function App() {
     }
 
     const systemCategories = lang === 'zh' ? SYSTEM_CONFIG_ZH : SYSTEM_CONFIG_EN;
-    const allBlocks = [...systemCategories, ...robotCategories].flatMap(cat => cat.blocks);
-    const commandBlocks = ROBOT_IDE_COMMAND_BLOCKS.map(({ codeTemplate, ...rest }) => ({ ...rest }));
-    const definitions = [...allBlocks, ...commandBlocks].map(({ codeTemplate, extensions, ...rest }) => ({ ...rest, extensions: extensions || undefined }));
+    const activeRobotCategories = controllerVersion === 'duet' ? [] : robotCategories;
+    const allBlocks = [...systemCategories, ...activeRobotCategories].flatMap(cat => cat.blocks);
+    const commandBlocks = [
+      ...ROBOT_IDE_COMMAND_BLOCKS,
+      ...getG1BlocklyCommandBlocks(G1_COMMANDS),
+      ...legacySharedMotionBlocks,
+      ...getG1BlocklyConditionBlocks(),
+      ...getDuetBlocklyCommandBlocks(savedDuetMotions, getDuetSharedMotions()),
+    ];
+    const definitions = [...allBlocks, ...commandBlocks].map((blockDef) => {
+      const definition = { ...blockDef };
+      delete definition.codeTemplate;
+      delete definition.stringFields;
+      delete definition.category;
+      delete definition.armPreset;
+      delete definition.poseName;
+      definition.extensions = definition.extensions || undefined;
+      return definition;
+    });
     Blockly.common.defineBlocksWithJsonArray(definitions);
     
     [...allBlocks, ...commandBlocks].forEach(blockDef => {
+      if (blockDef.type === 'duet_concurrent_action') {
+        pythonGenerator.forBlock[blockDef.type] = (block, generator) => (
+          `with duet.concurrent():\n${generator.statementToCode(block, 'LOCOMOTION')}${generator.statementToCode(block, 'GESTURE')}`
+        );
+        return;
+      }
+      if (!blockDef.codeTemplate) return;
       pythonGenerator.forBlock[blockDef.type] = function(block, generator) {
         let code = blockDef.codeTemplate;
         
@@ -1088,6 +4014,10 @@ export default function App() {
             if (arg.type === "input_value") value = generator.valueToCode(block, name, pythonGenerator.ORDER_ATOMIC) || '0';
             else if (arg.type.startsWith("field_")) value = block.getFieldValue(name);
 
+            if (blockDef.stringFields?.includes(name)) {
+              value = JSON.stringify(value);
+            }
+
             if (arg.type === 'field_number' && name) {
               const safeValue = clampSafeValue(name, value);
               value = String(safeValue);
@@ -1097,13 +4027,13 @@ export default function App() {
           });
         }
 
-        code = sanitizeRobotCode(code);
+        if (controllerVersion === 'legacy') code = sanitizeRobotCode(code).code;
         
         if (blockDef.output !== undefined) return [code, pythonGenerator.ORDER_ATOMIC];
         return code;
       };
     });
-  }, [lang]);
+  }, [lang, controllerVersion, savedDuetMotions, legacySharedMotionBlocks, getDuetSharedMotions]);
 
   useEffect(() => {
     if (!isBlocklyLoaded || !blocklyDiv.current) return;
@@ -1113,70 +4043,150 @@ export default function App() {
       setTimeout(() => promptInputRef.current?.focus(), 100);
     });
 
-    const initTimer = setTimeout(() => {
-        registerBlocks(robotConfig);
-        if (workspaceRef.current) workspaceRef.current.dispose();
-        
-        workspaceRef.current = Blockly.inject(blocklyDiv.current, {
-          toolbox: generateToolboxXML(robotConfig, lang),
-          scrollbars: false,
-          move: {
-            scrollbars: false,
-            drag: true,
-            wheel: true
-          },
-          grid: { spacing: 20, length: 3, colour: '#ccc', snap: true },
-          zoom: { controls: true, wheel: true, startScale: 1.0, maxScale: 3, minScale: 0.3, scaleSpeed: 1.2 },
-          trashcan: true,
-        });
+    registerBlocks(robotConfig);
+    if (workspaceRef.current) {
+      workspaceRef.current.updateToolbox(generateToolboxXML(lang));
+      return undefined;
+    }
 
-        if (resizeObserverRef.current) resizeObserverRef.current.disconnect();
-        resizeObserverRef.current = new ResizeObserver(() => {
+    const initFrame = requestAnimationFrame(() => {
+      if (!blocklyDiv.current) return;
+      workspaceRef.current = Blockly.inject(blocklyDiv.current, {
+        toolbox: generateToolboxXML(lang),
+        scrollbars: false,
+        move: {
+          scrollbars: false,
+          drag: true,
+          wheel: true
+        },
+        grid: { spacing: 20, length: 3, colour: '#ccc', snap: true },
+        zoom: { controls: true, wheel: true, startScale: 0.75, maxScale: 3, minScale: 0.3, scaleSpeed: 1.2 },
+        trashcan: true,
+      });
+
+      const scheduleResize = () => {
+        requestAnimationFrame(() => {
+          const container = blocklyDiv.current;
+          if (!workspaceRef.current || !container) return;
+          const { width, height } = container.getBoundingClientRect();
+          if (width <= 0 || height <= 0) return;
           Blockly.svgResize(workspaceRef.current);
         });
-        resizeObserverRef.current.observe(blocklyDiv.current);
+      };
 
-        const forceResize = () => {
-          if(workspaceRef.current) Blockly.svgResize(workspaceRef.current);
-        };
+      if (resizeObserverRef.current) resizeObserverRef.current.disconnect();
+      resizeObserverRef.current = new ResizeObserver(scheduleResize);
+      resizeObserverRef.current.observe(blocklyDiv.current);
 
-        const handleBlocklyEvents = (event) => {
-          if ([Blockly.Events.BLOCK_CHANGE, Blockly.Events.BLOCK_MOVE, Blockly.Events.BLOCK_DELETE, Blockly.Events.VAR_CREATE, Blockly.Events.VAR_DELETE, Blockly.Events.VAR_RENAME].includes(event.type)) {
-            try { setGeneratedCode(pythonGenerator.workspaceToCode(workspaceRef.current)); } catch(e) {}
+      const handleBlocklyEvents = (event) => {
+        if (event.type === Blockly.Events.UI || event.element === 'category') {
+          scheduleResize();
+        }
+        workspaceRef.current?.getAllBlocks(false).forEach((block) => {
+          if (block.type !== 'controls_repeat_ext') return;
+          const countField = block.getInputTargetBlock('TIMES')?.getField('NUM');
+          if (!countField) return;
+          if (!boundedLoopCountFields.has(countField)) {
+            countField.setValidator((value) => {
+              const numeric = Number(value);
+              if (!Number.isFinite(numeric)) return null;
+              return String(Math.min(20, Math.max(1, Math.round(numeric))));
+            });
+            boundedLoopCountFields.add(countField);
           }
-          if (event.type === Blockly.Events.UI || event.element === 'category') {
-             setTimeout(forceResize, 50);
-             setTimeout(forceResize, 200);
-             setTimeout(forceResize, 400);
+          const currentValue = Number(countField.getValue());
+          const boundedValue = Math.min(20, Math.max(1, Math.round(currentValue)));
+          if (Number.isFinite(boundedValue) && boundedValue !== currentValue) {
+            countField.setValue(String(boundedValue));
           }
-        };
-        workspaceRef.current.addChangeListener(handleBlocklyEvents);
+        });
+      };
+      workspaceRef.current.addChangeListener(handleBlocklyEvents);
 
-        const onDivClick = () => {
-           setTimeout(forceResize, 50);
-           setTimeout(forceResize, 350);
-        };
-        blocklyDiv.current.addEventListener('click', onDivClick);
-        blocklyDiv.current.addEventListener('touchstart', onDivClick);
-
-        const updateCode = () => {
-          try {
-            const code = pythonGenerator.workspaceToCode(workspaceRef.current);
-            setGeneratedCode(code);
-          } catch(e) {}
-        };
-        workspaceRef.current.addChangeListener(updateCode);
-    }, 100);
+      const updateCode = () => {
+        try {
+          const code = generateBlocklyPythonCode(workspaceRef.current);
+          applyGeneratedCodeRef.current?.(code, { syncBlocks: false });
+          setBlockSyncError('');
+        } catch (error) {
+          setBlockSyncError(`Cannot read the Blocks workspace: ${error.message}`);
+          console.error('Failed to generate code from the Blockly workspace.', error);
+        }
+      };
+      workspaceRef.current.addChangeListener(updateCode);
+      scheduleResize();
+      syncBlocksFromGeneratedCodeRef.current?.(generatedCodeRef.current);
+    });
     
     return () => {
-      if (resizeObserverRef.current) resizeObserverRef.current.disconnect();
+      cancelAnimationFrame(initFrame);
     };
-  }, [isBlocklyLoaded, registerBlocks, generateToolboxXML, robotConfig, lang]);
+  }, [isBlocklyLoaded, registerBlocks, generateToolboxXML, robotConfig, lang, controllerVersion]);
+
+  useEffect(() => () => resizeObserverRef.current?.disconnect(), []);
 
   const handleApplyConfig = () => { try { setRobotConfig(JSON.parse(configText)); setShowConfigEditor(false); } catch (e) { alert("JSON Error: " + e.message); } };
   const handleImportConfig = (e) => { const r = new FileReader(); r.onload = (ev) => setConfigText(ev.target.result); if(e.target.files[0]) r.readAsText(e.target.files[0]); };
   const handleExportConfig = () => { const a = document.createElement("a"); a.href = URL.createObjectURL(new Blob([configText], {type: "application/json"})); a.download = "robot_config.json"; a.click(); };
-  const saveProject = () => { if(workspaceRef.current) { const a = document.createElement("a"); a.href = URL.createObjectURL(new Blob([JSON.stringify(window.Blockly.serialization.workspaces.save(workspaceRef.current))], {type: "application/json"})); a.download = "project.json"; a.click(); }};
+  const saveProject = () => {
+    if (!workspaceRef.current) return;
+    const workspace = window.Blockly.serialization.workspaces.save(workspaceRef.current);
+    const payload = controllerVersion === 'duet'
+      ? { controllerVersion, generatedCode, workspace }
+      : workspace;
+    const a = document.createElement("a");
+    a.href = URL.createObjectURL(new Blob([JSON.stringify(payload)], { type: "application/json" }));
+    a.download = controllerVersion === 'duet' ? 'duet-project.json' : 'project.json';
+    a.click();
+  };
+
+  const savePathPlannerProject = async () => {
+    if (!session?.user?.username || plannerWaypoints.length < 2) {
+      alert('Add at least two waypoints to save a path project.');
+      return;
+    }
+    if (
+      pathPlannerMode !== PLANNER_PATH_MODES.manual
+      && !plannerRouteVariants.corrected
+      && !plannerRouteVariants.final
+    ) {
+      alert('Run the selected sensor-corrected or autonomous mode first. Only the measured executed route can be saved as the final path.');
+      return;
+    }
+    const label = (plannerProjectLabel || projectName || buildPlannerProjectName(pathPlannerMode)).trim() || buildPlannerProjectName(pathPlannerMode);
+    const variantCode = selectedPlannerVariant === 'initial'
+      ? plannerRouteVariants.initial
+      : selectedPlannerVariant === 'corrected'
+        ? plannerRouteVariants.corrected
+        : plannerRouteVariants.final || generatedCode;
+    const projectPayload = {
+      name: label,
+      sceneObjects,
+      plannerWaypoints,
+      generatedCode: attachPlannerProjectMeta(variantCode || generatedCode, {
+        plannerMode: pathPlannerMode,
+        plannerLabel: label,
+        plannerVariants: plannerRouteVariants,
+        selectedPlannerVariant,
+      }),
+      duetCode: codeByVersionRef.current.duet || '',
+      plannerMode: pathPlannerMode,
+      plannerLabel: label,
+      plannerVariants: plannerRouteVariants,
+    };
+
+    try {
+      await apiFetch('/api/classroom/project/save', {
+        method: 'POST',
+        body: JSON.stringify(projectPayload),
+      });
+      setProjectName(label);
+      setPlannerProjectLabel(label);
+      alert(`Saved planner project as “${label}”. Open it from the project library to load the saved route and code.`);
+    } catch (error) {
+      alert(`Could not save the planner project: ${error.message}`);
+    }
+  };
   
   const loadProject = (event) => {
     const file = event.target.files[0];
@@ -1185,6 +4195,17 @@ export default function App() {
     reader.onload = (e) => {
       try {
         const json = JSON.parse(e.target.result);
+        if (controllerVersion === 'duet') {
+          if (json?.controllerVersion !== 'duet' || typeof json.generatedCode !== 'string' || !json.workspace) {
+            throw new Error('This file is not a version-two DUET project. Switch to legacy mode to open a legacy project.');
+          }
+          parseDuetProgram(json.generatedCode);
+          applyGeneratedCode(json.generatedCode, { syncBlocks: true });
+          return;
+        }
+        if (json?.controllerVersion === 'duet') {
+          throw new Error('This is a DUET version-two project. Switch to DUET mode before opening it.');
+        }
         window.Blockly.serialization.workspaces.load(json, workspaceRef.current);
       } catch (err) {
         alert("项目加载失败，文件格式可能错误: " + err.message);
@@ -1194,16 +4215,64 @@ export default function App() {
     event.target.value = ''; 
   };
 
+  const loadPythonFile = (event) => {
+    const file = event.target.files[0];
+    if (!file) return;
+    const reader = new FileReader();
+    reader.onload = () => {
+      if (typeof reader.result !== 'string') {
+        alert('Could not read the selected Python file as text.');
+        return;
+      }
+      setMainTab('ide');
+      applyGeneratedCode(reader.result, { syncBlocks: true, preserveFormatting: true });
+    };
+    reader.onerror = () => alert(`Could not read the selected Python file: ${reader.error?.message || 'unknown file error'}`);
+    reader.readAsText(file);
+    event.target.value = '';
+  };
+
+  const handleImportPythonClick = () => {
+    pythonFileInputRef.current?.click();
+    setActiveMenu(null);
+  };
+
   const downloadPython = () => { const a = document.createElement("a"); a.href = URL.createObjectURL(new Blob([generatedCode], {type: "text/x-python;charset=utf-8"})); a.download = "task.py"; a.click(); };
-  const handleUndo = () => workspaceRef.current?.undo(false);
-  const handleRedo = () => workspaceRef.current?.undo(true);
+  const handleUndo = useCallback(() => workspaceRef.current?.undo(false), []);
+  const handleRedo = useCallback(() => workspaceRef.current?.undo(true), []);
+
+  useEffect(() => {
+    const handleWorkspaceHistoryShortcut = (event) => {
+      if ((!event.ctrlKey && !event.metaKey) || mainTab !== 'blocks') return;
+      const target = event.target;
+      if (
+        target instanceof HTMLElement
+        && (target.isContentEditable || target.matches('input, textarea, select'))
+      ) return;
+
+      const key = event.key.toLowerCase();
+      if ((key === 'z' && event.shiftKey) || key === 'y') {
+        event.preventDefault();
+        handleRedo();
+      } else if (key === 'z') {
+        event.preventDefault();
+        handleUndo();
+      }
+    };
+
+    window.addEventListener('keydown', handleWorkspaceHistoryShortcut);
+    return () => window.removeEventListener('keydown', handleWorkspaceHistoryShortcut);
+  }, [handleRedo, handleUndo, mainTab]);
   
   const handleClear = () => {
     if (window.confirm(t.confirmClear)) {
       workspaceRef.current?.clear();
       setSceneObjects([]);
+      setSelectedSceneObjectId(null);
       setPlannerWaypoints([]);
-      setGeneratedCode('');
+      setOriginalPlannerCode('');
+      setIsWaypointPlacementEnabled(false);
+      applyGeneratedCode('', { syncBlocks: false });
       setIsPreviewPlaying(false);
       if (session?.user?.username) {
         localStorage.removeItem(`edu-scene-objects:${session.user.username}`);
@@ -1211,34 +4280,90 @@ export default function App() {
     }
   };
 
-  const loadProjectFromLibrary = (project) => {
+  const loadProjectFromLibrary = (project, { duplicate = false } = {}) => {
     if (!project) return;
-    setProjectName(project.name || 'default');
-    setSceneObjects(Array.isArray(project.sceneObjects) ? project.sceneObjects : []);
-    setPlannerWaypoints(Array.isArray(project.plannerWaypoints) ? project.plannerWaypoints : []);
-    setGeneratedCode(typeof project.generatedCode === 'string' ? project.generatedCode : '');
-    if (workspaceRef.current && window.Blockly) {
-      syncBlocksFromGeneratedCode(typeof project.generatedCode === 'string' ? project.generatedCode : '');
+    const legacyCode = typeof project.generatedCode === 'string' ? project.generatedCode : '';
+    const meta = parsePlannerProjectMeta(legacyCode) || {
+      plannerMode: project.plannerMode,
+      plannerLabel: project.plannerLabel,
+      plannerVariants: project.plannerVariants,
+      selectedPlannerVariant: project.selectedPlannerVariant,
+    };
+    const cleanLegacyCode = stripPlannerProjectMeta(legacyCode);
+    const duetCode = typeof project.duetCode === 'string' ? project.duetCode : '';
+    const nextCode = controllerVersion === 'duet' ? duetCode : cleanLegacyCode;
+    if (controllerVersion === 'duet') {
+      try {
+        parseDuetProgram(nextCode);
+      } catch (error) {
+        alert(`Saved DUET project code is invalid and was not loaded: ${error.message}`);
+        return;
+      }
     }
+    const projectOwner = project.username || currentUser.username;
+    const sourceName = project.name || meta.plannerLabel || 'default';
+    let destinationName = sourceName;
+    if (duplicate || currentUser.role === 'student') {
+      const ownedNames = new Set(projectLibrary
+        .filter((entry) => entry.username === currentUser.username)
+        .map((entry) => entry.name));
+      let suffix = 1;
+      destinationName = `${sourceName} (copy)`;
+      while (ownedNames.has(destinationName)) {
+        suffix += 1;
+        destinationName = `${sourceName} (copy ${suffix})`;
+      }
+    }
+    setProjectName(destinationName);
+    setEditingProjectId(
+      currentUser.role === 'teacher' && !duplicate ? project.id : null,
+    );
+    setPlannerProjectLabel(projectOwner !== currentUser.username
+      ? destinationName
+      : meta.plannerLabel || project.name || 'default');
+    if (meta.plannerMode && Object.prototype.hasOwnProperty.call(PLANNER_PATH_MODES, meta.plannerMode)) {
+      setPathPlannerMode(meta.plannerMode);
+    }
+    setPlannerRouteVariants(meta.plannerVariants || { initial: cleanLegacyCode, corrected: cleanLegacyCode, final: cleanLegacyCode });
+    setOriginalPlannerCode(meta.plannerMode === PLANNER_PATH_MODES.sensor_corrected
+      ? meta.plannerVariants?.initial || ''
+      : '');
+    setSelectedPlannerVariant(meta.selectedPlannerVariant || 'final');
+    setSceneObjects(Array.isArray(project.sceneObjects) ? project.sceneObjects : []);
+    setSelectedSceneObjectId(null);
+    setPlannerWaypoints(Array.isArray(project.plannerWaypoints) ? project.plannerWaypoints : []);
+    setIsWaypointPlacementEnabled(false);
+    codeByVersionRef.current.legacy = cleanLegacyCode;
+    codeByVersionRef.current.duet = duetCode;
+    compiledPlannerCodeRef.current = nextCode;
+    applyGeneratedCode(nextCode, { syncBlocks: true });
     setMainTab('blocks');
+    setIsQueueOpen(false);
+    setIsLibraryOpen(false);
   };
 
-  const addPlannerWaypoint = () => {
-    setPlannerWaypoints((prev) => {
-      const lastPoint = prev[prev.length - 1] || { x: 0, y: 0 };
-      return [
-        ...prev,
-        {
-          id: `planner-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`,
-          x: lastPoint.x + 4,
-          y: lastPoint.y + 2,
-        },
-      ];
-    });
+  const placePlannerWaypoint = ({ x, y }) => {
+    const position = clampScenePoint(x, y, gridSize);
+    setPlannerWaypoints((prev) => [
+      ...prev,
+      {
+        id: `planner-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`,
+        ...position,
+      },
+    ]);
+    setIsWaypointPlacementEnabled(false);
   };
 
   const updatePlannerWaypoint = (id, patch) => {
-    setPlannerWaypoints((prev) => prev.map((point) => point.id === id ? { ...point, ...patch } : point));
+    setPlannerWaypoints((prev) => prev.map((point) => {
+      if (point.id !== id) return point;
+      const nextPosition = clampScenePoint(
+        patch.x !== undefined ? patch.x : point.x,
+        patch.y !== undefined ? patch.y : point.y,
+        gridSize,
+      );
+      return { ...point, ...patch, x: nextPosition.x, y: nextPosition.y };
+    }));
   };
 
   const removePlannerWaypoint = (id) => {
@@ -1246,256 +4371,903 @@ export default function App() {
   };
 
   const compilePlannerPath = () => {
+    if (controllerVersion === 'duet') {
+      alert('Path planner export is not available in DUET version two yet. Use the DUET Blocks or IDE commands instead.');
+      return;
+    }
+    if (pathPlannerMode === PLANNER_PATH_MODES.autonomous) {
+      alert('For autonomous routing, place destinations on the LiDAR map, preview them, then start the Nav2 route. Only the completed Nav2 feedback trace can be translated into SDK commands.');
+      return;
+    }
     if (plannerWaypoints.length < 2) {
       alert('Add at least two waypoints before compiling a motion path.');
       return;
     }
+    if (generatedCode.trim() && !window.confirm('Compiling this path will replace the current Blocks and IDE code. Continue?')) return;
 
-    const ordered = [...plannerWaypoints].sort((a, b) => a.x - b.x || a.y - b.y);
-    const commands = ['robot.stand();', 'robot.wait(0.5);'];
-
-    for (let i = 1; i < ordered.length; i += 1) {
-      const from = ordered[i - 1];
-      const to = ordered[i];
-      const dx = to.x - from.x;
-      const dy = to.y - from.y;
-      const distance = Math.hypot(dx, dy);
-      const turn = Math.atan2(dy, dx) * (180 / Math.PI);
-
-      if (Math.abs(turn) > 1) {
-        const direction = turn > 0 ? 'Left' : 'Right';
-        const angle = Math.min(180, Math.abs(turn));
-        commands.push(`robot.turn${direction}(${angle.toFixed(0)});`);
-      }
-
-      if (distance > 0.1) {
-        commands.push(`robot.walkForward(${Math.max(1, Math.round(distance / 4))});`);
-      }
+    const initialCode = buildPlannerMotionCommands(plannerWaypoints).join('\n');
+    const selectedCode = initialCode;
+    const safePlannerCode = sanitizeRobotCode(selectedCode).code || selectedCode;
+    if (safePlannerCode !== generatedCode) {
+      compiledPlannerCodeRef.current = safePlannerCode;
     }
 
-    commands.push('robot.stand();');
-    commands.push('console.log("Program complete!");');
-    updateGeneratedCode(commands.join('\n'));
-    setMainTab('ide');
+    setPlannerRouteVariants({
+      initial: initialCode,
+      corrected: '',
+      final: '',
+    });
+    setSelectedPlannerVariant('initial');
+    setPlannerProjectLabel((previous) => previous || buildPlannerProjectName(pathPlannerMode));
+    updateGeneratedCode(selectedCode);
+    setIsWaypointPlacementEnabled(false);
+  };
+
+  const handleRunCheckpointedPlanner = async () => {
+    if (session?.user?.role !== 'teacher') {
+      setNavigationExecutionStatus('Teacher login is required to run checkpointed SDK paths.');
+      return;
+    }
+    if (pathPlannerMode !== PLANNER_PATH_MODES.sensor_corrected) {
+      setNavigationExecutionStatus('Select the sensor-corrected planner mode to run checkpointed SDK motion.');
+      return;
+    }
+    if (plannerWaypoints.length < 2) {
+      setNavigationExecutionStatus('Add at least two waypoints before running a checkpointed path.');
+      return;
+    }
+    if (!plannerRouteVariants.initial) {
+      setNavigationExecutionStatus('Compile the initial SDK path first; it will be shown in Blocks and IDE before execution.');
+      return;
+    }
+    if (!window.confirm(
+      `Teacher approval required: run the initial path through the G1 SDK? The backend will verify fresh localization and safety health at each waypoint, make at most one correction per waypoint, and stop if a checkpoint cannot be verified.\n\nExact initial SDK program:\n${plannerRouteVariants.initial}`,
+    )) return;
+    setIsRunning(true);
+    setNavigationExecutionStatus('Running initial path through the SDK; checking live localization at each waypoint…');
+    try {
+      const result = await apiFetch('/api/planner/checkpointed-run', {
+        method: 'POST',
+        body: JSON.stringify({
+          waypoints: plannerWaypoints.map(({ x, y }) => ({ x, y })),
+        }),
+      });
+      if (result.status !== 'completed' || typeof result.correctedCode !== 'string') {
+        throw new Error('Backend did not confirm completion with a recorded SDK command sequence.');
+      }
+      const correctedCode = result.correctedCode;
+      const projectLabel = (plannerProjectLabel || buildPlannerProjectName(pathPlannerMode)).trim();
+      const saved = await apiFetch('/api/classroom/project/save-execution', {
+        method: 'POST',
+        body: JSON.stringify({
+          name: projectLabel,
+          sceneObjects,
+          plannerWaypoints,
+          generatedCode: correctedCode,
+          duetCode: codeByVersionRef.current.duet || '',
+          plannerMode: PLANNER_PATH_MODES.sensor_corrected,
+          plannerLabel: projectLabel,
+          plannerVariants: {
+            initial: plannerRouteVariants.initial,
+            corrected: correctedCode,
+            final: correctedCode,
+          },
+          selectedPlannerVariant: 'corrected',
+        }),
+      });
+      await refreshClassroomData();
+      setNavigationExecutionStatus(
+        `SDK route completed • ${result.checkpoints.length} waypoint checkpoints confirmed. Saved ${saved.project.name} to the shared project library; the original compiled route is retained there. Physical accuracy remains unverified.`,
+      );
+    } catch (error) {
+      setNavigationExecutionStatus(`Checkpointed SDK route stopped or rejected • ${error.message}`);
+    } finally {
+      setIsRunning(false);
+    }
   };
 
   const handleRunCode = async () => {
     if (isRunning) {
-      try { await fetch('/api/stop', { method: 'POST' }); setIsRunning(false); } catch (e) { alert("Stop Failed: " + e.message); }
+      try {
+        const result = await activeRobotConnection.stop();
+        if (controllerVersion === 'duet') {
+          if (result.status === 'stopped' && result.zeroCommandConfirmed === true) {
+            duetProgramActiveRef.current = false;
+            setIsDuetProgramActive(false);
+            setIsRunning(false);
+          }
+          setRobotConnectionStatus(result.status === 'stopping'
+            ? 'DUET stop requested; waiting for confirmation of zero velocity and cleared arm-pose lease.'
+            : result.status === 'stopped' && result.zeroCommandConfirmed === true
+              ? 'DUET confirmed zero velocity and requested carry/default arm return; physical immobility or pose attainment is not verified.'
+            : 'DUET stop was not confirmed.');
+        } else {
+          setIsRunning(false);
+          setRobotConnectionStatus(result.status === 'stopping' || result.status === 'stopped'
+            ? 'SDK stop requested.'
+            : 'Robot is not connected');
+        }
+      } catch (error) {
+        alert(`Stop failed: ${error.message}`);
+      }
     } else {
       try {
+        if (session?.user?.role !== 'teacher') {
+          throw new Error('A teacher must review and approve physical motion requests. Submit this exact program to the teacher queue for review.');
+        }
+        if (!isRobotConnected) {
+          throw new Error(controllerVersion === 'duet'
+            ? 'Connect the DUET G1 23-DOF controller before sending a program.'
+            : 'Connect the G1 SDK before sending a program.');
+        }
+        if (controllerVersion === 'duet') parseDuetProgram(generatedCode);
+        else parseG1Program(generatedCode);
+        const submittedCode = generatedCode;
+        if (!window.confirm(
+          `Teacher approval required: send this exact ${controllerVersion === 'duet' ? 'DUET v2' : 'legacy SDK'} program to the robot?\n\n${generatedCode}`,
+        )) return;
+        if (controllerVersion === 'duet') {
+          setLastSuccessfulDuetCode('');
+          setDuetMotionReviewConfirmed(false);
+        }
         setIsRunning(true);
-        const res = await fetch('/api/run', { method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({ code: generatedCode }) });
-        if (!res.ok) throw new Error("Server Error");
-      } catch (e) { setIsRunning(false); alert("Run Failed: " + e.message); }
+        const result = await activeRobotConnection.run(submittedCode);
+        let keepDuetRunLock = false;
+        if (
+          controllerVersion === 'duet'
+          && result.status === 'completed'
+          && !submittedCode.includes('duet.saved_motion(')
+        ) {
+          setLastSuccessfulDuetCode(submittedCode);
+        }
+        if (controllerVersion === 'duet' && result.status === 'accepted') {
+          duetProgramActiveRef.current = true;
+          setIsDuetProgramActive(true);
+          keepDuetRunLock = true;
+          setRobotConnectionStatus(`DUET accepted ${result.commandsExecuted} command(s); waiting for controller completion. Physical movement is not verified.`);
+        } else {
+          if (controllerVersion === 'duet') {
+            duetProgramActiveRef.current = false;
+            setIsDuetProgramActive(false);
+          }
+        }
+        const output = result.results?.length ? ` SDK output: ${JSON.stringify(result.results)}` : '';
+        const conditionOutput = result.conditionsEvaluated?.length
+          ? ` Condition branches: ${result.conditionsEvaluated.map((decision) => (
+            decision.variable
+              ? `${decision.variable} is ${decision.value} → ${decision.branch}`
+              : `${decision.clear ? `clear within ${decision.max_range_m} m` : `${decision.distance_m.toFixed(2)} m`} ${decision.operator} ${decision.threshold_m} m → ${decision.branch}`
+          )).join('; ')}.`
+          : '';
+        const safetyOutput = result.safetyInterventions?.length
+          ? ` Safe Mode: ${result.safetyInterventions.map((intervention) => (
+            `${intervention.command} ${intervention.status} (${intervention.reason})`
+          )).join('; ')}.`
+          : '';
+        if (!keepDuetRunLock) {
+          const controllerName = controllerVersion === 'duet' ? 'DUET' : 'SDK';
+          const accepted = controllerVersion === 'duet' ? 'accepted' : 'finished sending';
+          setRobotConnectionStatus(`${controllerName} ${accepted} ${result.commandsExecuted} command(s). Physical movement is not verified.${conditionOutput}${safetyOutput}${output}`);
+        }
+      } catch (error) {
+        alert(`Robot run failed: ${error.message}`);
+      } finally {
+        if (!duetProgramActiveRef.current) setIsRunning(false);
+      }
     }
   };
 
-  const challengeConfig = useMemo(
-    () => G1_EDU_23_ENV.challengeLayouts[simulatorChallenge] || G1_EDU_23_ENV.challengeLayouts['simple-path'],
-    [simulatorChallenge],
-  );
-  const activeObstacles = useMemo(
-    () => (currentUser.role === 'teacher'
-      ? challengeConfig.obstacles
-      : [...challengeConfig.obstacles, ...sceneObjects]),
-    [challengeConfig, currentUser.role, sceneObjects],
-  );
-
-  const previewPreviewState = useCallback(() => {
-    const state = simulateG1Edu23Program(generatedCode, {
-      mode: simulatorMode,
-      obstacles: activeObstacles,
-      challenge: challengeConfig,
-    });
-    setSimulatorState(state);
-  }, [generatedCode, simulatorMode, challengeConfig, activeObstacles]);
+  const activeObstacles = useMemo(() => sceneObjects, [sceneObjects]);
+  const queueReviewSnapshot = queueReviewItem?.project_snapshot || {};
+  const queueReviewPlannerRequest = queueReviewItem?.planner_request;
+  const queueReviewWaypoints = queueReviewPlannerRequest?.planner_waypoints
+    || queueReviewSnapshot.plannerWaypoints
+    || [];
 
   useEffect(() => {
-    if (!isPreviewPlaying) return;
-    const interval = setInterval(() => {
-      previewPreviewState();
-    }, 700);
-    return () => clearInterval(interval);
-  }, [isPreviewPlaying, previewPreviewState]);
+    const operationId = queueReviewNavigationOperation?.operation_id;
+    if (!operationId) return undefined;
+    let active = true;
+    let timer;
+    const pollOperation = async () => {
+      try {
+        const operation = await apiFetch(`/api/navigation/operation/${operationId}`);
+        if (!active) return;
+        setQueueReviewNavigationOperation(operation);
+        if (operation.saved_project) setQueueReviewSavedProject(operation.saved_project);
+        if (['completed', 'succeeded', 'canceled', 'failed'].includes(operation.status)) {
+          window.clearInterval(timer);
+          const completed = ['completed', 'succeeded'].includes(operation.status);
+          const queueStatus = completed ? 'completed' : operation.status === 'canceled' ? 'paused' : 'failed';
+          setQueueReviewStatus(completed
+            ? operation.saved_project
+              ? `Autonomous request completed and saved as ${operation.saved_project.name}. Physical movement is not independently verified.`
+              : operation.saved_project_error
+                ? `Autonomous request completed, but its project could not be saved • ${operation.saved_project_error}`
+                : 'Autonomous request completed. Physical movement is not independently verified.'
+            : `Autonomous request ${operation.status}.`);
+          setQueueReviewItem((item) => item?.id === operation.route?.queue_item_id
+            ? { ...item, status: queueStatus }
+            : item);
+          const items = await refreshClassroomData();
+          const item = items.find((entry) => entry.id === operation.route?.queue_item_id);
+          if (item) setQueueReviewItem(item);
+          if (item?.result_project) setQueueReviewSavedProject(item.result_project);
+        }
+      } catch (error) {
+        if (active) setQueueReviewError(`Could not refresh operation status • ${error.message}`);
+      }
+    };
+    pollOperation();
+    timer = window.setInterval(pollOperation, 1500);
+    return () => {
+      active = false;
+      window.clearInterval(timer);
+    };
+  }, [queueReviewNavigationOperation?.operation_id, apiFetch, refreshClassroomData]);
+
+  const previewPreviewState = useCallback(() => {
+    try {
+      const state = controllerVersion === 'duet'
+        ? simulateDuetG1Edu23Program(generatedCode, { obstacles: activeObstacles }).at(-1)
+        : simulateG1Edu23Program(generatedCode, {
+          mode: simulatorMode,
+          obstacles: activeObstacles,
+        });
+      setSimulatorState(state);
+    } catch (error) {
+      setSimulatorState({
+        ...createEmptyG1Edu23State(),
+        status: `Invalid ${controllerVersion === 'duet' ? 'DUET' : 'G1'} program`,
+        actions: [{ label: 'Preview rejected', summary: error.message }],
+        mode: controllerVersion === 'duet' ? 'duet-preview' : simulatorMode,
+      });
+    }
+  }, [controllerVersion, generatedCode, simulatorMode, activeObstacles]);
+
+  const previewRecordedArmMotion = (recording) => {
+    try {
+      buildG1RecordedMotionFrames(recording);
+      setRecordedMotionPreview(recording);
+      setPlaybackProgress(0);
+      setIsPreviewPlaying(true);
+      setShowAppSettings(false);
+    } catch (error) {
+      alert(`Recorded motion cannot be previewed: ${error.message}`);
+    }
+  };
 
   const startSimulationPreview = () => {
-    if (!generatedCode.trim()) {
+    if (!recordedMotionPreview && !generatedCode.trim()) {
       alert('Add some robot commands before starting the simulation preview.');
       return;
     }
+    setPlaybackProgress((progress) => progress >= 1 ? 0 : progress);
     setIsPreviewPlaying(true);
-    previewPreviewState();
+    if (!recordedMotionPreview) previewPreviewState();
   };
 
   const pauseSimulationPreview = () => {
     setIsPreviewPlaying(false);
-    setSimulatorState(simulateG1Edu23Program(generatedCode, {
-      mode: simulatorMode,
-      obstacles: activeObstacles,
-      challenge: challengeConfig,
-    }));
+  };
+
+  const resetSimulationPreview = () => {
+    setIsPreviewPlaying(false);
+    setPlaybackProgress(0);
+  };
+
+  const handleRunSimulation = () => {
+    if (!generatedCode.trim()) {
+      alert('Add code or blocks before running the simulation.');
+      return;
+    }
+    setRecordedMotionPreview(null);
+    setPlaybackProgress(0);
+    setIsPreviewPlaying(true);
+    setIsWaypointPlacementEnabled(false);
+  };
+
+  const handlePlaybackSpeedChange = (value) => {
+    const numericValue = Number(value);
+    if (!Number.isFinite(numericValue)) return;
+    setPlaybackSpeed(Math.min(3, Math.max(0.1, Math.round(numericValue * 10) / 10)));
   };
 
   const syncBlocksFromGeneratedCode = useCallback((code) => {
-    if (!workspaceRef.current || !window.Blockly) return;
+    if (!workspaceRef.current || !window.Blockly) return false;
     const workspace = workspaceRef.current;
-    workspace.clear();
-
-    const lines = (code || '').split(/\n+/).map((line) => line.trim()).filter(Boolean);
-    if (!lines.length) return;
-
-    let previousBlock = null;
-
-    lines.forEach((line) => {
-      const match = line.match(/^robot\.(\w+)\((.*)\);?$/);
-      const blockTypeMap = {
-        stand: 'robot_stand',
-        walk: 'robot_walk_forward',
-        walkForward: 'robot_walk_forward',
-        walkForwardSteps: 'robot_walk_forward_steps',
-        backward: 'robot_walk_back',
-        walkBackward: 'robot_walk_back',
-        walkBackwardSteps: 'robot_walk_back_steps',
-        sidestep: 'robot_walk_sideways_left',
-        walkSidewaysLeft: 'robot_walk_sideways_left',
-        walkSidewaysLeftSteps: 'robot_walk_sideways_left_steps',
-        walkSidewaysRight: 'robot_walk_sideways_right',
-        walkSidewaysRightSteps: 'robot_walk_sideways_right_steps',
-        turn: 'robot_turn_left',
-        turnLeft: 'robot_turn_left',
-        turnRight: 'robot_turn_right',
-        wait: 'robot_wait',
-        waitSeconds: 'robot_wait_seconds',
-        repeatLoop: 'robot_repeat_loop',
-        stop: 'robot_stop',
-        sit: 'robot_sit',
-        waveLeft: 'robot_wave_left',
-        waveRight: 'robot_wave_right',
-        raiseBothArms: 'robot_raise_both_arms',
-        lowerBothArms: 'robot_lower_both_arms',
-        raiseLeftArm: 'robot_raise_left_arm',
-        raiseRightArm: 'robot_raise_right_arm',
-        raiseLeftLeg: 'robot_left_leg_kick',
-        raiseRightLeg: 'robot_right_leg_kick',
-        raiseLeftKnee: 'robot_raise_left_knee',
-        raiseRightKnee: 'robot_raise_right_knee',
-        kick: 'robot_kick',
-      };
-
-      let blockType = 'raw_code';
-      let data = line;
-      let blockValues = {};
-
-      if (match) {
-        const methodName = match[1];
-        const argsRaw = match[2] || '';
-        blockType = blockTypeMap[methodName] || 'raw_code';
-
-        if (['walk', 'walkForward', 'walkBackward', 'walkSidewaysLeft', 'walkSidewaysRight', 'backward', 'sidestep'].includes(methodName)) {
-          const numberMatch = argsRaw.match(/-?\d*\.?\d+/);
-          const safeSpeed = clampSafeValue('SPEED', numberMatch ? numberMatch[0] : 1);
-          blockValues = { SPEED: safeSpeed };
-        }
-        if (['walkForwardSteps', 'walkBackwardSteps', 'walkSidewaysLeftSteps', 'walkSidewaysRightSteps', 'repeatLoop'].includes(methodName)) {
-          const numberMatch = argsRaw.match(/-?\d*\.?\d+/);
-          const safeSteps = clampSafeValue('STEPS', numberMatch ? numberMatch[0] : 3);
-          blockValues = { STEPS: safeSteps, TIMES: safeSteps };
-        }
-        if (['turn', 'turnLeft', 'turnRight'].includes(methodName)) {
-          if (methodName === 'turn') {
-            const turnArgs = argsRaw.match(/"(.*?)"\s*,\s*(\d+(?:\.\d+)?)/) || argsRaw.match(/'(.*?)'\s*,\s*(\d+(?:\.\d+)?)/);
-            if (turnArgs) {
-              const direction = (turnArgs[1] || 'left').toLowerCase();
-              const safeAngle = clampSafeValue('ANGLE', turnArgs[2]);
-              blockValues = { ANGLE: safeAngle, DIR: direction === 'right' ? 'right' : 'left' };
-              if (direction === 'right') {
-                blockType = 'robot_turn_right';
-              } else {
-                blockType = 'robot_turn_left';
-              }
+    let nodes;
+    try {
+      nodes = controllerVersion === 'duet'
+        ? parseDuetProgram(code || '')
+        : parseG1Program(code || '');
+    } catch (error) {
+      setBlockSyncError(`Cannot display this code as Blocks: ${error.message}`);
+      return false;
+    }
+    setBlockSyncError('');
+    Blockly.Events.disable();
+    try {
+      workspace.clear();
+      const createBlocks = (program, parentConnection = null) => {
+        let previousBlock = null;
+        program.forEach((node) => {
+          let block;
+          if (node.type === 'repeat') {
+            block = workspace.newBlock('controls_repeat_ext');
+          } else if (node.type === 'concurrent') {
+            block = workspace.newBlock('duet_concurrent_action');
+          } else if (node.type === 'condition') {
+            block = workspace.newBlock('controls_if');
+            if (node.else.length) {
+              const mutation = document.createElement('mutation');
+              mutation.setAttribute('else', '1');
+              block.domToMutation(mutation);
             }
+          } else if (node.type === 'boolean_assignment') {
+            block = workspace.newBlock('variables_set');
           } else {
-            const numberMatch = argsRaw.match(/-?\d*\.?\d+/);
-            blockValues = { ANGLE: clampSafeValue('ANGLE', numberMatch ? numberMatch[0] : 90) };
+            block = controllerVersion === 'duet'
+              ? workspace.newBlock(`duet_command_${node.method}`)
+              : workspace.newBlock(node.method === 'shared_motion'
+                ? `g1_shared_motion_${node.values[0]}`
+                : node.method === 'arm_action'
+                  ? getG1BlocklyCommandBlocks().find((definition) => definition.armPreset === node.values[0])?.type || 'g1_command_arm_action'
+                  : `g1_command_${node.method}`);
           }
-        }
-        if (['raiseLeftArm', 'raiseRightArm', 'raiseLeftLeg', 'raiseRightLeg'].includes(methodName)) {
-          const quoted = argsRaw.match(/"(.*?)"/) || argsRaw.match(/'(.*?)'/);
-          const degreeMatch = argsRaw.match(/-?\d*\.?\d+/);
-          blockValues = {
-            POSITION: quoted ? quoted[1].toLowerCase() : 'mid',
-            DEGREES: clampSafeValue('DEGREES', degreeMatch ? degreeMatch[0] : 90),
-          };
-        }
-        if (['wait', 'waitSeconds'].includes(methodName)) {
-          const numberMatch = argsRaw.match(/-?\d*\.?\d+/);
-          blockValues = { SECONDS: clampSafeValue('SECONDS', numberMatch ? numberMatch[0] : 0.5) };
-        }
-        if (methodName === 'kick') {
-          const kickArgs = argsRaw.match(/"(.*?)"/) || argsRaw.match(/'(.*?)'/);
-          if (kickArgs) {
-            blockValues = { LEVEL: kickArgs[1].toLowerCase() };
+          if (node.type === 'repeat') {
+            const repeatCount = workspace.newBlock('math_number');
+            repeatCount.setFieldValue(String(node.times), 'NUM');
+            repeatCount.initSvg();
+            repeatCount.render();
+            block.getInput('TIMES').connection.connect(repeatCount.outputConnection);
+          } else if (node.type === 'condition') {
+            if (node.variable) {
+              const variableMap = workspace.getVariableMap();
+              const variable = variableMap.getVariable(node.variable) || variableMap.createVariable(node.variable);
+              const variableBlock = workspace.newBlock('variables_get');
+              variableBlock.setFieldValue(variable.getId(), 'VAR');
+              variableBlock.initSvg();
+              variableBlock.render();
+              block.getInput('IF0').connection.connect(variableBlock.outputConnection);
+            } else {
+              const comparison = workspace.newBlock('logic_compare');
+              const distancePrefix = controllerVersion === 'duet' ? 'duet_' : 'g1_';
+              const distance = workspace.newBlock(`${distancePrefix}${node.sensor}`);
+              const threshold = workspace.newBlock('math_number');
+              const operatorFields = { '<': 'LT', '<=': 'LTE', '>': 'GT', '>=': 'GTE', '==': 'EQ', '!=': 'NEQ' };
+              comparison.setFieldValue(operatorFields[node.operator], 'OP');
+              threshold.setFieldValue(String(node.threshold), 'NUM');
+              [distance, threshold, comparison].forEach((conditionBlock) => {
+                conditionBlock.initSvg();
+                conditionBlock.render();
+              });
+              comparison.getInput('A').connection.connect(distance.outputConnection);
+              comparison.getInput('B').connection.connect(threshold.outputConnection);
+              block.getInput('IF0').connection.connect(comparison.outputConnection);
+            }
+          } else if (node.type === 'boolean_assignment') {
+            const variableMap = workspace.getVariableMap();
+            const variable = variableMap.getVariable(node.name) || variableMap.createVariable(node.name);
+            const valueBlock = workspace.newBlock('logic_boolean');
+            valueBlock.setFieldValue(node.value ? 'TRUE' : 'FALSE', 'BOOL');
+            valueBlock.initSvg();
+            valueBlock.render();
+            block.setFieldValue(variable.getId(), 'VAR');
+            block.getInput('VALUE').connection.connect(valueBlock.outputConnection);
+          } else if (node.type === 'command') {
+            const definition = (controllerVersion === 'duet' ? DUET_COMMANDS : G1_COMMANDS)
+              .find((entry) => entry.method === node.method);
+            definition?.args.forEach((argument, index) => {
+              const valueIndex = node.poseName && definition.poseInput ? index - 1 : index;
+              if (block.getField(argument.name) && node.values[valueIndex] !== undefined) {
+                block.setFieldValue(String(node.values[valueIndex]), argument.name);
+              }
+            });
           }
-        }
+          block.initSvg();
+          block.render();
+          if (node.type === 'command' && node.poseName) {
+            const poseBlock = workspace.newBlock(`duet_pose_target_${node.poseName}`);
+            poseBlock.initSvg();
+            poseBlock.render();
+            block.getInput('POSE').connection.connect(poseBlock.outputConnection);
+          }
+          if (previousBlock) previousBlock.nextConnection.connect(block.previousConnection);
+          else if (parentConnection) parentConnection.connect(block.previousConnection);
+          if (node.type === 'repeat') createBlocks(node.body, block.getInput('DO').connection);
+          if (node.type === 'concurrent') {
+            createBlocks([node.movement], block.getInput('LOCOMOTION').connection);
+            createBlocks([node.gesture], block.getInput('GESTURE').connection);
+          }
+          if (node.type === 'condition') {
+            createBlocks(node.then, block.getInput('DO0').connection);
+            if (node.else.length) createBlocks(node.else, block.getInput('ELSE').connection);
+          }
+          previousBlock = block;
+        });
+      };
+      createBlocks(nodes);
 
-        if (blockType !== 'raw_code') {
-          data = null;
-        }
+      if (workspace.getAllBlocks().length) {
+        workspace.zoomToFit();
+        workspace.setScale(Math.min(workspace.getScale(), 0.8));
+        workspace.scrollCenter();
       }
+      return true;
+    } catch (error) {
+      setBlockSyncError(`Cannot display this code as Blocks: ${error.message}`);
+      console.error('Failed to synchronize IDE code to Blockly.', error);
+      return false;
+    } finally {
+      Blockly.Events.enable();
+    }
+  }, [controllerVersion]);
+  syncBlocksFromGeneratedCodeRef.current = syncBlocksFromGeneratedCode;
 
-      const block = workspace.newBlock(blockType);
-      if (data) {
-        block.data = data;
-      }
-      Object.entries(blockValues).forEach(([key, value]) => {
-        if (typeof value === 'string' || typeof value === 'number') {
-          block.setFieldValue(String(value), key);
-        }
+  useEffect(() => {
+    if (mainTab !== 'blocks' || toolPanelCollapsed || !workspaceRef.current) return;
+    let fitFrame = 0;
+    const frame = requestAnimationFrame(() => {
+      if (!workspaceRef.current || toolPanelCollapsed) return;
+      Blockly.svgResize(workspaceRef.current);
+      fitFrame = requestAnimationFrame(() => {
+        if (!workspaceRef.current || toolPanelCollapsed) return;
+        syncBlocksFromGeneratedCode(generatedCodeRef.current);
+        Blockly.svgResize(workspaceRef.current);
       });
+    });
+    return () => {
+      cancelAnimationFrame(frame);
+      cancelAnimationFrame(fitFrame);
+    };
+  }, [mainTab, syncBlocksFromGeneratedCode, toolPanelCollapsed]);
 
-      if (previousBlock) {
-        previousBlock.nextConnection.connect(block.previousConnection);
+  const derivePlannerWaypointsFromCode = useCallback((code = '') => {
+    if (!code || !code.trim()) return [];
+    let commands;
+    try {
+      commands = flattenG1Commands(parseG1Program(code));
+    } catch {
+      return [];
+    }
+    if (!commands.length) return [];
+    let x = 0;
+    let y = 0;
+    let heading = 0;
+    const points = [{ id: 'planner-0', x, y }];
+    commands.forEach(({ method, values }) => {
+      const numberOfSteps = Number(values[0] || 0);
+      let forwardDistance = 0;
+      let moved = false;
+      if (method === 'walk') forwardDistance = numberOfSteps * G1_NOMINAL_STEP_METERS;
+      if (method === 'backward') forwardDistance = -numberOfSteps * G1_NOMINAL_STEP_METERS;
+      if (method === 'walktime') forwardDistance = numberOfSteps * 0.4;
+      if (method === 'backwardtime') forwardDistance = -numberOfSteps * 0.4;
+      if (method === 'slowwalk') forwardDistance = numberOfSteps * G1_NOMINAL_STEP_METERS;
+      if (method === 'slowwalktime') forwardDistance = numberOfSteps * 0.2;
+      if (method === 'fastwalk') forwardDistance = numberOfSteps * G1_NOMINAL_STEP_METERS;
+      if (method === 'fastwalktime') forwardDistance = numberOfSteps * 0.8;
+      if (method === 'sidestep') {
+        const sideHeading = heading + (values[0] === 'left' ? 90 : -90);
+        const lateralDistance = G1_NOMINAL_STEP_METERS * Number(values[1] || 1);
+        x += Math.cos((sideHeading * Math.PI) / 180) * lateralDistance;
+        y += Math.sin((sideHeading * Math.PI) / 180) * lateralDistance;
+        moved = true;
+      } else if (method === 'turn') {
+        heading += values[0] === 'right' ? -Number(values[1]) : Number(values[1]);
+      } else if (method === 'turn_around_180') {
+        heading += 180;
+      } else if (forwardDistance) {
+        x += Math.cos((heading * Math.PI) / 180) * forwardDistance;
+        y += Math.sin((heading * Math.PI) / 180) * forwardDistance;
+        moved = true;
       }
-      block.initSvg();
-      block.render();
-      previousBlock = block;
+      if (moved) {
+        points.push({ id: `planner-${points.length}`, x: Number(x.toFixed(2)), y: Number(y.toFixed(2)) });
+      }
     });
 
-    if (workspace.getAllBlocks().length) {
-      workspace.centerOnBlocks();
+    if (points.length < 2) {
+      return [{ id: 'planner-1', x: 0, y: 0 }];
     }
+
+    return points;
   }, []);
 
-  const updateGeneratedCode = useCallback((nextCode) => {
-    const result = sanitizeRobotCode(nextCode);
-    const safeCode = result.code || nextCode;
+  useEffect(() => {
+    const isCompiledPlannerPath = compiledPlannerCodeRef.current === generatedCode;
+    compiledPlannerCodeRef.current = null;
+    if (!isCompiledPlannerPath) {
+      const nextWaypoints = derivePlannerWaypointsFromCode(generatedCode);
+      setPlannerWaypoints((previousWaypoints) => {
+        const previousSnapshot = JSON.stringify(previousWaypoints);
+        const nextSnapshot = JSON.stringify(nextWaypoints);
+        return previousSnapshot === nextSnapshot ? previousWaypoints : nextWaypoints;
+      });
+    }
+    setPlaybackProgress(0);
+    setIsPreviewPlaying(false);
+  }, [generatedCode, derivePlannerWaypointsFromCode]);
+
+  const applyGeneratedCode = useCallback((nextCode, options = {}) => {
+    const { syncBlocks = true, preserveFormatting = false } = options;
+    const cleanedCode = stripPlannerProjectMeta(nextCode ?? '');
+    let boundedCode = cleanedCode;
+    let boundsChanged = false;
+    if (!preserveFormatting && cleanedCode.trim()) {
+      try {
+        boundedCode = controllerVersion === 'duet'
+          ? formatDuetProgram(parseDuetProgram(cleanedCode))
+          : formatG1Program(parseG1Program(cleanedCode));
+        boundsChanged = boundedCode.trim() !== cleanedCode.trim();
+      } catch {
+        // Keep in-progress IDE edits intact; execution validates the complete program.
+      }
+    }
+    const result = controllerVersion === 'duet'
+      ? { code: boundedCode, changed: false }
+      : sanitizeRobotCode(boundedCode);
+    const safeCode = result.code || boundedCode;
+    generatedCodeRef.current = safeCode;
+    codeByVersionRef.current[controllerVersion] = safeCode;
     setGeneratedCode(safeCode);
-    setSafetyNotice(result.changed ? 'One or more values were adjusted to the safe range.' : '');
-    if (workspaceRef.current && window.Blockly) {
+    setSafetyNotice(result.changed || boundsChanged ? 'Commands were normalized to the shared syntax and safe ranges.' : '');
+    if (syncBlocks && workspaceRef.current && window.Blockly) {
       syncBlocksFromGeneratedCode(safeCode);
     }
-  }, [syncBlocksFromGeneratedCode]);
+  }, [controllerVersion, syncBlocksFromGeneratedCode]);
+  applyGeneratedCodeRef.current = applyGeneratedCode;
+
+  const updateGeneratedCode = useCallback((nextCode) => {
+    applyGeneratedCode(nextCode, { syncBlocks: true });
+  }, [applyGeneratedCode]);
+
+  const applyMotionPromptResult = (promptText, source) => {
+    let result = controllerVersion === 'duet'
+      ? compileDuetMotionPrompt(promptText)
+      : compileMotionPrompt(promptText);
+    if (
+      controllerVersion === 'duet'
+      && duetMotionMode === 'follow'
+      && result.code
+      && /duet\.(?:arm_|wave_|raise_|gesture_|hold_pose)/.test(result.code)
+      && !/(?:duet\.(?:reset_arms|stop)\(\))\s*$/.test(result.code)
+    ) {
+      const code = `${result.code}\nduet.reset_arms()`;
+      parseDuetProgram(code);
+      result = {
+        ...result,
+        code,
+        steps: [...result.steps, {
+          label: 'Return arms to carry',
+          code: 'duet.reset_arms()',
+          detail: 'End the reusable sequence in the approved carry pose.',
+        }],
+      };
+    }
+    const adjustedResult = controllerVersion === 'duet' && duetMotionMode === 'follow'
+      ? {
+        ...result,
+        summary: result.code
+          ? `${result.summary} Review and run this series, then save it as one named DUET command.`
+          : result.summary,
+      }
+      : result;
+    setMotionPromptResult({ ...adjustedResult, source });
+    if (adjustedResult.code) updateGeneratedCode(adjustedResult.code);
+  };
+
+  const generateMotionFromPrompt = async (useHuggingFace = false) => {
+    if (generatedCode.trim() && !window.confirm('Generating this motion will replace the current Blocks and IDE code. Continue?')) return;
+    const useRemoteGenerator = useHuggingFace && controllerVersion !== 'duet';
+    setMotionPromptStatus(useRemoteGenerator ? 'loading' : 'local');
+    if (!useRemoteGenerator) {
+      applyMotionPromptResult(
+        motionPrompt,
+        controllerVersion === 'duet' ? 'Local DUET command compiler' : 'Local safe compiler',
+      );
+      return;
+    }
+
+    try {
+      const response = await apiFetch('/api/hf/text-to-motion', {
+        method: 'POST',
+        body: JSON.stringify({ prompt: motionPrompt }),
+      });
+      setMotionPrompt(response.text);
+      applyMotionPromptResult(response.text, `Hugging Face: ${response.model}`);
+      setMotionPromptStatus('hf');
+    } catch (error) {
+      applyMotionPromptResult(motionPrompt, 'Local fallback');
+      setMotionPromptStatus('fallback');
+      setVisionMotionStatus(`Remote prompt generation failed; the local safe compiler was used. ${error.message}`);
+    }
+  };
+
+  const installVisionMotionDraft = (result, source) => {
+    const parsed = parseDuetProgram(result.code);
+    updateGeneratedCode(formatDuetProgram(parsed));
+    setMotionPromptResult({
+      code: result.code,
+      steps: result.code.split('\n').map((code, index) => ({
+        code,
+        label: `Observed DUET action ${index + 1}`,
+      })),
+      unknown: [],
+      source,
+      summary: `${result.summary} ${duetMotionMode === 'follow'
+        ? 'Review and run this series, then save it as one named DUET command.'
+        : 'Edit or run the approved catalog commands as needed.'}`,
+    });
+    setVisionMotionStatus(result.summary);
+    setLastSuccessfulDuetCode('');
+    setDuetMotionReviewConfirmed(false);
+  };
+
+  const analyzeVisionMotion = async (useUploadedVideo) => {
+    if (session?.user?.role !== 'teacher') {
+      setVisionMotionStatus('A teacher must launch vision motion analysis.');
+      return;
+    }
+    if (generatedCode.trim() && !window.confirm('Vision motion generation will replace the current Blocks and IDE code. Continue?')) {
+      return;
+    }
+    setIsVisionMotionAnalyzing(true);
+    setVisionMotionProgress(0);
+    setVisionMotionStatus('Loading local pose estimation and analyzing arm movement…');
+    try {
+      const progress = (value) => setVisionMotionProgress(value);
+      const result = useUploadedVideo
+        ? await analyzeDuetVideo(motionVideoRef.current, progress)
+        : await captureDuetLiveMotion(
+          cameraInputSource === 'device'
+            ? deviceCameraVideoRef.current
+            : robotCameraCanvasRef.current,
+          5,
+          progress,
+        );
+      const instruction = visionMotionPrompt.trim()
+        ? compileDuetMotionPrompt(visionMotionPrompt)
+        : null;
+      if (instruction?.unknown.length) {
+        throw new Error(instruction.unknown.join(' '));
+      }
+      const poseCode = duetMotionMode === 'follow'
+        ? `${result.code}\nduet.reset_arms()`
+        : result.code;
+      const code = [instruction?.code, poseCode].filter(Boolean).join('\n');
+      parseDuetProgram(code);
+      installVisionMotionDraft({
+        ...result,
+        code,
+        summary: `${result.summary}${instruction?.code ? ' Added the approved prompt instruction.' : ''}`,
+      }, 'Local browser pose estimation');
+    } catch (error) {
+      setVisionMotionStatus(`Vision motion analysis failed: ${error.message}`);
+    } finally {
+      setIsVisionMotionAnalyzing(false);
+      setVisionMotionProgress(0);
+    }
+  };
 
   const insertRobotCommand = (snippet) => {
     const nextCode = generatedCode ? `${generatedCode.trimEnd()}\n${snippet}\n` : `${snippet}\n`;
     updateGeneratedCode(nextCode);
   };
 
+  const canSaveSuccessfulDuetMotion = () => (
+    currentUser.role === 'teacher'
+    && Boolean(lastSuccessfulDuetCode)
+    && (
+      lastSuccessfulDuetCode === generatedCode
+      || (
+        queueReviewItem?.controller_version === 'duet'
+        && queueReviewItem.code === lastSuccessfulDuetCode
+      )
+    )
+  );
+
+  const saveSuccessfulDuetMotion = async () => {
+    if (
+      !canSaveSuccessfulDuetMotion()
+      || !duetMotionReviewConfirmed
+    ) {
+      setDuetMotionSaveError('Review a successfully completed DUET run before saving it.');
+      return;
+    }
+    setDuetMotionSaveBusy(true);
+    setDuetMotionSaveError('');
+    try {
+      const response = await apiFetch('/api/duet/motions', {
+        method: 'POST',
+        body: JSON.stringify({ name: duetMotionSaveName, code: lastSuccessfulDuetCode }),
+      });
+      setSavedDuetMotions((motions) => [...motions, response.motion]);
+      setDuetMotionSaveName('');
+      setDuetMotionReviewConfirmed(false);
+      setLastSuccessfulDuetCode('');
+      if (controllerVersion === 'duet') {
+        updateGeneratedCode(`duet.saved_motion(${JSON.stringify(response.motion.id)})`);
+      }
+      setVisionMotionStatus(controllerVersion === 'duet'
+        ? `Saved "${response.motion.name}" as a reusable DUET command.`
+        : `Saved "${response.motion.name}" to the DUET library. The legacy SDK workspace was left unchanged.`);
+    } catch (error) {
+      setDuetMotionSaveError(error.message);
+    } finally {
+      setDuetMotionSaveBusy(false);
+    }
+  };
+
+  const renderDuetMotionSaveForm = () => {
+    if (!canSaveSuccessfulDuetMotion()) return null;
+    return (
+      <div className="space-y-2 border-t border-slate-700 pt-2">
+        <label className="flex items-start gap-2 text-[10px] leading-4 text-slate-300">
+          <input
+            type="checkbox"
+            checked={duetMotionReviewConfirmed}
+            onChange={(event) => setDuetMotionReviewConfirmed(event.target.checked)}
+            className="mt-0.5"
+          />
+          I reviewed the completed motion and it matched the intended result.
+        </label>
+        <div className="flex gap-2">
+          <input
+            aria-label="Name the successful DUET motion"
+            value={duetMotionSaveName}
+            onChange={(event) => setDuetMotionSaveName(event.target.value)}
+            maxLength={40}
+            placeholder="Name this command"
+            className="min-w-0 flex-1 rounded-md border border-slate-700 bg-slate-950 px-2 py-1.5 text-xs text-slate-100"
+          />
+          <button
+            type="button"
+            onClick={saveSuccessfulDuetMotion}
+            disabled={!duetMotionReviewConfirmed || !duetMotionSaveName.trim() || duetMotionSaveBusy}
+            className="rounded-md bg-cyan-600 px-2.5 py-1.5 text-[10px] font-semibold text-white disabled:opacity-50"
+          >
+            {duetMotionSaveBusy ? 'Saving…' : 'Save command'}
+          </button>
+        </div>
+        {duetMotionSaveError && <p role="alert" className="text-[10px] text-amber-300">{duetMotionSaveError}</p>}
+      </div>
+    );
+  };
+
+  const insertSavedDuetMotion = (motion) => {
+    insertRobotCommand(`duet.saved_motion(${JSON.stringify(motion.id)})`);
+  };
+
+  const renderDuetMotionLibrary = () => (
+    <section className="space-y-2 rounded-xl border border-cyan-400/20 bg-slate-900 p-3">
+      <div className="flex items-center justify-between gap-2">
+        <p className="text-[10px] font-semibold uppercase tracking-[0.16em] text-cyan-200">Saved DUET commands</p>
+        <span className="text-[10px] text-slate-500">{savedDuetMotions.length}/50</span>
+      </div>
+      {savedDuetMotions.length ? (
+        <ul className="space-y-1.5">
+          {savedDuetMotions.map((motion) => (
+            <li key={motion.id} className="flex items-center justify-between gap-2 rounded-md bg-slate-800 px-2 py-1.5">
+              <span className="min-w-0 truncate text-xs text-slate-200">{motion.name}</span>
+              <button
+                type="button"
+                onClick={() => insertSavedDuetMotion(motion)}
+                className="shrink-0 text-[10px] font-semibold text-cyan-300 hover:text-cyan-200"
+              >
+                Insert command
+              </button>
+            </li>
+          ))}
+        </ul>
+      ) : (
+        <p className="text-[10px] text-slate-400">Run and review a supported motion to save a reusable command.</p>
+      )}
+      {renderDuetMotionSaveForm()}
+    </section>
+  );
+
+  const renderDuetMotionModeSelector = () => (
+    <div className="space-y-2 rounded-xl border border-cyan-400/20 bg-cyan-950/20 p-3">
+      <p className="text-[10px] font-semibold uppercase tracking-[0.16em] text-cyan-200">DUET motion mode</p>
+      <div className="grid grid-cols-2 gap-2">
+        <button
+          type="button"
+          aria-pressed={duetMotionMode === 'library'}
+          onClick={() => setDuetMotionMode('library')}
+          className={`rounded-md px-2 py-2 text-[10px] font-semibold ${duetMotionMode === 'library' ? 'bg-cyan-500 text-slate-950' : 'bg-slate-800 text-slate-200'}`}
+        >
+          DUET library
+        </button>
+        <button
+          type="button"
+          aria-pressed={duetMotionMode === 'follow'}
+          onClick={() => setDuetMotionMode('follow')}
+          className={`rounded-md px-2 py-2 text-[10px] font-semibold ${duetMotionMode === 'follow' ? 'bg-cyan-500 text-slate-950' : 'bg-slate-800 text-slate-200'}`}
+        >
+          Follow and save
+        </button>
+      </div>
+      <p className="text-[10px] leading-4 text-slate-300">
+        {duetMotionMode === 'library'
+          ? 'Generate only approved DUET commands. Review the preview before the normal teacher run.'
+          : 'Create a bounded motion series, review and run it, then save it as one named DUET command.'}
+      </p>
+    </div>
+  );
+
+  const saveDuetArmMotion = () => {
+    try {
+      const motion = validateDuetArmMotion(duetArmMotionName, generatedCode);
+      if (savedDuetArmMotions.some(({ name }) => name.toLocaleLowerCase() === motion.name.toLocaleLowerCase())) {
+        throw new Error(`A saved sequence named "${motion.name}" already exists.`);
+      }
+      if (savedDuetArmMotions.length >= MAX_SAVED_DUET_ARM_MOTIONS) {
+        throw new Error(`The saved arm sequence library is limited to ${MAX_SAVED_DUET_ARM_MOTIONS} items.`);
+      }
+      const nextMotions = [...savedDuetArmMotions, motion];
+      localStorage.setItem(duetArmMotionsKey, JSON.stringify(nextMotions));
+      setSavedDuetArmMotions(nextMotions);
+      setDuetArmMotionName('');
+      setDuetArmMotionError('');
+    } catch (error) {
+      setDuetArmMotionError(error.message);
+    }
+  };
+
+  const insertSavedDuetArmMotion = (motion) => {
+    try {
+      const currentProgram = generatedCode.trim()
+        ? formatDuetProgram(parseDuetProgram(generatedCode))
+        : '';
+      const combinedCode = [currentProgram, motion.code].filter(Boolean).join('\n');
+      const normalizedCode = formatDuetProgram(parseDuetProgram(combinedCode));
+      applyGeneratedCode(normalizedCode);
+      setDuetArmMotionError('');
+    } catch (error) {
+      setDuetArmMotionError(`Could not insert "${motion.name}": ${error.message}`);
+    }
+  };
+
+  const deleteSavedDuetArmMotion = (motionName) => {
+    try {
+      const nextMotions = savedDuetArmMotions.filter(({ name }) => name !== motionName);
+      localStorage.setItem(duetArmMotionsKey, JSON.stringify(nextMotions));
+      setSavedDuetArmMotions(nextMotions);
+      setDuetArmMotionError('');
+    } catch (error) {
+      setDuetArmMotionError(`Could not delete "${motionName}": ${error.message}`);
+    }
+  };
+
+  const clearSavedDuetArmMotions = () => {
+    if (!window.confirm('Clear all saved DUET arm sequences for this user in this browser?')) return;
+    try {
+      localStorage.removeItem(duetArmMotionsKey);
+      setSavedDuetArmMotions([]);
+      setDuetArmMotionError('');
+    } catch (error) {
+      setDuetArmMotionError(`Could not clear saved DUET arm sequences: ${error.message}`);
+    }
+  };
+
   const handleRecordMotionCapture = () => {
-    const sampleScript = [
-      'robot.stand();',
-      'robot.wait(0.5);',
-      'robot.walkForward(3);',
-      'robot.wait(0.5);',
-      'robot.turnLeft(90);',
-      'robot.walkForward(2);',
-      'robot.stand();',
-      'console.log("Program complete!");',
-    ].join('\n');
+    const sampleScript = controllerVersion === 'duet'
+      ? [
+        'duet.move(0.15, 0, 0, 1)',
+        'duet.move(0, 0, 0.25, 1)',
+      ].join('\n')
+      : [
+        'robot.stand()',
+        'robot.walk(3)',
+        'robot.turn("left", 90)',
+        'robot.walk(2)',
+        'robot.stand()',
+      ].join('\n');
 
     if (generatedCode && generatedCode.trim()) {
-      const confirmed = window.confirm('Recording motion capture will overwrite the current blocks and IDE code. Continue?');
+      const confirmed = window.confirm('Inserting the example program will overwrite the current blocks and IDE code. Continue?');
       if (!confirmed) return;
     }
 
@@ -1504,97 +5276,235 @@ export default function App() {
   };
 
   useEffect(() => {
-    setSimulatorState(simulateG1Edu23Program(generatedCode, { mode: simulatorMode, obstacles: activeObstacles, challenge: challengeConfig }));
-  }, [generatedCode, simulatorMode, challengeConfig, activeObstacles]);
-
-  const applyMotionTemplate = (template) => {
-    updateGeneratedCode(template.code);
-  };
-
-  const handleChallengeChange = (challengeKey) => {
-    setSimulatorChallenge(challengeKey);
-  };
+    try {
+      const state = controllerVersion === 'duet'
+        ? simulateDuetG1Edu23Program(generatedCode, { obstacles: activeObstacles }).at(-1)
+        : simulateG1Edu23Program(generatedCode, { mode: simulatorMode, obstacles: activeObstacles });
+      setSimulatorState(state);
+    } catch (error) {
+      setSimulatorState({
+        ...createEmptyG1Edu23State(),
+        status: `Invalid ${controllerVersion === 'duet' ? 'DUET' : 'G1'} program`,
+        actions: [{ label: 'Preview rejected', summary: error.message }],
+        mode: controllerVersion === 'duet' ? 'duet-preview' : simulatorMode,
+      });
+    }
+  }, [controllerVersion, generatedCode, simulatorMode, activeObstacles]);
 
   const addStudentObstacle = (type = 'box') => {
     const preset = OBJECT_LIBRARY.find((item) => item.id === type) || OBJECT_LIBRARY[0];
-    setSceneObjects((prev) => [
-      ...prev,
-      {
+    setSceneObjects((prev) => {
+      const coordinateLimit = Math.max(0, sceneExtent / 2 - 1);
+      const coordinates = Array.from({ length: 5 }, (_, index) => (
+        -coordinateLimit + (coordinateLimit * 2 * index) / 4
+      ));
+      const candidates = coordinates.flatMap((x) => coordinates.map((y) => ({
+        x: x + sceneCenterX,
+        y: y + sceneCenterY,
+      })))
+        .sort((left, right) => (
+          Math.hypot(left.x - sceneCenterX, left.y - sceneCenterY)
+          - Math.hypot(right.x - sceneCenterX, right.y - sceneCenterY)
+        ));
+      const position = candidates
+        .map((candidate) => ({
+          ...candidate,
+          overlap: prev.reduce((score, obstacle) => {
+            const requiredSpace = (preset.defaultRadius + (Number(obstacle.radius) || 10)) / 12 + 0.5;
+            const distance = Math.hypot(candidate.x - obstacle.x, candidate.y - obstacle.y);
+            return score + Math.max(0, requiredSpace - distance);
+          }, 0),
+        }))
+        .sort((left, right) => (
+          left.overlap - right.overlap
+          || Math.hypot(left.x - sceneCenterX, left.y - sceneCenterY)
+            - Math.hypot(right.x - sceneCenterX, right.y - sceneCenterY)
+        ))[0];
+      const defaultPosition = clampGridPoint(position.x, position.y);
+      return [
+        ...prev,
+        {
         id: `student-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`,
         type: preset.id,
         label: preset.label,
         color: preset.color,
-        x: 0,
-        y: 0,
+        x: defaultPosition.x,
+        y: defaultPosition.y,
         radius: preset.defaultRadius,
-      },
-    ]);
+        dimensions: getSceneObjectDimensions({ type: preset.id, radius: preset.defaultRadius }),
+        },
+      ];
+    });
+  };
+
+  const selectSceneObject = (id) => {
+    setSelectedSceneObjectId(id);
+    setObjectPanelTab('scene-objects');
   };
 
   const updateStudentObstacle = (id, patch) => {
-    setSceneObjects((prev) => prev.map((obstacle) => obstacle.id === id ? { ...obstacle, ...patch } : obstacle));
+    setSceneObjects((prev) => prev.map((obstacle) => {
+      if (obstacle.id !== id) return obstacle;
+      const nextPosition = clampGridPoint(
+        patch.x !== undefined ? patch.x : obstacle.x,
+        patch.y !== undefined ? patch.y : obstacle.y,
+      );
+      return { ...obstacle, ...patch, x: nextPosition.x, y: nextPosition.y };
+    }));
   };
 
   const removeStudentObstacle = (id) => {
     setSceneObjects((prev) => prev.filter((obstacle) => obstacle.id !== id));
+    setSelectedSceneObjectId((selectedId) => selectedId === id ? null : selectedId);
   };
 
-  const obstacleDragRef = useRef(null);
-  const plannerDragRef = useRef(null);
-
-  const getSvgCoords = (event) => {
-    const svg = event.currentTarget.ownerSVGElement || event.currentTarget;
-    const rect = svg.getBoundingClientRect();
-    const localX = (event.clientX - rect.left - 110) / 1.5;
-    const localY = (110 - (event.clientY - rect.top - 110) / 1.5);
-    return {
-      x: Math.max(-35, Math.min(35, localX)),
-      y: Math.max(-35, Math.min(35, localY)),
-    };
-  };
-
-  const handleObstaclePointerDown = (event, obstacleId) => {
-    if (currentUser.role === 'teacher') return;
-    obstacleDragRef.current = { obstacleId, pointerId: event.pointerId };
-    event.currentTarget.setPointerCapture?.(event.pointerId);
-  };
-
-  const handlePlannerWaypointPointerDown = (event, waypointId) => {
-    plannerDragRef.current = { waypointId, pointerId: event.pointerId };
-    event.currentTarget.setPointerCapture?.(event.pointerId);
-  };
-
-  const handleObstaclePointerMove = (event) => {
-    if (!obstacleDragRef.current || currentUser.role === 'teacher') return;
-    const { x, y } = getSvgCoords(event);
-    updateStudentObstacle(obstacleDragRef.current.obstacleId, { x, y });
-  };
-
-  const handlePlannerWaypointPointerMove = (event) => {
-    if (!plannerDragRef.current) return;
-    const { x, y } = getSvgCoords(event);
-    updatePlannerWaypoint(plannerDragRef.current.waypointId, { x, y });
-  };
-
-  const handleObstaclePointerUp = () => {
-    obstacleDragRef.current = null;
-    plannerDragRef.current = null;
-  };
-
+  const sharedMapMetadata = sharedLidarMap?.map?.map;
+  const mapWidthMeters = sharedMapMetadata ? sharedMapMetadata.width * sharedMapMetadata.resolution_m : 0;
+  const mapHeightMeters = sharedMapMetadata ? sharedMapMetadata.height * sharedMapMetadata.resolution_m : 0;
+  const mapCenterLocalX = mapWidthMeters / 2;
+  const mapCenterLocalY = mapHeightMeters / 2;
+  const mapCenterCosine = Math.cos(sharedMapMetadata?.origin?.yaw_rad || 0);
+  const mapCenterSine = Math.sin(sharedMapMetadata?.origin?.yaw_rad || 0);
+  const sceneCenterX = sharedLidarOverlayEnabled && sharedMapMetadata
+    ? sharedMapMetadata.origin.x + mapCenterCosine * mapCenterLocalX - mapCenterSine * mapCenterLocalY
+    : 0;
+  const sceneCenterY = sharedLidarOverlayEnabled && sharedMapMetadata
+    ? sharedMapMetadata.origin.y + mapCenterSine * mapCenterLocalX + mapCenterCosine * mapCenterLocalY
+    : 0;
+  const rotatedMapWidth = Math.abs(mapCenterCosine) * mapWidthMeters + Math.abs(mapCenterSine) * mapHeightMeters;
+  const rotatedMapHeight = Math.abs(mapCenterSine) * mapWidthMeters + Math.abs(mapCenterCosine) * mapHeightMeters;
+  const sceneExtent = sharedLidarOverlayEnabled && sharedMapMetadata
+    ? Math.max(gridSize, rotatedMapWidth, rotatedMapHeight)
+    : gridSize;
+  const clampGridPoint = (x, y) => ({
+    x: Math.max(sceneCenterX - sceneExtent / 2, Math.min(sceneCenterX + sceneExtent / 2, x)),
+    y: Math.max(sceneCenterY - sceneExtent / 2, Math.min(sceneCenterY + sceneExtent / 2, y)),
+  });
+  const navigationOccupiedCellsPath = useMemo(() => {
+    if (!navigationMapSnapshot?.data?.length || !navigationMapSnapshot.map) return '';
+    const { data, map } = navigationMapSnapshot;
+    const commands = [];
+    for (let index = 0; index < data.length; index += 1) {
+      if (data[index] < 65) continue;
+      const column = index % map.width;
+      const row = Math.floor(index / map.width);
+      const x = column * map.resolution_m;
+      const y = row * map.resolution_m;
+      const size = map.resolution_m;
+      commands.push(`M${x} ${y}h${size}v${size}h-${size}z`);
+    }
+    return commands.join('');
+  }, [navigationMapSnapshot]);
+  const navigationRoutePreviewPoints = useMemo(() => {
+    if (
+      !navigationRoutePreview
+      || !navigationMapSnapshot?.map
+      || navigationRoutePreview.map_id !== navigationMapSnapshot.map.map_id
+      || navigationRoutePreview.version !== navigationMapSnapshot.map.version
+      || navigationRoutePreview.frame_id !== navigationMapSnapshot.map.frame_id
+    ) return '';
+    const { map } = navigationMapSnapshot;
+    return navigationRoutePreview.path.map((point) => {
+      const local = worldToMapLocal(point.x, point.y, map);
+      return `${local.x},${local.y}`;
+    }).join(' ');
+  }, [navigationMapSnapshot, navigationRoutePreview]);
+  const navigationLiveScanPreview = useMemo(() => {
+    const map = navigationMapSnapshot?.map;
+    if (!map || !Array.isArray(liveLidarScanPoints) || lidarScanJob?.frame_id !== map.frame_id) return [];
+    const mapWidth = map.width * map.resolution_m;
+    const mapHeight = map.height * map.resolution_m;
+    return liveLidarScanPoints.flatMap((point) => {
+      const local = worldToMapLocal(point.x, point.y, map);
+      if (local.x < 0 || local.y < 0 || local.x >= mapWidth || local.y >= mapHeight) return [];
+      return [{ ...point, mapX: local.x, mapY: local.y }];
+    });
+  }, [lidarScanJob?.frame_id, liveLidarScanPoints, navigationMapSnapshot]);
+  const navigationLiveObstaclePreview = useMemo(() => {
+    const map = navigationMapSnapshot?.map;
+    if (
+      navigationPlannerMode !== 'live'
+      || !map
+      || liveNavigationObstacles?.ready !== true
+      || liveNavigationObstacles.frame_id !== map.frame_id
+      || !Array.isArray(liveNavigationObstacles.points)
+    ) return [];
+    const mapWidth = map.width * map.resolution_m;
+    const mapHeight = map.height * map.resolution_m;
+    return liveNavigationObstacles.points.flatMap((point) => {
+      const local = worldToMapLocal(point.x, point.y, map);
+      if (local.x < 0 || local.y < 0 || local.x >= mapWidth || local.y >= mapHeight) return [];
+      return [{ ...point, mapX: local.x, mapY: local.y }];
+    });
+  }, [liveNavigationObstacles, navigationMapSnapshot, navigationPlannerMode]);
+  const navigationLivePosePreview = useMemo(() => {
+    const map = navigationMapSnapshot?.map;
+    if (!map || liveNavigationPose?.frame_id !== map.frame_id) return null;
+    const local = worldToMapLocal(liveNavigationPose.x, liveNavigationPose.y, map);
+    if (
+      local.x < 0 || local.y < 0
+      || local.x >= map.width * map.resolution_m
+      || local.y >= map.height * map.resolution_m
+    ) return null;
+    return { ...local, yaw_rad: liveNavigationPose.yaw_rad };
+  }, [liveNavigationPose, navigationMapSnapshot]);
+  const sharedOccupiedCellsPath = useMemo(() => {
+    const snapshot = sharedLidarMap?.map;
+    if (!snapshot?.data?.length || !snapshot.map) return '';
+    const { data, map } = snapshot;
+    const commands = [];
+    for (let index = 0; index < data.length; index += 1) {
+      if (data[index] < 65) continue;
+      const column = index % map.width;
+      const row = Math.floor(index / map.width);
+      const x = column * map.resolution_m;
+      const y = row * map.resolution_m;
+      const size = map.resolution_m;
+      commands.push(`M${x} ${y}h${size}v${size}h-${size}z`);
+    }
+    return commands.join('');
+  }, [sharedLidarMap]);
+  const sharedPointCloudPreview = useMemo(() => {
+    const snapshot = sharedLidarMap?.map;
+    const points = sharedLidarMap?.pointcloud?.points;
+    if (!snapshot?.map || !Array.isArray(points)) return [];
+    const { map } = snapshot;
+    const stride = Math.max(1, Math.ceil(points.length / 5_000));
+    const cosine = Math.cos(map.origin.yaw_rad);
+    const sine = Math.sin(map.origin.yaw_rad);
+    return points.filter((_, index) => index % stride === 0).flatMap((point) => {
+      const dx = point.x - map.origin.x;
+      const dy = point.y - map.origin.y;
+      const x = cosine * dx + sine * dy;
+      const y = -sine * dx + cosine * dy;
+      if (x < 0 || y < 0 || x >= map.width * map.resolution_m || y >= map.height * map.resolution_m) return [];
+      return [{ ...point, mapX: x, mapY: y }];
+    });
+  }, [sharedLidarMap]);
   const handlePromptSubmit = () => { promptState.callback?.(promptState.inputValue); setPromptState({ ...promptState, isOpen: false }); };
   const handlePromptCancel = () => { promptState.callback?.(null); setPromptState({ ...promptState, isOpen: false }); };
-  
+
   const handleSaveCode = () => {
     if (workspaceRef.current && codeEditorState.blockId) {
       const block = workspaceRef.current.getBlockById(codeEditorState.blockId);
       if (block) {
         block.data = codeEditorState.code;
         if (workspaceRef.current) {
-           const event = new window.Blockly.Events.BlockChange(block, 'comment', null, '', ''); 
-           workspaceRef.current.fireChangeListener(event);
+          const event = new window.Blockly.Events.BlockChange(block, 'comment', null, '', '');
+          workspaceRef.current.fireChangeListener(event);
         }
       }
     }
+
+    if (workspaceRef.current && window.Blockly) {
+      try {
+        const nextCode = generateBlocklyPythonCode(workspaceRef.current);
+        applyGeneratedCode(nextCode, { syncBlocks: true });
+      } catch (error) {
+        console.warn('Failed to refresh generated code after block edit.', error);
+      }
+    }
+
     setCodeEditorState({ ...codeEditorState, isOpen: false });
   };
 
@@ -1603,6 +5513,77 @@ export default function App() {
       fileInputRef.current.click();
     }
     setActiveMenu(null);
+  };
+
+  const beginToolPanelInteraction = (event, mode) => {
+    if (toolPanelCollapsed) return;
+    event.preventDefault();
+    event.stopPropagation();
+    toolPanelInteractionRef.current = {
+      mode,
+      startX: event.clientX,
+      startY: event.clientY,
+      rect: { ...toolPanelRect },
+    };
+    event.currentTarget.setPointerCapture?.(event.pointerId);
+  };
+
+  const updateToolPanelInteraction = (event) => {
+    const interaction = toolPanelInteractionRef.current;
+    const sceneBounds = sceneShellRef.current?.getBoundingClientRect();
+    if (!interaction || !sceneBounds) return;
+
+    const deltaX = event.clientX - interaction.startX;
+    const deltaY = event.clientY - interaction.startY;
+    const nextRect = { ...interaction.rect };
+    const minimumWidth = Math.min(320, Math.max(48, sceneBounds.width - 16));
+    const minimumHeight = Math.min(360, Math.max(48, sceneBounds.height - 16));
+    const maximumWidth = Math.max(minimumWidth, sceneBounds.width - 16);
+    const maximumHeight = Math.max(minimumHeight, sceneBounds.height - 16);
+    const panelWidth = toolPanelCollapsed ? 48 : Math.min(nextRect.width, sceneBounds.width - 16);
+    const panelHeight = toolPanelCollapsed ? 48 : Math.min(nextRect.height, sceneBounds.height - 16);
+
+    if (interaction.mode === 'move') {
+      nextRect.right = Math.min(
+        Math.max(8, interaction.rect.right - deltaX),
+        Math.max(8, sceneBounds.width - panelWidth - 8),
+      );
+      nextRect.top = Math.min(
+        Math.max(8, interaction.rect.top + deltaY),
+        Math.max(8, sceneBounds.height - panelHeight - 8),
+      );
+    } else {
+      if (interaction.mode.includes('left')) {
+        nextRect.width = Math.min(maximumWidth, Math.max(minimumWidth, interaction.rect.width - deltaX));
+        nextRect.right = Math.max(8, interaction.rect.right + deltaX);
+      }
+      if (interaction.mode.includes('right')) {
+        nextRect.width = Math.min(maximumWidth, Math.max(minimumWidth, interaction.rect.width + deltaX));
+      }
+      if (interaction.mode.includes('top')) {
+        nextRect.height = Math.min(maximumHeight, Math.max(minimumHeight, interaction.rect.height - deltaY));
+        nextRect.top = Math.max(8, interaction.rect.top + deltaY);
+      }
+      if (interaction.mode.includes('bottom')) {
+        nextRect.height = Math.min(maximumHeight, Math.max(minimumHeight, interaction.rect.height + deltaY));
+      }
+    }
+
+    nextRect.width = Math.min(nextRect.width, sceneBounds.width - 16);
+    nextRect.height = Math.min(nextRect.height, sceneBounds.height - 16);
+    nextRect.right = Math.min(
+      Math.max(8, nextRect.right),
+      Math.max(8, sceneBounds.width - nextRect.width - 8),
+    );
+    nextRect.top = Math.min(
+      Math.max(8, nextRect.top),
+      Math.max(8, sceneBounds.height - nextRect.height - 8),
+    );
+    setToolPanelRect(nextRect);
+  };
+
+  const endToolPanelInteraction = () => {
+    toolPanelInteractionRef.current = null;
   };
 
   if (!session) {
@@ -1614,98 +5595,63 @@ export default function App() {
             <p className="text-sm text-blue-100 mt-1">One robot, one queue, easy for every class.</p>
           </div>
 
-          <div className="px-6 pt-4 flex gap-2">
-            <button
-              type="button"
-              onClick={() => setAuthMode('login')}
-              className={`flex-1 rounded-lg px-3 py-2 text-sm font-medium ${authMode === 'login' ? 'bg-blue-600 text-white' : 'bg-slate-100 text-slate-600'}`}
-            >
-              Log In
-            </button>
-            <button
-              type="button"
-              onClick={() => setAuthMode('signup')}
-              className={`flex-1 rounded-lg px-3 py-2 text-sm font-medium ${authMode === 'signup' ? 'bg-blue-600 text-white' : 'bg-slate-100 text-slate-600'}`}
-            >
-              Create Account
-            </button>
-          </div>
-
-          {authMode === 'login' ? (
-            <form onSubmit={handleLogin} className="p-6 space-y-4">
+          <form onSubmit={isRegistering ? handleRegisterStudent : handleLogin} className="p-6 space-y-4">
               <div>
                 <label className="block text-sm font-medium text-slate-700 mb-1">Username</label>
                 <input
                   type="text"
                   value={loginForm.username}
                   onChange={(e) => setLoginForm({ ...loginForm, username: e.target.value })}
+                  autoComplete="username"
+                  required
                   className="w-full border border-slate-200 rounded-xl px-3 py-2 focus:outline-none focus:ring-2 focus:ring-blue-500"
                 />
               </div>
               <div>
                 <label className="block text-sm font-medium text-slate-700 mb-1">Password</label>
-                <input
-                  type="password"
-                  value={loginForm.password}
-                  onChange={(e) => setLoginForm({ ...loginForm, password: e.target.value })}
-                  className="w-full border border-slate-200 rounded-xl px-3 py-2 focus:outline-none focus:ring-2 focus:ring-blue-500"
-                />
-              </div>
-              <div>
-                <label className="block text-sm font-medium text-slate-700 mb-1">Role</label>
-                <select
-                  value={loginForm.role}
-                  onChange={(e) => setLoginForm({ ...loginForm, role: e.target.value })}
-                  className="w-full border border-slate-200 rounded-xl px-3 py-2 focus:outline-none focus:ring-2 focus:ring-blue-500"
-                >
-                  <option value="teacher">Teacher</option>
-                  <option value="student">Student</option>
-                </select>
+                <div className="flex overflow-hidden rounded-xl border border-slate-200 focus-within:ring-2 focus-within:ring-blue-500">
+                  <input
+                    type={isLoginPasswordVisible ? 'text' : 'password'}
+                    value={loginForm.password}
+                    onChange={(e) => setLoginForm({ ...loginForm, password: e.target.value })}
+                    autoComplete={isRegistering ? 'new-password' : 'current-password'}
+                    minLength={isRegistering ? 8 : undefined}
+                    required
+                    className="min-w-0 flex-1 px-3 py-2 focus:outline-none"
+                  />
+                  <button
+                    type="button"
+                    aria-label={isLoginPasswordVisible ? 'Hide password' : 'Show password'}
+                    aria-pressed={isLoginPasswordVisible}
+                    onClick={() => setIsLoginPasswordVisible((visible) => !visible)}
+                    className="px-3 text-slate-500 hover:bg-slate-50 hover:text-slate-700"
+                  >
+                    {isLoginPasswordVisible ? <EyeOff size={18} aria-hidden="true" /> : <Eye size={18} aria-hidden="true" />}
+                  </button>
+                </div>
               </div>
               {loginError && <p className="text-red-600 text-sm">{loginError}</p>}
-              <button type="submit" className="w-full bg-blue-600 text-white rounded-xl py-2.5 font-semibold hover:bg-blue-700 transition-colors">Log In</button>
+              <button type="submit" className="w-full bg-blue-600 text-white rounded-xl py-2.5 font-semibold hover:bg-blue-700 transition-colors">
+                {isRegistering ? 'Create Student Account' : 'Log In'}
+              </button>
+              <button
+                type="button"
+                onClick={() => {
+                  setIsRegistering((registering) => !registering);
+                  setLoginError('');
+                }}
+                className="w-full rounded-xl border border-slate-200 py-2 text-sm font-semibold text-blue-700 hover:bg-blue-50"
+              >
+                {isRegistering ? 'Back to Log In' : 'Create Account'}
+              </button>
               <div className="text-xs text-slate-500 space-y-1">
-                <p>Teacher demo: teacher / teacher</p>
-                <p>Student demo: student1 / student1</p>
+                {isRegistering
+                  ? <p>Student accounts only. Username: 3–32 letters, numbers, _ or -. Password: 8–128 characters.</p>
+                  : <>
+                    <p>Sign in with your classroom account or create a student account to join.</p>
+                  </>}
               </div>
-            </form>
-          ) : (
-            <form onSubmit={handleSignup} className="p-6 space-y-4">
-              <div>
-                <label className="block text-sm font-medium text-slate-700 mb-1">New username</label>
-                <input
-                  type="text"
-                  value={signupForm.username}
-                  onChange={(e) => setSignupForm({ ...signupForm, username: e.target.value })}
-                  className="w-full border border-slate-200 rounded-xl px-3 py-2 focus:outline-none focus:ring-2 focus:ring-blue-500"
-                  placeholder="student24"
-                />
-              </div>
-              <div>
-                <label className="block text-sm font-medium text-slate-700 mb-1">Password</label>
-                <input
-                  type="password"
-                  value={signupForm.password}
-                  onChange={(e) => setSignupForm({ ...signupForm, password: e.target.value })}
-                  className="w-full border border-slate-200 rounded-xl px-3 py-2 focus:outline-none focus:ring-2 focus:ring-blue-500"
-                  placeholder="At least 4 characters"
-                />
-              </div>
-              <div>
-                <label className="block text-sm font-medium text-slate-700 mb-1">Role</label>
-                <select
-                  value={signupForm.role}
-                  onChange={(e) => setSignupForm({ ...signupForm, role: e.target.value })}
-                  className="w-full border border-slate-200 rounded-xl px-3 py-2 focus:outline-none focus:ring-2 focus:ring-blue-500"
-                >
-                  <option value="student">Student</option>
-                  <option value="teacher">Teacher</option>
-                </select>
-              </div>
-              {loginError && <p className="text-red-600 text-sm">{loginError}</p>}
-              <button type="submit" className="w-full bg-emerald-600 text-white rounded-xl py-2.5 font-semibold hover:bg-emerald-700 transition-colors">Create Classroom Account</button>
-            </form>
-          )}
+          </form>
         </div>
       </div>
     );
@@ -1713,103 +5659,8 @@ export default function App() {
 
   if (!isBlocklyLoaded) return <div className="flex h-screen items-center justify-center bg-gray-50 flex-col gap-4"><Loader2 className="animate-spin text-blue-600" size={48} /><p className="text-gray-500 font-medium">{UI_TEXT.en.loading}</p></div>;
 
-  const robotAnchor = { x: 110 + simulatorState.x * 1.5, y: 110 - simulatorState.y * 1.5 };
-  const robotJoints = simulatorState.joints || {};
-  const toRadians = (degrees) => (degrees * Math.PI) / 180;
-  const armLen = 22;
-  const forearmLen = 20;
-  const legLen = 30;
-  const shinLen = 28;
-  const getJointAngle = (name, defaultValue = 0) => Number(robotJoints[name] ?? defaultValue);
-
-  const leftArm = (() => {
-    const shoulder = getJointAngle('left_shoulder_pitch', 12);
-    const elbow = getJointAngle('left_elbow_pitch', 8);
-    const shoulderRad = toRadians(shoulder + 180);
-    const elbowRad = toRadians(elbow + 110);
-    const shoulderX = 0;
-    const shoulderY = -28;
-    const elbowX = shoulderX + Math.cos(shoulderRad) * armLen;
-    const elbowY = shoulderY + Math.sin(shoulderRad) * armLen;
-    const wristX = elbowX + Math.cos(shoulderRad + elbowRad - Math.PI) * forearmLen;
-    const wristY = elbowY + Math.sin(shoulderRad + elbowRad - Math.PI) * forearmLen;
-    return { shoulderX, shoulderY, elbowX, elbowY, wristX, wristY };
-  })();
-
-  const rightArm = (() => {
-    const shoulder = getJointAngle('right_shoulder_pitch', 12);
-    const elbow = getJointAngle('right_elbow_pitch', 8);
-    const shoulderRad = toRadians(shoulder + 180);
-    const elbowRad = toRadians(elbow + 110);
-    const shoulderX = 0;
-    const shoulderY = -28;
-    const elbowX = shoulderX + Math.cos(shoulderRad) * armLen;
-    const elbowY = shoulderY + Math.sin(shoulderRad) * armLen;
-    const wristX = elbowX + Math.cos(shoulderRad + elbowRad - Math.PI) * forearmLen;
-    const wristY = elbowY + Math.sin(shoulderRad + elbowRad - Math.PI) * forearmLen;
-    return { shoulderX, shoulderY, elbowX, elbowY, wristX, wristY };
-  })();
-
-  const leftLeg = (() => {
-    const hip = getJointAngle('left_hip_pitch', 8);
-    const knee = getJointAngle('left_knee_pitch', 10);
-    const hipRad = toRadians(hip + 200);
-    const kneeRad = toRadians(knee + 80);
-    const hipX = 0;
-    const hipY = 28;
-    const kneeX = hipX + Math.cos(hipRad) * legLen;
-    const kneeY = hipY + Math.sin(hipRad) * legLen;
-    const ankleX = kneeX + Math.cos(hipRad + kneeRad - Math.PI) * shinLen;
-    const ankleY = kneeY + Math.sin(hipRad + kneeRad - Math.PI) * shinLen;
-    return { hipX, hipY, kneeX, kneeY, ankleX, ankleY };
-  })();
-
-  const rightLeg = (() => {
-    const hip = getJointAngle('right_hip_pitch', 8);
-    const knee = getJointAngle('right_knee_pitch', 10);
-    const hipRad = toRadians(hip + 200);
-    const kneeRad = toRadians(knee + 80);
-    const hipX = 0;
-    const hipY = 28;
-    const kneeX = hipX + Math.cos(hipRad) * legLen;
-    const kneeY = hipY + Math.sin(hipRad) * legLen;
-    const ankleX = kneeX + Math.cos(hipRad + kneeRad - Math.PI) * shinLen;
-    const ankleY = kneeY + Math.sin(hipRad + kneeRad - Math.PI) * shinLen;
-    return { hipX, hipY, kneeX, kneeY, ankleX, ankleY };
-  })();
-
-  const robotBody = (
-    <g transform={`translate(${robotAnchor.x} ${robotAnchor.y}) rotate(${simulatorState.heading})`}>
-      <ellipse cx="0" cy="44" rx="38" ry="10" fill="rgba(15,23,42,0.18)" />
-      <g stroke="#dfe7f3" strokeWidth="2" strokeLinecap="round" fill="none">
-        <line x1="0" y1="-10" x2="0" y2="-42" stroke="#b4c4d8" strokeWidth="6" />
-        <line x1="0" y1="-42" x2="0" y2="-70" stroke="#b4c4d8" strokeWidth="8" />
-        <ellipse cx="0" cy="-70" rx="16" ry="18" fill="#e2e8f0" stroke="#475569" strokeWidth="2" />
-        <circle cx="0" cy="-74" r="5" fill="#94a3b8" />
-        <line x1="-8" y1="-66" x2="-18" y2="-58" stroke="#475569" strokeWidth="2" />
-        <line x1="8" y1="-66" x2="18" y2="-58" stroke="#475569" strokeWidth="2" />
-
-        <line x1="-10" y1="-40" x2={leftArm.shoulderX} y2={leftArm.shoulderY - 8} stroke="#cbd5e1" strokeWidth="5" />
-        <line x1={leftArm.shoulderX} y1={leftArm.shoulderY} x2={leftArm.elbowX} y2={leftArm.elbowY} stroke="#dfe7f3" strokeWidth="4" />
-        <line x1={leftArm.elbowX} y1={leftArm.elbowY} x2={leftArm.wristX} y2={leftArm.wristY} stroke="#dfe7f3" strokeWidth="4" />
-
-        <line x1="10" y1="-40" x2={rightArm.shoulderX} y2={rightArm.shoulderY - 8} stroke="#cbd5e1" strokeWidth="5" />
-        <line x1={rightArm.shoulderX} y1={rightArm.shoulderY} x2={rightArm.elbowX} y2={rightArm.elbowY} stroke="#dfe7f3" strokeWidth="4" />
-        <line x1={rightArm.elbowX} y1={rightArm.elbowY} x2={rightArm.wristX} y2={rightArm.wristY} stroke="#dfe7f3" strokeWidth="4" />
-
-        <line x1="-8" y1="8" x2={leftLeg.hipX} y2={leftLeg.hipY - 2} stroke="#cbd5e1" strokeWidth="5" />
-        <line x1={leftLeg.hipX} y1={leftLeg.hipY} x2={leftLeg.kneeX} y2={leftLeg.kneeY} stroke="#dfe7f3" strokeWidth="4" />
-        <line x1={leftLeg.kneeX} y1={leftLeg.kneeY} x2={leftLeg.ankleX} y2={leftLeg.ankleY} stroke="#dfe7f3" strokeWidth="4" />
-
-        <line x1="8" y1="8" x2={rightLeg.hipX} y2={rightLeg.hipY - 2} stroke="#cbd5e1" strokeWidth="5" />
-        <line x1={rightLeg.hipX} y1={rightLeg.hipY} x2={rightLeg.kneeX} y2={rightLeg.kneeY} stroke="#dfe7f3" strokeWidth="4" />
-        <line x1={rightLeg.kneeX} y1={rightLeg.kneeY} x2={rightLeg.ankleX} y2={rightLeg.ankleY} stroke="#dfe7f3" strokeWidth="4" />
-      </g>
-    </g>
-  );
-
   return (
-    <div className="flex flex-col h-screen bg-gray-50 text-gray-800 font-sans relative overflow-hidden">
+    <div className="flex h-dvh flex-col bg-gray-50 text-gray-800 font-sans relative overflow-hidden">
       
       <style>{`
         .blocklyToolboxDiv {
@@ -1817,6 +5668,25 @@ export default function App() {
           border-right: 1px solid #e5e7eb;
           -ms-overflow-style: none;
           scrollbar-width: none;
+        }
+        .blocklyToolbox {
+          background-color: #f8fafc !important;
+          color: #334155 !important;
+        }
+        .blocklyToolboxCategoryLabel,
+        .blocklyToolboxCategoryLabelText {
+          color: #334155 !important;
+          font-weight: 600;
+        }
+        .blocklyToolboxCategory:hover,
+        .blocklyToolboxCategory[aria-selected="true"] {
+          background-color: #e2e8f0 !important;
+        }
+        .blocklyFlyout {
+          background-color: #f8fafc !important;
+        }
+        .blocklyFlyoutLabelText {
+          fill: #334155 !important;
         }
         .blocklyToolboxDiv::-webkit-scrollbar {
           display: none;
@@ -1840,8 +5710,17 @@ export default function App() {
         type="file" 
         ref={fileInputRef} 
         className="hidden" 
+        aria-label="Import JSON file"
         accept=".json" 
         onChange={loadProject} 
+      />
+      <input
+        type="file"
+        ref={pythonFileInputRef}
+        className="hidden"
+        aria-label="Import Python file"
+        accept=".py,text/x-python,text/plain"
+        onChange={loadPythonFile}
       />
 
       {showConfigEditor && (
@@ -1858,6 +5737,515 @@ export default function App() {
             </div>
             <div className="flex-1 bg-slate-900 p-0 overflow-hidden"><textarea className="w-full h-full p-6 font-mono text-sm bg-slate-900 text-green-400 resize-none focus:outline-none" value={configText || ''} onChange={(e) => setConfigText(e.target.value)} spellCheck={false} /></div>
             <div className="p-4 border-t bg-white flex justify-end gap-3"><button onClick={() => setShowConfigEditor(false)} className="px-5 py-2 text-sm text-gray-600 font-medium hover:bg-gray-100 rounded-lg">{t.closeBtn}</button><button onClick={handleApplyConfig} className="flex items-center gap-2 px-6 py-2 text-sm bg-blue-600 text-white rounded-lg font-bold hover:bg-blue-700 shadow-md"><Check size={16} /> {t.applyBtn}</button></div>
+          </div>
+        </div>
+      )}
+
+      {showAppSettings && (
+        <div className="fixed inset-0 z-[9999] flex items-center justify-center bg-black/60 backdrop-blur-sm animate-in fade-in p-4" onClick={(event) => event.stopPropagation()}>
+          <div className="flex max-h-[90vh] w-full max-w-4xl flex-col overflow-hidden rounded-xl bg-white shadow-2xl">
+            <div className="flex items-center justify-between border-b bg-slate-50 px-5 py-4">
+              <div>
+                <h2 className="text-xl font-bold text-slate-800">Settings</h2>
+                <p className="mt-1 text-xs text-slate-500">Application preferences{currentUser.role === 'teacher' ? ' and teacher robot settings' : ''}.</p>
+              </div>
+              <button
+                type="button"
+                onClick={() => setShowAppSettings(false)}
+                disabled={isArmMotionRecording}
+                className="rounded-md px-3 py-1.5 text-sm font-medium text-slate-600 hover:bg-slate-200"
+              >
+                {isArmMotionRecording ? 'Recording…' : 'Close'}
+              </button>
+            </div>
+            <div className="space-y-3 overflow-y-auto p-5">
+              <div className="flex flex-wrap items-center justify-between gap-4 rounded-xl border border-slate-200 bg-slate-50 px-5 py-4">
+                <div>
+                  <p className="text-sm font-semibold text-slate-800">Language</p>
+                  <p className="text-xs text-slate-500">Choose the application language.</p>
+                </div>
+                <button
+                  type="button"
+                  onClick={toggleLanguage}
+                  aria-label="Toggle application language"
+                  className="rounded-md border border-slate-300 bg-white px-3 py-1.5 text-sm font-semibold text-slate-700 hover:bg-slate-100"
+                >
+                  {lang === 'zh' ? 'English' : '中文'}
+                </button>
+              </div>
+              <fieldset className="rounded-xl border border-slate-200 bg-slate-50 px-5 py-4">
+                <legend className="text-sm font-semibold text-slate-800">Simulation preview</legend>
+                <p className="mb-3 text-xs text-slate-500">Choose the preview mode and adjust its grid and playback speed.</p>
+                <div className="grid gap-2 sm:grid-cols-2">
+                  {Object.entries(SIMULATOR_MODES).map(([key, mode]) => (
+                    <button
+                      key={key}
+                      type="button"
+                      aria-pressed={simulatorMode === key}
+                      onClick={() => setSimulatorMode(key)}
+                      className={`rounded-lg px-3 py-2 text-sm font-semibold transition ${simulatorMode === key ? 'bg-blue-600 text-white' : 'bg-white text-slate-700 hover:bg-slate-100'}`}
+                    >
+                      {mode.label}
+                    </button>
+                  ))}
+                </div>
+                <label className="mt-4 block text-xs font-semibold text-slate-700">
+                  <span className="flex items-center justify-between">
+                    <span>Grid size</span>
+                    <span>{gridSize} m x {gridSize} m</span>
+                  </span>
+                  <input
+                    type="range"
+                    aria-label="Simulation grid size"
+                    min="10"
+                    max="80"
+                    step="1"
+                    value={gridSize}
+                    onChange={(event) => setGridSize(Number(event.target.value))}
+                    className="mt-2 w-full accent-blue-600"
+                  />
+                </label>
+                <label className="mt-3 block text-xs font-semibold text-slate-700">
+                  <span className="flex items-center justify-between">
+                    <span>Simulation speed</span>
+                    <span>{playbackSpeed.toFixed(1)}x</span>
+                  </span>
+                  <input
+                    type="range"
+                    aria-label="Simulation speed"
+                    min="0.1"
+                    max="3"
+                    step="0.1"
+                    value={playbackSpeed}
+                    onChange={(event) => setPlaybackSpeed(Number(event.target.value))}
+                    className="mt-2 w-full accent-cyan-600"
+                  />
+                </label>
+                <p className="mt-2 text-xs text-slate-500">Speed changes timing only. Distances remain in meters.</p>
+                {currentUser.role === 'teacher' && (
+                  <label className="mt-4 flex items-center justify-between gap-3 border-t border-slate-200 pt-3 text-xs font-semibold text-slate-700">
+                    <span>Show 3D simulation in the workspace</span>
+                    <input
+                      type="checkbox"
+                      aria-label="Show 3D simulation in the workspace"
+                      checked={isSimulationVisible}
+                      disabled={isSimulationVisibilityLoading || isSimulationVisibilitySaving}
+                      onChange={(event) => handleSimulationVisibilityToggle(event.target.checked)}
+                      className="h-4 w-4 accent-blue-700"
+                    />
+                  </label>
+                )}
+                {currentUser.role === 'teacher' && simulationVisibilityError && (
+                  <p role="alert" className="mt-2 text-xs text-red-700">{simulationVisibilityError}</p>
+                )}
+              </fieldset>
+              {currentUser.role === 'teacher' && (
+                <>
+              <TeacherArmMotionRecorder
+                connection={activeRobotConnection}
+                controllerVersion={controllerVersion}
+                onBusyChange={setIsArmMotionRecording}
+                onPreview={previewRecordedArmMotion}
+              />
+              {recordedMotionPreview && (
+                <div className="flex flex-wrap items-center justify-between gap-2 rounded-lg border border-violet-200 bg-white px-3 py-2">
+                  <p className="text-xs text-violet-900">
+                    Previewing measured motion: <strong>{recordedMotionPreview.name}</strong>
+                  </p>
+                  <button
+                    type="button"
+                    onClick={() => {
+                      setRecordedMotionPreview(null);
+                      setIsPreviewPlaying(false);
+                      setPlaybackProgress(0);
+                    }}
+                    className="rounded-md border border-violet-300 px-2 py-1 text-[11px] font-semibold text-violet-900"
+                  >
+                    Return to command preview
+                  </button>
+                </div>
+              )}
+              <section className="rounded-xl border border-slate-200 bg-slate-50 p-4">
+                <h3 className="text-sm font-semibold uppercase tracking-wide text-slate-700">Manage classroom accounts</h3>
+                <div className="mt-3 rounded-lg border border-emerald-200 bg-emerald-50 p-3">
+                  <h4 className="text-sm font-semibold text-emerald-950">Student classes</h4>
+                  <p className="mt-1 text-xs text-emerald-900">
+                    Create a class of up to 99 accounts. Class numbers are assigned automatically; each account keeps its generated 8-digit password across classes.
+                  </p>
+                  <form onSubmit={handleCreateClassGroup} className="mt-3 grid gap-2 rounded-lg border border-emerald-100 bg-white p-3 sm:grid-cols-[minmax(0,1fr)_8rem_auto]">
+                    <label className="text-xs font-medium text-slate-700">
+                      Class name <span className="font-normal text-slate-500">(optional)</span>
+                      <input
+                        type="text"
+                        value={newClassGroup.name}
+                        onChange={(event) => setNewClassGroup({ ...newClassGroup, name: event.target.value })}
+                        maxLength={60}
+                        className="mt-1 w-full rounded-lg border border-slate-200 px-2 py-1.5 text-sm"
+                        placeholder="Default: Class 1"
+                      />
+                    </label>
+                    <label className="text-xs font-medium text-slate-700">
+                      Number of students
+                      <input
+                        type="number"
+                        min="1"
+                        max="99"
+                        required
+                        value={newClassGroup.size}
+                        onChange={(event) => setNewClassGroup({ ...newClassGroup, size: event.target.value })}
+                        className="mt-1 w-full rounded-lg border border-slate-200 px-2 py-1.5 text-sm"
+                      />
+                    </label>
+                    <button
+                      type="submit"
+                      disabled={isCreatingClassGroup || isClearingGuestData}
+                      className="self-end rounded-lg bg-emerald-700 px-3 py-2 text-xs font-semibold text-white disabled:opacity-50"
+                    >
+                      {isCreatingClassGroup ? 'Creating…' : 'Create class'}
+                    </button>
+                  </form>
+                  {classroomGroups.length ? (
+                    <div className="mt-3 space-y-2">
+                      {classroomGroups.map((group) => {
+                        const accountNumbers = group.accounts.map((account) => Number(account.username));
+                        const range = accountNumbers.length
+                          ? `${accountNumbers[0]}–${accountNumbers[accountNumbers.length - 1]}`
+                          : 'No accounts';
+                        return (
+                          <div key={group.group_number} className="flex flex-wrap items-center justify-between gap-3 rounded-lg border border-emerald-100 bg-white p-3">
+                            <div>
+                              <p className="text-sm font-semibold text-slate-800">{group.name}</p>
+                              <p className="text-xs text-slate-500">
+                                Class {group.group_number} · {group.accounts.length} students · usernames {range}
+                              </p>
+                            </div>
+                            <div className="flex flex-wrap gap-2">
+                              <button
+                                type="button"
+                                onClick={() => setGuestCardGroup(group)}
+                                disabled={!group.accounts.length}
+                                className="rounded-lg border border-emerald-700 bg-white px-3 py-2 text-xs font-semibold text-emerald-900 disabled:opacity-50"
+                              >
+                                Print login cards
+                              </button>
+                              <button
+                                type="button"
+                                onClick={() => handleRenameClassGroup(group)}
+                                className="rounded-lg border border-slate-300 bg-white px-3 py-2 text-xs font-semibold text-slate-700"
+                              >
+                                Rename
+                              </button>
+                              <button
+                                type="button"
+                                onClick={() => handleClearClassData(group)}
+                                disabled={isClearingGuestData || isCreatingClassGroup || deletingClassGroup !== null}
+                                className="rounded-lg border border-red-300 bg-white px-3 py-2 text-xs font-semibold text-red-800 disabled:opacity-50"
+                              >
+                                {isClearingGuestData ? 'Clearing…' : 'Clear class data'}
+                              </button>
+                              <button
+                                type="button"
+                                onClick={() => handleDeleteClassGroup(group)}
+                                disabled={isClearingGuestData || isCreatingClassGroup || deletingClassGroup !== null}
+                                className="rounded-lg border border-red-700 bg-white px-3 py-2 text-xs font-semibold text-red-900 disabled:opacity-50"
+                              >
+                                {deletingClassGroup === group.group_number ? 'Deleting…' : 'Delete class'}
+                              </button>
+                            </div>
+                          </div>
+                        );
+                      })}
+                    </div>
+                  ) : (
+                    <p className="mt-3 text-xs text-slate-600">No student classes yet.</p>
+                  )}
+                  {guestAccountStatus && <p role="status" className="mt-2 text-xs text-emerald-900">{guestAccountStatus}</p>}
+                </div>
+                <form onSubmit={handleCreateStudent} className="mt-3 max-w-lg space-y-2 rounded-lg border border-blue-100 bg-white p-3">
+                  <label className="block text-xs font-medium text-slate-700">
+                    Account type
+                    <select
+                      value={newStudent.role}
+                      onChange={(event) => setNewStudent({ ...newStudent, role: event.target.value })}
+                      className="mt-1 w-full rounded-lg border border-slate-200 px-2 py-1.5 text-sm"
+                    >
+                      <option value="student">Student</option>
+                      <option value="teacher">Teacher</option>
+                    </select>
+                  </label>
+                  <label className="block text-xs font-medium text-slate-700">
+                    New {newStudent.role} username
+                    <input
+                      type="text"
+                      value={newStudent.username}
+                      onChange={(event) => setNewStudent({ ...newStudent, username: event.target.value })}
+                      minLength={3}
+                      maxLength={32}
+                      pattern="[A-Za-z0-9_-]{3,32}"
+                      autoComplete="off"
+                      required
+                      className="mt-1 w-full rounded-lg border border-slate-200 px-2 py-1.5 text-sm"
+                      placeholder="student24"
+                    />
+                  </label>
+                  <label className="block text-xs font-medium text-slate-700">
+                    Initial password
+                    <input
+                      type="password"
+                      value={newStudent.password}
+                      onChange={(event) => setNewStudent({ ...newStudent, password: event.target.value })}
+                      minLength={8}
+                      maxLength={128}
+                      autoComplete="new-password"
+                      required
+                      className="mt-1 w-full rounded-lg border border-slate-200 px-2 py-1.5 text-sm"
+                    />
+                  </label>
+                  <p className="text-[10px] text-slate-500">Username: 3–32 letters, numbers, _ or -. Password: 8–128 characters.</p>
+                  <button
+                    type="submit"
+                    disabled={isCreatingStudent}
+                    className="w-full rounded-lg bg-blue-600 px-2 py-1.5 text-xs font-semibold text-white disabled:opacity-60"
+                  >
+                    {isCreatingStudent ? 'Creating…' : `Create ${newStudent.role} account`}
+                  </button>
+                </form>
+                {accountManagementError && (
+                  <p role="alert" className="mt-2 text-xs text-red-700">{accountManagementError}</p>
+                )}
+                <div className="mt-3 grid gap-2 sm:grid-cols-2">
+                  {teacherRoster.length === 0 ? (
+                    <p className="text-xs text-slate-500">No classroom accounts found.</p>
+                  ) : teacherRoster.map((user) => (
+                    <div key={user.username} className="flex items-center justify-between rounded-lg border border-slate-200 bg-white px-3 py-2">
+                      <div className="min-w-0">
+                        <p className="truncate text-sm text-slate-700">{user.username}</p>
+                        <p className="text-xs text-slate-500">
+                          Password: {classroomPasswordsByUsername.get(user.username) || 'Not available'}
+                        </p>
+                      </div>
+                      <div className="flex shrink-0 items-center gap-2">
+                        <span className="rounded-full bg-slate-100 px-2 py-1 text-[10px] uppercase text-slate-600">{user.role}</span>
+                        {user.username !== currentUser.username && (
+                          <button
+                            type="button"
+                            onClick={() => handleDeleteUser(user.username)}
+                            disabled={deletingUsername === user.username}
+                            aria-label={`Delete account ${user.username}`}
+                            className="rounded px-2 py-1 text-[10px] font-semibold text-red-700 hover:bg-red-50 disabled:opacity-50"
+                          >
+                            {deletingUsername === user.username ? 'Deleting…' : 'Delete'}
+                          </button>
+                        )}
+                      </div>
+                    </div>
+                  ))}
+                </div>
+              </section>
+              {guestCardGroup && createPortal((
+                <div
+                  id="guest-login-cards"
+                  role="dialog"
+                  aria-modal="true"
+                  aria-label="Guest account login cards"
+                  className="fixed inset-0 z-[10000] overflow-y-auto bg-slate-950/70 p-4"
+                >
+                  <div className="mx-auto max-w-5xl rounded-2xl bg-white p-4 shadow-2xl">
+                    <div className="guest-card-toolbar mb-4 flex flex-wrap items-center justify-between gap-3">
+                      <div>
+                        <h3 className="text-lg font-bold text-slate-900">Guest account login cards</h3>
+                        <p className="text-xs text-slate-600">Card-sized, cut along the dashed borders. Print on A4 portrait paper.</p>
+                      </div>
+                      <div className="flex gap-2">
+                        <button
+                          type="button"
+                          onClick={() => downloadLoginCardsPdf(guestCardGroup)}
+                          className="rounded-lg border border-blue-700 px-3 py-2 text-sm font-semibold text-blue-800"
+                        >
+                          Download PDF
+                        </button>
+                        <button
+                          type="button"
+                          onClick={() => window.print()}
+                          className="rounded-lg bg-blue-700 px-3 py-2 text-sm font-semibold text-white"
+                        >
+                          Print
+                        </button>
+                        <button
+                          type="button"
+                          onClick={() => setGuestCardGroup(null)}
+                          aria-label="Close guest login cards"
+                          className="rounded-lg border border-slate-300 px-3 py-2 text-sm font-semibold text-slate-700"
+                        >
+                          Close
+                        </button>
+                      </div>
+                    </div>
+                    {Array.from(
+                      { length: Math.ceil(guestCardGroup.accounts.length / 10) },
+                      (_, pageIndex) => pageIndex,
+                    ).map((pageIndex) => (
+                      <div key={pageIndex} className="guest-card-page mb-4 grid grid-cols-1 justify-center gap-3 sm:grid-cols-2">
+                        {guestCardGroup.accounts.slice(pageIndex * 10, pageIndex * 10 + 10).map(({ username, password }) => (
+                          <article
+                            key={username}
+                            className="guest-login-card flex h-52 w-full max-w-[22rem] flex-col justify-between rounded-xl border-2 border-dashed border-slate-400 bg-white p-5"
+                          >
+                            <div className="flex items-start justify-between gap-3">
+                              <div>
+                                <p className="text-[10px] font-bold uppercase tracking-[0.2em] text-blue-800">Student login</p>
+                                <p className="mt-1 text-xs text-slate-500">Reusable classroom account</p>
+                              </div>
+                              <span className="rounded-full bg-blue-50 px-2 py-1 text-xs font-bold text-blue-800">GUEST</span>
+                            </div>
+                            <div className="grid grid-cols-2 gap-3">
+                              <div>
+                                <p className="text-[10px] font-semibold uppercase tracking-wide text-slate-500">Username</p>
+                                <p className="mt-1 font-mono text-2xl font-bold tracking-wider text-slate-950">{username}</p>
+                              </div>
+                              <div>
+                                <p className="text-[10px] font-semibold uppercase tracking-wide text-slate-500">Password</p>
+                                <p className="mt-1 font-mono text-lg font-bold tracking-wide text-slate-950">{password}</p>
+                              </div>
+                            </div>
+                            <p className="text-[10px] text-slate-500">Keep this card for future classroom use.</p>
+                          </article>
+                        ))}
+                      </div>
+                    ))}
+                  </div>
+                </div>
+              ), document.body)}
+              <fieldset className="rounded-xl border border-violet-200 bg-violet-50 px-5 py-4">
+                <legend className="text-sm font-semibold text-violet-950">Robot speaker volume</legend>
+                <p className="mt-1 text-xs text-violet-900">
+                  Speech uses the robot's current global speaker volume; TTS has no per-message volume setting. Unitree volume ranges from 0 to 100.
+                </p>
+                <div className="mt-2 flex flex-wrap items-center gap-3">
+                  <label className="flex items-center gap-2 text-xs font-medium text-slate-700">
+                    Volume
+                    <input
+                      type="range"
+                      aria-label="Robot speaker volume"
+                      min="0"
+                      max="100"
+                      step="1"
+                      value={speakerVolume}
+                      disabled={!isRobotConnected || controllerVersion !== 'legacy' || isRunning || isSpeakerVolumeBusy}
+                      onChange={(event) => setSpeakerVolume(Number(event.target.value))}
+                      className="w-40 accent-violet-700 disabled:opacity-50"
+                    />
+                    <span className="min-w-12 text-right tabular-nums">{speakerVolume}/100</span>
+                  </label>
+                  <button
+                    type="button"
+                    onClick={() => handleSpeakerVolume('read')}
+                    disabled={!isRobotConnected || controllerVersion !== 'legacy' || isRunning || isSpeakerVolumeBusy}
+                    className="rounded border border-violet-300 bg-white px-3 py-1.5 text-xs font-semibold text-violet-900 disabled:opacity-50"
+                  >
+                    Read current
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => handleSpeakerVolume('set')}
+                    disabled={!isRobotConnected || controllerVersion !== 'legacy' || isRunning || isSpeakerVolumeBusy}
+                    className="rounded bg-violet-700 px-3 py-1.5 text-xs font-semibold text-white disabled:opacity-50"
+                  >
+                    {isSpeakerVolumeBusy ? 'Working…' : 'Apply volume'}
+                  </button>
+                </div>
+                <p role="status" aria-live="polite" className="mt-2 text-xs text-slate-700">
+                  {controllerVersion !== 'legacy'
+                    ? 'Switch to legacy G1 SDK mode to adjust speaker volume.'
+                    : !isRobotConnected
+                      ? 'Connect the legacy G1 SDK before reading or changing speaker volume.'
+                      : speakerVolumeStatus}
+                </p>
+              </fieldset>
+              <div className="flex items-center justify-between gap-3 rounded-xl border border-cyan-200 bg-cyan-50 px-5 py-4">
+                <div>
+                  <p className="text-sm font-semibold text-gray-800">Shared LiDAR map</p>
+                  <p className="text-xs text-gray-500">Show the teacher-approved room map on student grids.</p>
+                </div>
+                <input
+                  type="checkbox"
+                  aria-label="Show shared LiDAR map overlay in Settings"
+                  checked={sharedLidarOverlayEnabled}
+                  onChange={(event) => handleSharedLidarOverlayToggle(event.target.checked)}
+                  className="h-5 w-5 accent-cyan-700"
+                />
+              </div>
+              <div className="flex items-center justify-between gap-3 rounded-xl border border-blue-200 bg-blue-50 px-5 py-4">
+                <div>
+                  <p className="text-sm font-semibold text-gray-800">DUET version two preview</p>
+                  <p className="text-xs text-gray-600">
+                    Switches Blocks, IDE, simulation, and connection to the separate DUET path. Legacy programs stay unchanged. Teacher-only commissioning unlocks normal physical runs only after every bounded test is physically reviewed.
+                  </p>
+                </div>
+                <input
+                  type="checkbox"
+                  aria-label="Enable DUET version two"
+                  checked={controllerVersion === 'duet'}
+                  disabled={isRunning || isRobotConnecting || isDuetCommissioningBusy || isDuetCommissioningAborting || isArmMotionRecording}
+                  onChange={(event) => handleControllerVersionChange(event.target.checked)}
+                  className="h-5 w-5 shrink-0 accent-blue-700"
+                />
+              </div>
+              <fieldset className="rounded-xl border border-amber-300 bg-amber-50 px-5 py-4">
+                <div className="flex items-start justify-between gap-4">
+                  <div>
+                    <p className="text-sm font-semibold text-amber-950">Safe Mode • registered obstacle coverage</p>
+                    <p className="mt-1 text-xs text-amber-900">
+                      Combines live front/rear clearance with recent LiDAR points registered in the map frame as the robot moves.
+                      Checks the robot's swept footprint during forward, reverse, sideways, and turning motion.
+                      Relevant missing or stale coverage stops movement; arm commands are skipped if the model-derived reach envelope is obstructed.
+                    </p>
+                    <p className="mt-1 text-xs font-medium text-red-800">
+                      Arm geometry is inflated by 0.20 m, but that is not a physical-safety certification. Sensor occlusion, model mismatch,
+                      latency, and stopping distance still require validation on the actual robot.
+                    </p>
+                  </div>
+                  <input
+                    type="checkbox"
+                    aria-label="Enable Safe Mode spatial guards"
+                    checked={safeModeEnabled}
+                    disabled={isSafeModeSettingsLoading || isSafeModeSettingsSaving || isRunning}
+                    onChange={(event) => handleSafeModeToggle(event.target.checked)}
+                    className="mt-1 h-5 w-5 shrink-0 accent-amber-700"
+                  />
+                </div>
+                <p className="mt-2 text-xs text-slate-700">
+                  DUET can stop its active arm/base lease when a relevant obstacle is detected. Legacy arm actions are checked before dispatch,
+                  because mid-action cancellation is unverified. Stale observations only affect an action when their mapped location intersects its swept area.
+                  Autonomous mode 3 and Return to Origin keep Nav2 as the fallback when the optional registered layer is unavailable.
+                </p>
+                {safeModeSettingsError && <p role="alert" className="mt-2 text-xs text-red-700">{safeModeSettingsError}</p>}
+              </fieldset>
+              <fieldset className="rounded-xl border border-slate-200 bg-slate-50 px-5 py-4">
+                <legend className="text-sm font-semibold text-gray-800">Hide sidebar tabs for this teacher account</legend>
+                <p className="mb-2 text-xs text-gray-500">
+                  Hidden tabs stay hidden on other devices when this teacher account signs in.
+                </p>
+                <div className="flex flex-wrap gap-x-5 gap-y-2">
+                  {configurableSidebarPanels.map((panel) => (
+                    <label key={panel.id} className="inline-flex items-center gap-2 text-xs text-gray-700">
+                      <input
+                        type="checkbox"
+                        aria-label={`Hide ${panel.label} tab from sidebar`}
+                        checked={sidebarPanelIsLocked(panel.id)}
+                        disabled={isSidebarSettingsLoading || isSidebarSettingsSaving}
+                        onChange={(event) => handleSidebarPanelLockChange(panel.id, event.target.checked)}
+                        className="h-4 w-4 accent-blue-700"
+                      />
+                      {panel.label}
+                    </label>
+                  ))}
+                </div>
+                {lockedSidebarPanelsError && <p role="alert" className="mt-2 text-xs text-red-600">{lockedSidebarPanelsError}</p>}
+              </fieldset>
+                </>
+              )}
+            </div>
           </div>
         </div>
       )}
@@ -1890,103 +6278,593 @@ export default function App() {
         </div>
       )}
 
-      {showAbout && (
-        <div className="fixed inset-0 z-[9999] flex items-center justify-center bg-black/40 backdrop-blur-sm p-4" onClick={() => setShowAbout(false)}>
-          <div className="bg-white max-w-md w-full rounded-xl shadow-2xl p-8 text-center" onClick={e => e.stopPropagation()}>
-            <div className="w-16 h-16 bg-blue-600 text-white rounded-2xl flex items-center justify-center text-3xl font-bold mx-auto mb-4 shadow-lg shadow-blue-200">U++</div>
-            <h2 className="text-2xl font-bold text-gray-800">{t.appName}</h2><p className="text-sm text-blue-600 font-mono mt-1 mb-6">{t.version}</p><p className="text-gray-600 text-sm leading-relaxed mb-6">{t.aboutContent}</p>
-            <button onClick={() => setShowAbout(false)} className="px-6 py-2 bg-gray-100 hover:bg-gray-200 text-gray-700 rounded-lg font-medium transition-colors">Close</button>
-          </div>
+      {isLibraryOpen && (
+        <div className="fixed inset-0 z-[60] flex items-center justify-center bg-slate-950/50 p-4" onClick={() => setIsLibraryOpen(false)}>
+          <section
+            aria-label="Project library"
+            className="flex max-h-[90vh] w-full max-w-4xl flex-col overflow-hidden rounded-xl bg-white shadow-2xl"
+            onClick={(event) => event.stopPropagation()}
+          >
+            <header className="flex items-center justify-between border-b border-slate-200 bg-slate-50 px-5 py-4">
+              <div>
+                <h2 className="text-lg font-bold text-slate-800">Library</h2>
+                <p className="mt-1 text-xs text-slate-500">Saved projects, starter examples, and your saved code.</p>
+              </div>
+              <button
+                type="button"
+                onClick={() => setIsLibraryOpen(false)}
+                className="rounded-md px-3 py-1.5 text-sm font-medium text-slate-600 hover:bg-slate-200"
+              >
+                Close
+              </button>
+            </header>
+            <div className="grid gap-4 overflow-y-auto p-5 md:grid-cols-2">
+              {renderProjectLibrary()}
+              {renderStarterMotionLibrary()}
+              {currentUser.role === 'student' && (
+                <section className="rounded-xl border border-slate-200 bg-slate-50 p-3 md:col-span-2">
+                  <h3 className="text-sm font-semibold uppercase tracking-wide text-slate-700">My Saved Code</h3>
+                  <div className="mt-2 grid gap-2 sm:grid-cols-2">
+                    {savedCodes.length === 0 ? (
+                      <p className="text-xs text-slate-500">No saved code yet.</p>
+                    ) : savedCodes.map((code) => (
+                      <div key={code.name} className="rounded-lg border border-slate-200 bg-white p-3">
+                        <p className="text-sm font-medium text-slate-800">{code.name}</p>
+                        <p className="mt-1 text-xs text-slate-500">
+                          {code.code.slice(0, 60)}{code.code.length > 60 ? '...' : ''}
+                        </p>
+                        <button
+                          type="button"
+                          onClick={() => {
+                            updateGeneratedCode(code.code);
+                            setIsLibraryOpen(false);
+                          }}
+                          className="mt-2 text-xs text-blue-600 hover:text-blue-700"
+                        >
+                          Load
+                        </button>
+                      </div>
+                    ))}
+                  </div>
+                </section>
+              )}
+            </div>
+          </section>
         </div>
       )}
 
-      <div className="h-9 bg-[#f8f9fa] border-b flex items-center px-2 select-none z-40 text-sm">
-        <div className="flex items-center gap-2 mr-6 px-2"><div className="w-5 h-5 bg-blue-600 text-white rounded flex items-center justify-center font-bold text-xs">U</div><span className="font-semibold text-gray-700 tracking-tight">{t.appName}</span></div>
-        <div className="flex items-center h-full">
-          {[
-            { id: 'file', label: t.menuFile, content: <><MenuItem label={t.actNew} icon={FileText} onClick={() => { handleClear(); setActiveMenu(null); }} /><MenuItem label={t.actOpen} icon={FolderOpen} onClick={handleOpenProjectClick} /><MenuItem label={t.actSave} icon={Save} onClick={() => { saveProject(); setActiveMenu(null); }} /><div className="h-px bg-gray-200 my-1"></div><MenuItem label={t.actExportPy} icon={Download} onClick={() => { downloadPython(); setActiveMenu(null); }} /></> },
-            { id: 'edit', label: t.menuEdit, content: <><MenuItem label={t.actUndo} icon={Undo} shortcut="Ctrl+Z" onClick={() => { handleUndo(); setActiveMenu(null); }} /><MenuItem label={t.actRedo} icon={Redo} shortcut="Ctrl+Y" onClick={() => { handleRedo(); setActiveMenu(null); }} /></> },
-            { id: 'view', label: t.menuView, content: <><MenuItem label={t.actToggleCode} icon={Sidebar} onClick={() => { setIsCodeOpen(!isCodeOpen); setActiveMenu(null); }} /></> },
-            { id: 'help', label: t.menuHelp, content: <><MenuItem label={t.actAbout} icon={Info} onClick={() => { setShowAbout(true); setActiveMenu(null); }} /></> }
-          ].map(menu => (
-            <div key={menu.id} className="relative h-full"><button className={`h-full px-3 hover:bg-gray-200 transition-colors ${activeMenu === menu.id ? 'bg-gray-200 text-blue-700' : 'text-gray-700'}`} onClick={(e) => { e.stopPropagation(); setActiveMenu(activeMenu === menu.id ? null : menu.id); }}>{menu.label}</button>{activeMenu === menu.id && (<div className="absolute top-full left-0 w-56 bg-white border shadow-xl rounded-b-lg rounded-r-lg py-1 z-50 animate-in fade-in zoom-in-95 duration-100" onClick={e => e.stopPropagation()}>{menu.content}</div>)}</div>
-          ))}
+      {starterMotionEditor && (
+        <div className="fixed inset-0 z-[70] flex items-center justify-center bg-slate-950/60 p-4">
+          <section
+            role="dialog"
+            aria-modal="true"
+            aria-labelledby="starter-motion-editor-title"
+            className="flex max-h-[90vh] w-full max-w-2xl flex-col rounded-xl bg-white shadow-2xl"
+          >
+            <header className="border-b border-slate-200 px-5 py-4">
+              <h2 id="starter-motion-editor-title" className="text-lg font-bold text-slate-800">
+                Edit shared {starterMotionEditor.controller_version.toUpperCase()} motion
+              </h2>
+              <p className="mt-1 text-xs text-slate-500">This stores only the command sequence, not a project environment.</p>
+            </header>
+            <div className="space-y-3 overflow-y-auto p-5">
+              <label className="block text-xs font-semibold text-slate-700">
+                Motion name
+                <input
+                  value={starterMotionEditor.name}
+                  onChange={(event) => setStarterMotionEditor((motion) => ({ ...motion, name: event.target.value }))}
+                  maxLength={80}
+                  className="mt-1 w-full rounded-md border border-slate-300 px-3 py-2 text-sm"
+                />
+              </label>
+              <label className="block text-xs font-semibold text-slate-700">
+                Sequence
+                <textarea
+                  value={starterMotionEditor.code}
+                  onChange={(event) => setStarterMotionEditor((motion) => ({ ...motion, code: event.target.value }))}
+                  rows={12}
+                  spellCheck={false}
+                  className="mt-1 w-full resize-y rounded-md border border-slate-300 bg-slate-950 p-3 font-mono text-xs leading-5 text-slate-100"
+                />
+              </label>
+            </div>
+            <footer className="flex justify-end gap-2 border-t border-slate-200 px-5 py-4">
+              <button type="button" onClick={() => setStarterMotionEditor(null)} className="rounded-md border border-slate-300 px-4 py-2 text-sm text-slate-700">
+                Cancel
+              </button>
+              <button type="button" onClick={saveStarterMotionEdit} className="rounded-md bg-blue-700 px-4 py-2 text-sm font-semibold text-white">
+                Save changes
+              </button>
+            </footer>
+          </section>
         </div>
-        <div className="flex-1"></div>
-        <button onClick={toggleLanguage} className="flex items-center gap-1 text-xs text-gray-500 hover:text-blue-600 px-3 transition-colors"><Globe size={12} /> {lang === 'zh' ? 'English' : '中文'}</button>
-      </div>
+      )}
 
-      <div className="h-12 bg-white border-b flex items-center px-4 gap-2 z-30 shadow-sm">
-        <button onClick={() => setShowConfigEditor(true)} className="p-2 text-gray-600 hover:bg-blue-50 hover:text-blue-600 rounded transition-colors" title={t.configTitle}><Settings size={20} /></button>
-        <div className="w-px h-6 bg-gray-200 mx-1"></div>
-        <button onClick={handleUndo} className="p-2 text-gray-600 hover:bg-gray-100 rounded transition-colors" title={t.actUndo}><Undo size={20} /></button>
-        <button onClick={handleRedo} className="p-2 text-gray-600 hover:bg-gray-100 rounded transition-colors" title={t.actRedo}><Redo size={20} /></button>
-        <div className="w-px h-6 bg-gray-200 mx-1"></div>
-        {currentUser.role === 'teacher' ? (
-          <>
-            <button onClick={handleRunNext} className="flex items-center gap-2 px-3 py-1.5 text-white bg-blue-600 hover:bg-blue-700 rounded text-sm font-medium">Run Next</button>
-            <button onClick={handleStopCurrent} className="flex items-center gap-2 px-3 py-1.5 text-white bg-amber-500 hover:bg-amber-600 rounded text-sm font-medium">Pause</button>
-            <button onClick={handleClearQueue} className="flex items-center gap-2 px-3 py-1.5 text-white bg-red-500 hover:bg-red-600 rounded text-sm font-medium">Clear Queue</button>
-          </>
-        ) : (
-          <>
-            <button onClick={handleSaveCodeToAccount} className="flex items-center gap-2 px-3 py-1.5 text-white bg-emerald-600 hover:bg-emerald-700 rounded text-sm font-medium">Save</button>
-            <button onClick={handleSubmitToQueue} className="flex items-center gap-2 px-3 py-1.5 text-white bg-violet-600 hover:bg-violet-700 rounded text-sm font-medium">Submit</button>
-          </>
+      {(isQueueOpen || isConnectionPanelOnly || isObjectPanelOpen) && (
+      <div
+        className="fixed inset-0 z-50 bg-slate-950/20"
+        onClick={() => {
+          setIsQueueOpen(false);
+          setIsConnectionPanelOnly(false);
+          setIsObjectPanelOpen(false);
+        }}
+      >
+      <div className="absolute right-4 top-24 z-10 flex max-h-[calc(100vh-7rem)] w-[min(360px,calc(100vw-2rem))] flex-col gap-3 overflow-y-auto overscroll-contain pr-1" onClick={(event) => event.stopPropagation()}>
+        {isConnectionPanelOnly && (
+          <section role="dialog" aria-modal="true" aria-label="Robot connection panel" className="rounded-xl border border-slate-200 bg-white shadow-xl">
+            <header className="flex items-center justify-between border-b border-slate-200 bg-slate-50 p-3">
+              <h2 className="font-semibold text-slate-800">Connection</h2>
+              <button
+                type="button"
+                onClick={() => setIsConnectionPanelOnly(false)}
+                className="rounded-md p-1 text-slate-500 hover:bg-slate-200 hover:text-slate-800"
+                aria-label="Close connection panel"
+              >
+                <X size={16} />
+              </button>
+            </header>
+            <div ref={setConnectionTabTarget} className="p-3" />
+          </section>
         )}
-        <button onClick={handleRunCode} className={`flex items-center gap-2 px-4 py-1.5 text-white rounded font-medium text-sm transition-colors shadow-sm ${isRunning ? 'bg-red-600 hover:bg-red-700' : 'bg-green-600 hover:bg-green-700'}`} title={isRunning ? t.btnStop : t.btnRun}>
-          {isRunning ? <Square size={16} fill="currentColor" /> : <Play size={16} fill="currentColor" />} {isRunning ? t.btnStop : t.btnRun}
-        </button>
-        <div className="flex-1"></div>
-        <div className="flex items-center gap-2 text-xs text-slate-500">
-          <span className="rounded-full bg-slate-100 px-2 py-1 font-medium">{currentUser.role}</span>
-          <span>{currentUser.username}</span>
-          <button onClick={handleLogout} className="px-2 py-1 rounded bg-slate-100 hover:bg-slate-200">Logout</button>
-        </div>
-        <button onClick={() => setIsCodeOpen(!isCodeOpen)} className={`flex items-center gap-2 px-3 py-1.5 text-sm font-medium rounded border transition-all ${isCodeOpen ? 'bg-blue-50 border-blue-200 text-blue-700' : 'bg-white border-gray-200 text-gray-600 hover:bg-gray-50'}`}><Code size={16} />{isCodeOpen ? 'Hide Code' : 'Show Code'}</button>
-      </div>
-
-      <div className="absolute right-4 top-20 z-40 w-[320px] flex flex-col gap-3">
-        <div className="max-h-[420px] overflow-auto rounded-xl border border-slate-200 bg-white shadow-xl">
+        <div className={`max-h-[420px] overflow-auto rounded-xl border border-slate-200 bg-white shadow-xl ${isConnectionPanelOnly || isObjectPanelOpen ? 'hidden' : ''}`}>
           <div className="border-b border-slate-200 p-3 bg-slate-50 flex items-center justify-between">
-            <h3 className="font-semibold text-slate-800">{currentUser.role === 'teacher' ? 'Teacher Queue' : 'My Saved Code'}</h3>
-            <span className="text-xs rounded-full bg-blue-100 text-blue-700 px-2 py-1">{classroomStatus}</span>
+            <h3 className="font-semibold text-slate-800">Teacher Queue</h3>
+            <div className="flex items-center gap-2">
+              <span className="text-xs rounded-full bg-blue-100 text-blue-700 px-2 py-1" aria-label={`Classroom queue: ${classroomStatus}`}>
+                Queue: {classroomStatus}
+              </span>
+              <button type="button" onClick={() => setIsQueueOpen(false)} className="rounded-md p-1 text-slate-500 hover:bg-slate-200 hover:text-slate-800" aria-label="Close queue">
+                <X size={16} />
+              </button>
+            </div>
           </div>
           <div className="p-3 space-y-3">
             {currentUser.role === 'teacher' && (
               <>
-                <div className="rounded-xl border border-blue-200 bg-blue-50 p-3">
-                  <p className="text-[10px] uppercase tracking-wide text-blue-700 font-semibold">G1 connection</p>
-                  <div className="mt-2 flex gap-2">
-                    <input
-                      type="text"
-                      value={robotAddress}
-                      onChange={(e) => setRobotAddress(e.target.value)}
-                      className="w-full border border-blue-200 rounded-lg px-2 py-1.5 text-sm bg-white focus:outline-none focus:ring-2 focus:ring-blue-500"
-                      placeholder="192.168.123.164"
-                    />
-                    <button onClick={handleConnectRobot} className="rounded-lg bg-blue-600 text-white px-2.5 py-1.5 text-xs font-medium">Connect</button>
+                {connectionTabTarget && createPortal(
+                  <>
+                    <div data-testid="teacher-robot-settings" className="rounded-xl border border-blue-200 bg-blue-50 p-3">
+                  <div className="flex items-center justify-between gap-2">
+                    <p className="text-[10px] uppercase tracking-wide text-blue-700 font-semibold">Robot connection</p>
+                    <span
+                      role="status"
+                      aria-live="polite"
+                      className={`rounded-full px-2 py-1 text-[10px] font-bold ${
+                        isRobotConnected
+                          ? 'bg-green-100 text-green-800'
+                          : isRobotConnecting
+                            ? 'bg-amber-100 text-amber-800'
+                            : 'bg-slate-200 text-slate-700'
+                      }`}
+                    >
+                      {isRobotConnected ? 'CONNECTED' : isRobotConnecting ? 'CONNECTING' : 'DISCONNECTED'}
+                    </span>
                   </div>
+                  <div className="mt-2 flex gap-2">
+                    <button
+                      onClick={handleConnectRobot}
+                      disabled={isRobotConnecting || isRunning || isDuetCommissioningBusy}
+                      className="flex-1 rounded-lg bg-blue-600 text-white px-2.5 py-1.5 text-xs font-medium disabled:cursor-wait disabled:opacity-60"
+                    >
+                      {isRobotConnecting
+                        ? 'Connecting…'
+                        : controllerVersion === 'duet' && isRobotConnected
+                          ? 'Disconnect DUET'
+                          : isRobotConnected ? 'Reconnect' : 'Connect'}
+                    </button>
+                    {isRobotConnected && controllerVersion !== 'duet' && (
+                      <button
+                        type="button"
+                        onClick={handleTestRobotMotion}
+                        disabled={isRunning || isRobotConnecting}
+                        className="flex-1 rounded-lg bg-amber-500 text-slate-950 px-2.5 py-1.5 text-xs font-semibold disabled:cursor-wait disabled:opacity-60"
+                      >
+                        {isRunning ? 'Motion test running…' : 'Test motion'}
+                      </button>
+                    )}
+                  </div>
+                  <div className="mt-2 flex items-center gap-2">
+                    <button
+                      type="button"
+                      onClick={handleTestLidar}
+                      disabled={isLidarTesting || isRobotConnecting}
+                      className="rounded-lg border border-cyan-700 bg-white px-2.5 py-1.5 text-xs font-semibold text-cyan-800 disabled:cursor-wait disabled:opacity-60"
+                    >
+                      {isLidarTesting ? 'Testing LiDAR…' : 'Test LiDAR'}
+                    </button>
+                    <span role="status" aria-live="polite" className="min-w-0 text-xs text-slate-700">
+                      {lidarTestStatus}
+                    </span>
+                  </div>
+                  <p className="mt-2 text-[10px] text-slate-600">
+                    {controllerVersion === 'duet'
+                      ? 'Connect acquires the DUET command lease without starting movement. Teacher-only commissioning is required before normal physical runs; the legacy SDK path is not used.'
+                      : 'Connect uses the G1 host&apos;s configured Ethernet interface. Test LiDAR reads backend sensor status without robot motion; simulation works while disconnected.'}
+                  </p>
                   <p className={`mt-2 text-xs ${isRobotConnected ? 'text-green-700' : 'text-slate-600'}`}>{robotConnectionStatus}</p>
+                  <div className="mt-3 space-y-2 rounded-lg border border-blue-100 bg-white p-2">
+                    <div className="flex gap-2">
+                      <button
+                        type="button"
+                        onClick={handleSetNavigationHome}
+                        disabled={isSettingNavigationHome}
+                        className="flex-1 rounded-md border border-cyan-600 bg-cyan-50 px-2 py-1.5 text-[10px] font-semibold text-cyan-900 disabled:opacity-50"
+                      >
+                        {isSettingNavigationHome ? 'Saving…' : 'Set Origin'}
+                      </button>
+                      <button
+                        type="button"
+                        onClick={handleReturnNavigationHome}
+                        disabled={isReturningNavigationHome || !navigationHome}
+                        className="flex-1 rounded-md border border-emerald-600 bg-emerald-50 px-2 py-1.5 text-[10px] font-semibold text-emerald-900 disabled:opacity-50"
+                      >
+                        {isReturningNavigationHome ? 'Returning…' : 'Return to Origin'}
+                      </button>
+                    </div>
+                    <p className="text-[10px] text-slate-700">
+                      {navigationHome
+                        ? `Origin ${navigationHome.map_id} ${navigationHome.map_version} • (${navigationHome.x.toFixed(2)}, ${navigationHome.y.toFixed(2)}) • yaw ${navigationHome.yaw_rad.toFixed(2)} rad`
+                        : 'No shared origin saved yet.'}
+                    </p>
+                    <p className="text-[10px] text-slate-500" role="status" aria-live="polite">{navigationHomeStatus}</p>
+                  </div>
                 </div>
 
-                <div className="rounded-xl border border-slate-200 bg-slate-50 p-3">
-                  <p className="text-[10px] uppercase tracking-wide text-slate-600 font-semibold">Class roster</p>
-                  <div className="mt-2 space-y-2">
-                    {teacherRoster.length === 0 ? (
-                      <p className="text-xs text-slate-500">No students yet.</p>
-                    ) : teacherRoster.map((user) => (
-                      <div key={user.username} className="flex items-center justify-between rounded-lg bg-white border border-slate-200 px-2 py-1.5">
-                        <span className="text-sm text-slate-700">{user.username}</span>
-                        <span className="text-[10px] uppercase rounded-full bg-slate-100 text-slate-600 px-2 py-1">{user.role}</span>
+                {controllerVersion === 'duet' && currentUser.role === 'teacher' && (
+                  <div className="rounded-xl border border-amber-300 bg-amber-50 p-3">
+                    <div className="flex items-start justify-between gap-3">
+                      <div>
+                        <p className="text-[10px] uppercase tracking-wide text-amber-900 font-semibold">Teacher-only DUET commissioning</p>
+                        <p className="mt-1 text-[10px] text-slate-700">
+                          Runs one bounded test at a time and pauses for your physical pass/fail review. It tests every catalog pose, authored arm command, legacy gesture and mirror, base direction, concurrent control, lease expiry, and STOP/reset.
+                        </p>
                       </div>
-                    ))}
+                      <span className="shrink-0 rounded-full bg-white px-2 py-1 text-[10px] font-semibold text-slate-700">
+                        {duetCommissioning?.status || 'loading'}
+                      </span>
+                    </div>
+                    {duetCommissioning?.commissioning_enabled !== true && (
+                      <p className="mt-2 rounded-lg border border-amber-300 bg-white p-2 text-[10px] text-amber-950">
+                        Guided commissioning is disabled. Enable both DUET_PHYSICAL_ENABLED and DUET_COMMISSIONING_ENABLED on the backend to expose the teacher test controls.
+                      </p>
+                    )}
+                    {duetCommissioning?.status === 'not_started' && (
+                      <p className="mt-2 text-[10px] text-slate-700">No commissioning report exists. Physical DUET program execution remains locked until the sequence is completed and teacher-reviewed.</p>
+                    )}
+                    {duetCommissioning?.status === 'passed' && (
+                      <p className="mt-2 rounded-lg border border-green-200 bg-green-50 p-2 text-[10px] text-green-900">
+                        Teacher-reviewed commissioning report: {duetCommissioning.acceptance_id}. This report does not certify supervised hardware acceptance or unlock normal runs. A qualified operator must separately document acceptance on the exact G1 and deployed policy and configure the matching DUET_HARDWARE_ACCEPTANCE_ID.
+                      </p>
+                    )}
+                    {duetCommissioning?.steps?.length > 0 && (
+                      <div className="mt-2">
+                        <div className="flex justify-between text-[10px] text-slate-600">
+                          <span>{duetCommissioning.steps.filter((step) => step.status === 'passed').length} / {duetCommissioning.steps.length} steps passed</span>
+                          <span>Policy {duetCommissioning.policy_id}</span>
+                        </div>
+                        <div className="mt-1 h-1.5 overflow-hidden rounded bg-white">
+                          <div
+                            className="h-full bg-green-600 transition-all"
+                            style={{ width: `${(duetCommissioning.steps.filter((step) => step.status === 'passed').length / duetCommissioning.steps.length) * 100}%` }}
+                          />
+                        </div>
+                      </div>
+                    )}
+                    {duetCommissioning?.status === 'in_progress' && (() => {
+                      const stepIndex = duetCommissioning.current_step;
+                      const step = duetCommissioning.steps?.[stepIndex];
+                      if (!step) return null;
+                      return (
+                        <div className="mt-3 rounded-lg border border-amber-200 bg-white p-2">
+                          <p className="text-xs font-semibold text-slate-900">Step {stepIndex + 1} of {duetCommissioning.steps.length}: {step.title}</p>
+                          <p className="mt-1 text-[10px] text-slate-700">{step.expected}</p>
+                          {['pending', 'awaiting_review'].includes(step.status) && (
+                            <button
+                              type="button"
+                              onClick={() => handleRunDuetCommissioningStep(step.status === 'awaiting_review')}
+                              disabled={!isRobotConnected || isDuetCommissioningBusy || isRobotConnecting || duetCommissioning?.commissioning_enabled !== true}
+                              className="mt-2 rounded-lg bg-amber-600 px-3 py-1.5 text-xs font-semibold text-white disabled:opacity-50"
+                            >
+                              {isDuetCommissioningBusy
+                                ? 'Running…'
+                                : step.status === 'awaiting_review'
+                                  ? 'Run again'
+                                  : `Run test ${stepIndex + 1}`}
+                            </button>
+                          )}
+                          {step.status === 'running' && (
+                            <p role="status" className="mt-2 text-xs font-semibold text-amber-800">Test is running. Stop remains available.</p>
+                          )}
+                          {step.status === 'awaiting_review' && (
+                            <div className="mt-2 space-y-2">
+                              <pre className="max-h-40 overflow-auto rounded bg-slate-950 p-2 text-[9px] text-green-200">
+                                {JSON.stringify(step.result, null, 2)}
+                              </pre>
+                              {step.result?.armTelemetry?.map((measurement, measurementIndex) => (
+                                <div
+                                  key={`${measurement.pose || 'arm'}-${measurementIndex}`}
+                                  className="rounded border border-slate-200 bg-slate-50 p-2 text-[9px] text-slate-700"
+                                >
+                                  <p className="font-semibold">
+                                    {measurement.pose || 'Arm target'} · left max error {Number(measurement.leftMaximumErrorRad).toFixed(3)} rad · right max error {Number(measurement.rightMaximumErrorRad).toFixed(3)} rad
+                                  </p>
+                                  <p className="mt-1 break-words">
+                                    Expected target [L/R, radians]: {JSON.stringify(measurement.target)}
+                                  </p>
+                                  <p className="break-words">
+                                    Measured joints [L/R, radians]: {JSON.stringify(measurement.measured)}
+                                  </p>
+                                </div>
+                              ))}
+                              {step.feedback_within_tolerance === false && (
+                                <p className="rounded bg-red-50 p-2 text-[10px] text-red-800">
+                                  Measured joints exceeded 0.25 rad error for at least one requested target. Passing is disabled; fail this step and inspect the terminal JSONL log.
+                                </p>
+                              )}
+                              <label className="flex items-start gap-2 text-[10px] text-slate-800">
+                                <input
+                                  type="checkbox"
+                                  checked={duetCommissioningObserved}
+                                  onChange={(event) => setDuetCommissioningObserved(event.target.checked)}
+                                  className="mt-0.5 accent-amber-700"
+                                />
+                                I physically observed the expected robot response for this test.
+                              </label>
+                              <textarea
+                                aria-label="DUET commissioning observed result"
+                                value={duetCommissioningObservedResult}
+                                onChange={(event) => setDuetCommissioningObservedResult(event.target.value)}
+                                maxLength={1000}
+                                required
+                                placeholder="Required: describe what you observed (for example, direction, arm response, stop result, or discrepancy)"
+                                className="w-full rounded border border-slate-300 px-2 py-1.5 text-[10px]"
+                                rows={2}
+                              />
+                              <textarea
+                                aria-label="DUET commissioning additional notes"
+                                value={duetCommissioningNotes}
+                                onChange={(event) => setDuetCommissioningNotes(event.target.value)}
+                                maxLength={1000}
+                                placeholder="Optional additional notes"
+                                className="w-full rounded border border-slate-300 px-2 py-1.5 text-[10px]"
+                                rows={2}
+                              />
+                              <div className="flex gap-2">
+                                <button
+                                  type="button"
+                                  onClick={() => handleReviewDuetCommissioningStep(true)}
+                                  disabled={!duetCommissioningObserved || !duetCommissioningObservedResult.trim() || step.feedback_within_tolerance === false || isDuetCommissioningBusy}
+                                  className="flex-1 rounded-lg bg-green-700 px-2 py-1.5 text-xs font-semibold text-white disabled:opacity-50"
+                                >
+                                  Next
+                                </button>
+                                <button
+                                  type="button"
+                                  onClick={() => handleReviewDuetCommissioningStep(false)}
+                                  disabled={isDuetCommissioningAborting || !duetCommissioningObservedResult.trim() || isDuetCommissioningBusy}
+                                  className="flex-1 rounded-lg bg-red-700 px-2 py-1.5 text-xs font-semibold text-white disabled:opacity-50"
+                                >
+                                  Fail and stop sequence
+                                </button>
+                              </div>
+                            </div>
+                          )}
+                        </div>
+                      );
+                    })()}
+                    <div className="mt-2 flex gap-2">
+                      {['not_started', 'failed', 'aborted', 'passed'].includes(duetCommissioning?.status) && (
+                        <button
+                          type="button"
+                          onClick={handleStartDuetCommissioning}
+                          disabled={!isRobotConnected || isDuetCommissioningBusy || isRunning || isRobotConnecting || duetCommissioning?.commissioning_enabled !== true}
+                          className="rounded-lg bg-amber-700 px-3 py-1.5 text-xs font-semibold text-white disabled:opacity-50"
+                        >
+                          {duetCommissioning?.status === 'not_started' ? 'Start full test sequence' : 'Start a new full test'}
+                        </button>
+                      )}
+                      {duetCommissioning?.status === 'in_progress' && (
+                        <button
+                          type="button"
+                          onClick={handleAbortDuetCommissioning}
+                          disabled={isDuetCommissioningBusy}
+                          className="rounded-lg border border-red-400 bg-white px-3 py-1.5 text-xs font-semibold text-red-800 disabled:opacity-50"
+                        >
+                          Abort and request STOP
+                        </button>
+                      )}
+                    </div>
+                    <details className="mt-2">
+                      <summary className="cursor-pointer text-[10px] font-medium text-slate-700">Report identity and reviewed test history</summary>
+                      <pre className="mt-1 max-h-40 overflow-auto rounded bg-white p-2 text-[9px] text-slate-700">
+                        {JSON.stringify(duetCommissioning, null, 2)}
+                      </pre>
+                    </details>
+                    {['passed', 'failed', 'aborted'].includes(duetCommissioning?.status) && (
+                      <div className="mt-2 rounded-lg border border-slate-200 bg-white p-2">
+                        <div className="flex items-center justify-between gap-2">
+                          <p className="text-[10px] font-semibold text-slate-800">Full report and append-only event log</p>
+                          <button
+                            type="button"
+                            onClick={handleCopyDuetCommissioningEvidence}
+                            disabled={!duetCommissioningEvidence}
+                            className="rounded bg-slate-800 px-2 py-1 text-[10px] font-semibold text-white disabled:opacity-50"
+                          >
+                            Copy evidence
+                          </button>
+                        </div>
+                        <textarea
+                          ref={duetCommissioningEvidenceRef}
+                          aria-label="Selectable DUET commissioning report and event log"
+                          readOnly
+                          value={duetCommissioningEvidence
+                            ? JSON.stringify({
+                              report: duetCommissioningEvidence.report,
+                              event_log: duetCommissioningEvidence.event_log,
+                            }, null, 2)
+                            : 'Loading full commissioning evidence…'}
+                          onFocus={(event) => event.target.select()}
+                          className="mt-2 w-full rounded border border-slate-300 bg-slate-50 p-2 font-mono text-[9px] text-slate-700"
+                          rows={10}
+                        />
+                        <p role="status" aria-live="polite" className="mt-1 text-[9px] text-slate-600">
+                          {duetCommissioningCopyStatus}
+                        </p>
+                      </div>
+                    )}
+                    <p className="mt-2 text-[9px] text-slate-600">
+                      Logs are written to the backend terminal and {duetCommissioning?.log_path || 'the DUET control directory commissioning.jsonl'}. This sequence cannot certify balance, every environment, future motion, or emergency-stop hardware; acceptance applies only to the reviewed test run.
+                    </p>
                   </div>
+                )}
+
+                <div className="rounded-xl border border-cyan-200 bg-cyan-50 p-3">
+                  <div className="flex items-center justify-between gap-2">
+                    <div>
+                      <p className="text-[10px] uppercase tracking-wide text-cyan-800 font-semibold">Sensors and diagnostics</p>
+                      <p className="mt-1 text-[10px] text-slate-600">Teacher-only controls; no network, topic, frame, or route editing.</p>
+                    </div>
+                    <button
+                      type="button"
+                      onClick={handleDiscoverSensors}
+                      disabled={isSensorDiscovering}
+                      className="rounded-lg bg-cyan-700 px-2.5 py-1.5 text-xs font-semibold text-white disabled:opacity-60"
+                    >
+                      {isSensorDiscovering ? 'Discovering…' : 'Discover sensors'}
+                    </button>
+                  </div>
+                  <p role="status" aria-live="polite" className="mt-2 text-[10px] text-slate-700">
+                    {sensorOperationStatus || 'Run discovery to check each source independently.'}
+                  </p>
+                  {sensorDiagnostics && (
+                    <div className="mt-2 space-y-2">
+                      <div className="rounded-lg border border-cyan-100 bg-white p-2">
+                        <div className="flex items-center justify-between gap-2">
+                          <span className="text-xs font-semibold text-slate-800">MID-360</span>
+                          <span className="text-[10px] text-slate-600">
+                            {sensorDiagnostics.lidar?.discovery?.connection?.method || 'unknown'}
+                            {' · '}
+                            {sensorDiagnostics.lidar?.calibration?.status === 'model_derived'
+                              ? 'model-derived (provisional)'
+                              : sensorDiagnostics.lidar?.calibration?.status || 'unverified'}
+                          </span>
+                        </div>
+                        <p className="mt-1 text-[10px] text-slate-600">
+                          {sensorDiagnostics.lidar?.calibration?.reason
+                            || sensorDiagnostics.lidar?.discovery?.connection?.reason
+                            || 'No LiDAR diagnostic reported.'}
+                        </p>
+                        {(sensorDiagnostics.lidar?.discovery?.ros?.pointclouds || []).map((source) => (
+                          <p key={source.name} className="mt-1 break-all text-[10px] text-slate-600">
+                            {source.name} · {source.fresh ? 'fresh' : 'unavailable'}
+                            {source.frame_id ? ` · frame ${source.frame_id}` : ''}
+                            {source.age_ms != null ? ` · ${Math.round(source.age_ms)} ms old` : ''}
+                            {source.error ? ` · ${source.error}` : ''}
+                          </p>
+                        ))}
+                        {(sensorDiagnostics.lidar?.discovery?.ros?.sources || []).map((source) => (
+                          <p key={`${source.role}:${source.name}`} className="mt-1 break-all text-[10px] text-slate-600">
+                            {source.role.replaceAll('_', ' ')}: {source.name} · {source.fresh ? 'fresh' : 'unavailable'}
+                            {source.frame_id ? ` · frame ${source.frame_id}` : ''}
+                            {source.age_ms != null ? ` · ${Math.round(source.age_ms)} ms old` : ''}
+                            {source.error ? ` · ${source.error}` : ''}
+                          </p>
+                        ))}
+                        {sensorDiagnostics.lidar?.calibration?.candidate_mounts?.mid360?.available && (
+                          <p className="mt-1 text-[10px] text-amber-700">
+                            Nominal model mount ({sensorDiagnostics.lidar.calibration.candidate_mounts.mid360.parent_frame} → {sensorDiagnostics.lidar.calibration.candidate_mounts.mid360.sensor_frame}; physical fit not independently checked): {sensorDiagnostics.lidar.calibration.candidate_mounts.mid360.translation_m.map((value) => Number(value).toFixed(3)).join(', ')} m
+                          </p>
+                        )}
+                        <p className="mt-1 text-[10px] text-slate-600">
+                          Forward distance: {sensorDiagnostics.lidar?.distance?.ready ? 'ready' : sensorDiagnostics.lidar?.distance?.error || 'unavailable'}
+                          {' · '}
+                          Rear distance: {sensorDiagnostics.lidar?.distance?.rear?.ready ? 'ready' : sensorDiagnostics.lidar?.distance?.rear?.error || 'unavailable'}
+                        </p>
+                        {(
+                          sensorDiagnostics.lidar?.distance?.sources?.length
+                            ? sensorDiagnostics.lidar.distance.sources.map((source) => ({ sector: 'forward', source }))
+                            : (sensorDiagnostics.lidar?.calibration?.source_status || []).map((source) => ({ sector: 'source', source }))
+                        ).concat(
+                          (sensorDiagnostics.lidar?.distance?.rear?.sources || []).map((source) => ({ sector: 'rear', source })),
+                        ).map(({ sector, source }) => (
+                          <p key={`${sector}:${source.id}`} className="mt-1 break-all text-[10px] text-slate-500">
+                            {sector} · {source.topic || source.id} · {source.contributing ? 'contributing' : source.status || 'unavailable'}
+                            {source.sensor_frame_id ? ` · frame ${source.sensor_frame_id}` : ''}
+                            {source.age_ms != null ? ` · ${Math.round(source.age_ms)} ms old` : ''}
+                            {source.receive_age_ms != null ? ` · receive ${Math.round(source.receive_age_ms)} ms` : ''}
+                            {source.stamp_age_ms != null ? ` · stamp ${Math.round(source.stamp_age_ms)} ms` : ''}
+                            {source.coverage?.length ? ` · ${source.coverage.join('/')}` : ''}
+                            {source.error ? ` · ${source.error}` : ''}
+                          </p>
+                        ))}
+                        {['direct_livox', 'existing_driver'].includes(
+                          sensorDiagnostics.lidar?.discovery?.connection?.method,
+                        ) && (
+                          <button
+                            type="button"
+                            onClick={() => handleSensorServiceOperation('lidar_driver', 'repair')}
+                            disabled={Boolean(sensorOperationBusy)}
+                            className="mt-2 rounded-md border border-cyan-300 bg-white px-2 py-1 text-[10px] font-semibold text-cyan-900 disabled:opacity-50"
+                          >
+                            {sensorOperationBusy === 'lidar_driver:repair' ? 'Repairing…' : 'Restart managed LiDAR driver'}
+                          </button>
+                        )}
+                      </div>
+                      {Object.entries(sensorDiagnostics.cameras?.sources || {}).map(([sourceId, source]) => {
+                        return (
+                          <div key={sourceId} className="rounded-lg border border-cyan-100 bg-white p-2">
+                            <div className="flex items-center justify-between gap-2">
+                              <span className="text-xs font-semibold text-slate-800">
+                                {sourceId === 'unitree' ? 'Unitree camera' : 'USB RealSense'}
+                              </span>
+                              <span className={`text-[10px] ${source.ready ? 'text-emerald-700' : 'text-amber-700'}`}>
+                                {source.status}
+                              </span>
+                            </div>
+                            <p className="mt-1 text-[10px] text-slate-600">{source.reason}</p>
+                            {[...(source.image_topics || []), ...(source.camera_info_topics || [])].map((topic) => (
+                              <p key={`${topic.name}:${topic.type}`} className="mt-1 break-all text-[10px] text-slate-500">
+                                {topic.name} · {topic.type}
+                                {topic.frame_id ? ` · frame ${topic.frame_id}` : ''}
+                                {topic.age_ms != null ? ` · ${Math.round(topic.age_ms)} ms old` : ''}
+                              </p>
+                            ))}
+                            {source.intrinsics && (
+                              <p className="mt-1 text-[10px] text-slate-500">
+                                Intrinsics: fx {source.intrinsics.fx_px}, fy {source.intrinsics.fy_px}, cx {source.intrinsics.cx_px}, cy {source.intrinsics.cy_px} px
+                              </p>
+                            )}
+                            {source.devices?.map((device) => (
+                              <p key={device.usb_path} className="mt-1 text-[10px] text-slate-500">
+                                {device.product || device.usb_path}
+                                {device.serial ? ` · serial ${device.serial}` : ''}
+                              </p>
+                            ))}
+                          </div>
+                        );
+                      })}
+                      {(sensorDiagnostics.lidar?.discovery?.diagnostics || []).map((diagnostic) => (
+                        <p key={diagnostic} className="break-words text-[10px] text-amber-800">{diagnostic}</p>
+                      ))}
+                    </div>
+                  )}
+                  <p className="mt-2 text-[9px] text-slate-500">
+                    Camera frames are transient only. No video is recorded or saved. Registered LiDAR-camera fusion requires verified transforms and time alignment.
+                  </p>
+                </div>
+
+                  </>,
+                  connectionTabTarget,
+                )}
+                <div className="grid grid-cols-3 gap-2">
+                  <button type="button" onClick={handleRunNext} className="rounded-lg bg-blue-600 px-2 py-2 text-[10px] font-semibold text-white hover:bg-blue-700">Run next</button>
+                  <button type="button" onClick={handleStopCurrent} className="rounded-lg bg-amber-500 px-2 py-2 text-[10px] font-semibold text-slate-950 hover:bg-amber-400">Pause</button>
+                  <button type="button" onClick={handleClearQueue} className="rounded-lg bg-red-500 px-2 py-2 text-[10px] font-semibold text-white hover:bg-red-600">Clear queue</button>
                 </div>
               </>
             )}
 
-            {currentUser.role === 'teacher' ? (
+            {currentUser.role === 'teacher' && (
               <>
                 {queueItems.length === 0 ? <p className="text-sm text-slate-500">No student jobs queued.</p> : queueItems.map((item) => (
                   <div key={item.id} className="rounded-lg border border-slate-200 p-2">
@@ -1994,46 +6872,56 @@ export default function App() {
                       <p className="font-medium text-slate-800 text-sm truncate">{item.name}</p>
                       <span className="text-[10px] uppercase bg-slate-100 text-slate-600 rounded-full px-2 py-1">{item.status}</span>
                     </div>
-                    <p className="text-xs text-slate-500 mt-1">by {item.student}</p>
+                    <p className="text-xs text-slate-500 mt-1">
+                      by {item.student} • {item.controller_version === 'duet' ? 'DUET v2' : 'legacy SDK'}
+                    </p>
+                    {item.planner_request && (
+                      <p className="mt-1 text-[10px] font-semibold text-cyan-800">
+                        Planner request • {PLANNER_MODE_LABELS[item.planner_request.planner_mode] || item.planner_request.planner_mode}
+                        {item.planner_request.navigation
+                          ? ` • ${item.planner_request.navigation.waypoints.length} Nav2 goal(s) • map ${item.planner_request.navigation.map_id} ${item.planner_request.navigation.version}`
+                          : ` • ${(item.planner_request.planner_waypoints || []).length} grid waypoint(s)`}
+                      </p>
+                    )}
+                    <details className="mt-2 rounded-md bg-slate-50 p-2">
+                      <summary className="cursor-pointer text-[10px] font-semibold text-blue-700">
+                        Review exact command preview
+                      </summary>
+                      <pre className="mt-2 max-h-36 overflow-auto whitespace-pre-wrap break-words rounded bg-slate-900 p-2 text-[10px] text-slate-100">
+                        {item.code || '(No SDK/DUET commands yet; review the requested planner goals below.)'}
+                      </pre>
+                      {item.planner_request && (
+                        <pre className="mt-2 max-h-28 overflow-auto whitespace-pre-wrap break-words rounded bg-slate-100 p-2 text-[10px] text-slate-700">
+                          {JSON.stringify(item.planner_request, null, 2)}
+                        </pre>
+                      )}
+                    </details>
+                    <button
+                      type="button"
+                      onClick={() => handleLoadQueueItemForReview(item)}
+                      className="mt-2 rounded-md border border-blue-200 px-2 py-1 text-[10px] font-semibold text-blue-700 hover:bg-blue-50"
+                    >
+                      Review request
+                    </button>
                     <button onClick={() => handleDeleteQueueItem(item.id)} className="mt-2 text-xs text-red-600 hover:text-red-700">Delete</button>
                   </div>
                 ))}
-
-                <div className="rounded-xl border border-slate-200 bg-slate-50 p-3">
-                  <p className="text-[10px] uppercase tracking-wide text-slate-600 font-semibold">Student projects</p>
-                  <div className="mt-2 space-y-2">
-                    {projectLibrary.length === 0 ? (
-                      <p className="text-xs text-slate-500">No student projects yet.</p>
-                    ) : projectLibrary.map((project) => (
-                      <div key={`${project.username}-${project.name}`} className="rounded-lg border border-slate-200 bg-white p-2">
-                        <div className="flex items-center justify-between gap-2">
-                          <span className="text-sm font-medium text-slate-800">{project.name}</span>
-                          <span className="text-[10px] uppercase rounded-full bg-slate-100 text-slate-600 px-2 py-1">{project.username}</span>
-                        </div>
-                        <button type="button" onClick={() => loadProjectFromLibrary(project)} className="mt-2 text-xs text-blue-600 hover:text-blue-700">Open project</button>
-                      </div>
-                    ))}
-                  </div>
-                </div>
               </>
-            ) : (
-              savedCodes.length === 0 ? <p className="text-sm text-slate-500">No saved code yet.</p> : savedCodes.map((code) => (
-                <div key={code.name} className="rounded-lg border border-slate-200 p-2">
-                  <p className="font-medium text-slate-800 text-sm">{code.name}</p>
-                  <p className="text-xs text-slate-500 mt-1">{code.code.slice(0, 60)}{code.code.length > 60 ? '...' : ''}</p>
-                </div>
-              ))
             )}
           </div>
         </div>
 
-        <div className="rounded-xl border border-slate-200 bg-white shadow-xl overflow-hidden">
-          <div className="border-b border-slate-200 bg-slate-50 p-3 flex items-center justify-between">
-            <div>
-              <h3 className="font-semibold text-slate-800">{G1_EDU_23_ENV.robotType} Internal Simulator</h3>
-              <p className="text-[10px] uppercase tracking-wide text-slate-500">23-DoF local environment</p>
-            </div>
-            <span className="text-xs rounded-full bg-emerald-100 text-emerald-700 px-2 py-1">{simulatorState.status}</span>
+        <div
+          role="dialog"
+          aria-modal="true"
+          aria-label="Object area"
+          className={`flex max-h-[calc(100vh-8rem)] min-h-0 flex-col rounded-xl border border-slate-200 bg-white shadow-xl ${isObjectPanelOpen ? '' : 'hidden'}`}
+        >
+          <div className="flex items-center justify-between border-b border-slate-200 bg-slate-50 p-3">
+            <h2 className="font-semibold text-slate-800">Objects</h2>
+            <button type="button" onClick={() => setIsObjectPanelOpen(false)} aria-label="Close object area" className="rounded-md p-1 text-slate-500 hover:bg-slate-200 hover:text-slate-800">
+              <X size={16} />
+            </button>
           </div>
 
           <div className="border-b border-slate-200 bg-slate-50 px-3 pt-3">
@@ -2041,14 +6929,12 @@ export default function App() {
               {[
                 { id: 'add-object', label: 'Add Object' },
                 { id: 'scene-objects', label: 'Scene Objects' },
-                { id: 'planner', label: 'Motion Planner' },
-                { id: 'settings', label: 'Settings' },
               ].map((tab) => (
                 <button
                   key={tab.id}
                   type="button"
-                  onClick={() => setSimulatorSidebarTab(tab.id)}
-                  className={`flex-1 rounded-t-md border-b-2 px-2 py-2 text-[10px] font-semibold uppercase tracking-wide transition ${simulatorSidebarTab === tab.id ? 'border-blue-600 bg-white text-blue-700' : 'border-transparent bg-slate-100 text-slate-500 hover:bg-slate-200'}`}
+                  onClick={() => setObjectPanelTab(tab.id)}
+                  className={`flex-1 rounded-t-md border-b-2 px-2 py-2 text-[10px] font-semibold uppercase tracking-wide transition ${objectPanelTab === tab.id ? 'border-blue-600 bg-white text-blue-700' : 'border-transparent bg-slate-100 text-slate-500 hover:bg-slate-200'}`}
                 >
                   {tab.label}
                 </button>
@@ -2056,8 +6942,8 @@ export default function App() {
             </div>
           </div>
 
-          <div className="p-3 space-y-3">
-            {simulatorSidebarTab === 'add-object' && (
+          <div className="min-h-0 flex-1 space-y-3 overflow-y-auto overscroll-contain p-3">
+            {objectPanelTab === 'add-object' && (
               <>
                 <div className="grid grid-cols-3 gap-2">
                   {OBJECT_LIBRARY.map((objectType) => (
@@ -2073,31 +6959,20 @@ export default function App() {
                   ))}
                 </div>
 
-                <div className="rounded-lg border border-slate-200 bg-white p-2">
-                  <p className="text-[10px] uppercase tracking-wide text-slate-500 mb-2">Teacher challenge</p>
-                  <div className="grid grid-cols-2 gap-2">
-                    {Object.entries(G1_EDU_23_ENV.challengeLayouts).map(([key, challenge]) => (
-                      <button
-                        key={key}
-                        type="button"
-                        onClick={() => handleChallengeChange(key)}
-                        className={`rounded-md px-2 py-1.5 text-[10px] font-medium ${simulatorChallenge === key ? 'bg-emerald-600 text-white' : 'bg-slate-100 text-slate-700 hover:bg-slate-200'}`}
-                      >
-                        {challenge.label}
-                      </button>
-                    ))}
-                  </div>
-                </div>
               </>
             )}
 
-            {simulatorSidebarTab === 'scene-objects' && (
+            {objectPanelTab === 'scene-objects' && (
               <div className="space-y-2">
                 {sceneObjects.length === 0 ? (
                   <p className="rounded-lg border border-dashed border-slate-200 bg-slate-50 p-3 text-xs text-slate-500">No scene objects yet. Add one from the object library.</p>
                 ) : (
                   sceneObjects.map((obstacle) => (
-                    <div key={obstacle.id} className="rounded-lg border border-slate-200 bg-slate-50 p-2">
+                    <div
+                      key={obstacle.id}
+                      onClick={() => setSelectedSceneObjectId(obstacle.id)}
+                      className={`rounded-lg border p-2 ${selectedSceneObjectId === obstacle.id ? 'border-blue-400 bg-blue-50 ring-1 ring-blue-200' : 'border-slate-200 bg-slate-50'}`}
+                    >
                       <div className="mb-2 flex items-center justify-between">
                         <span className="text-[10px] font-semibold uppercase tracking-wide text-slate-600">{obstacle.label}</span>
                         <button type="button" onClick={() => removeStudentObstacle(obstacle.id)} className="text-[10px] text-red-600">Delete</button>
@@ -2116,40 +6991,26 @@ export default function App() {
                           <input type="number" value={obstacle.radius} min="4" max="24" step="1" onChange={(event) => updateStudentObstacle(obstacle.id, { radius: Number(event.target.value) })} className="mt-1 w-full rounded border border-slate-200 bg-white px-1 py-1" />
                         </label>
                       </div>
-                    </div>
-                  ))
-                )}
-              </div>
-            )}
-
-            {simulatorSidebarTab === 'planner' && (
-              <div className="space-y-3">
-                <div className="flex gap-2">
-                  <button type="button" onClick={addPlannerWaypoint} className="flex-1 rounded-lg bg-blue-600 px-2 py-1.5 text-[10px] font-semibold text-white hover:bg-blue-700">Add waypoint</button>
-                  <button type="button" onClick={compilePlannerPath} className="flex-1 rounded-lg bg-emerald-600 px-2 py-1.5 text-[10px] font-semibold text-white hover:bg-emerald-700">Compile path</button>
-                </div>
-                <div className="rounded-lg border border-slate-200 bg-slate-50 p-2 text-[10px] text-slate-600">
-                  <p className="font-semibold uppercase tracking-wide text-slate-500">Planner instructions</p>
-                  <p className="mt-2">Place and drag waypoints in the scene. Compile creates robot walk commands that update the IDE and block output.</p>
-                </div>
-                {plannerWaypoints.length === 0 ? (
-                  <p className="rounded-lg border border-dashed border-slate-200 bg-slate-50 p-3 text-xs text-slate-500">No waypoints yet.</p>
-                ) : (
-                  plannerWaypoints.map((point, index) => (
-                    <div key={point.id} className="rounded-lg border border-slate-200 bg-white p-2">
-                      <div className="mb-2 flex items-center justify-between">
-                        <span className="text-[10px] font-semibold uppercase tracking-wide text-slate-600">Waypoint {index + 1}</span>
-                        <button type="button" onClick={() => removePlannerWaypoint(point.id)} className="text-[10px] text-red-600">Delete</button>
-                      </div>
-                      <div className="grid grid-cols-2 gap-2 text-[10px] text-slate-600">
-                        <label>
-                          X
-                          <input type="number" value={point.x} step="0.5" onChange={(event) => updatePlannerWaypoint(point.id, { x: Number(event.target.value) })} className="mt-1 w-full rounded border border-slate-200 bg-slate-50 px-1 py-1" />
-                        </label>
-                        <label>
-                          Y
-                          <input type="number" value={point.y} step="0.5" onChange={(event) => updatePlannerWaypoint(point.id, { y: Number(event.target.value) })} className="mt-1 w-full rounded border border-slate-200 bg-slate-50 px-1 py-1" />
-                        </label>
+                      <div className="mt-2 grid grid-cols-3 gap-2 text-[10px] text-slate-600">
+                        {Object.entries(getSceneObjectDimensions(obstacle)).map(([dimension, value]) => (
+                          <label key={dimension}>
+                            {dimension === 'width' ? 'Width (m)' : dimension === 'height' ? 'Height (m)' : 'Depth (m)'}
+                            <input
+                              type="number"
+                              value={value}
+                              min="0.1"
+                              max="8"
+                              step="0.1"
+                              onChange={(event) => updateStudentObstacle(obstacle.id, {
+                                dimensions: {
+                                  ...getSceneObjectDimensions(obstacle),
+                                  [dimension]: Math.min(8, Math.max(0.1, Number(event.target.value))),
+                                },
+                              })}
+                              className="mt-1 w-full rounded border border-slate-200 bg-white px-1 py-1"
+                            />
+                          </label>
+                        ))}
                       </div>
                     </div>
                   ))
@@ -2157,261 +7018,82 @@ export default function App() {
               </div>
             )}
 
-            {simulatorSidebarTab === 'settings' && (
-              <div className="space-y-3">
-                <div className="rounded-lg border border-slate-200 bg-white p-2">
-                  <p className="text-[10px] uppercase tracking-wide text-slate-500 mb-2">Preview mode</p>
-                  <div className="flex gap-2">
-                    {Object.entries(SIMULATOR_MODES).map(([key, mode]) => (
-                      <button
-                        key={key}
-                        type="button"
-                        onClick={() => setSimulatorMode(key)}
-                        className={`flex-1 rounded-lg px-2 py-1.5 text-[10px] font-semibold transition ${simulatorMode === key ? 'bg-blue-600 text-white' : 'bg-slate-100 text-slate-600 hover:bg-slate-200'}`}
-                      >
-                        {mode.label}
-                      </button>
-                    ))}
-                  </div>
-                </div>
-
-                <div className="rounded-lg border border-slate-200 bg-slate-50 p-2 text-[11px] text-slate-600">
-                  <div className="flex items-center justify-between"><span>Robot</span><span className="font-medium text-slate-700">{G1_EDU_23_ENV.robotType}</span></div>
-                  <div className="mt-2 flex items-center justify-between"><span>Goal</span><span className="font-medium text-slate-700">{simulatorState.goal ? `${simulatorState.goal.x.toFixed(1)}, ${simulatorState.goal.y.toFixed(1)}` : 'None'}</span></div>
-                  <div className="mt-2 flex items-center justify-between"><span>Collisions</span><span className="font-medium text-slate-700">{simulatorState.collisions || 0}</span></div>
-                </div>
-              </div>
-            )}
-
-            <div className="flex gap-2">
-              <button
-                type="button"
-                onClick={startSimulationPreview}
-                className={`flex-1 rounded-lg px-2 py-1.5 text-[10px] font-semibold ${isPreviewPlaying ? 'bg-slate-200 text-slate-600' : 'bg-emerald-600 text-white hover:bg-emerald-700'}`}
-                disabled={isPreviewPlaying}
-              >
-                Play sim
-              </button>
-              <button
-                type="button"
-                onClick={pauseSimulationPreview}
-                className={`flex-1 rounded-lg px-2 py-1.5 text-[10px] font-semibold ${isPreviewPlaying ? 'bg-amber-500 text-white hover:bg-amber-600' : 'bg-slate-100 text-slate-600 hover:bg-slate-200'}`}
-              >
-                Pause sim
-              </button>
-            </div>
-
-            <div className="rounded-xl border border-slate-200 bg-slate-100 p-2">
-              <svg viewBox="0 0 220 220" className="w-full h-40 block" onPointerMove={handleObstaclePointerMove} onPointerUp={handleObstaclePointerUp} onPointerLeave={handleObstaclePointerUp}>
-                <defs>
-                  <pattern id="grid-pattern" width="20" height="20" patternUnits="userSpaceOnUse">
-                    <path d="M 20 0 L 0 0 0 20" fill="none" stroke="#dfe7f3" strokeWidth="1"/>
-                  </pattern>
-                </defs>
-                <rect x="0" y="0" width="220" height="220" fill="url(#grid-pattern)" rx="12"/>
-                {activeObstacles.map((obstacle) => {
-                  const isStudentObstacle = String(obstacle.id).startsWith('student-');
-                  const isEditable = currentUser.role !== 'teacher' && isStudentObstacle;
-                  const color = obstacle.color || (isStudentObstacle ? '#a78bfa' : '#fbbf24');
-                  return (
-                    <g key={obstacle.id} onPointerDown={isEditable ? (event) => handleObstaclePointerDown(event, obstacle.id) : undefined} style={{ cursor: isEditable ? 'grab' : 'default' }}>
-                      <circle
-                        cx={110 + obstacle.x * 1.5}
-                        cy={110 - obstacle.y * 1.5}
-                        r={obstacle.radius * 1.5}
-                        fill={color}
-                        fillOpacity={isStudentObstacle ? 0.45 : 0.35}
-                        stroke={isStudentObstacle ? '#7c3aed' : '#f59e0b'}
-                        strokeWidth={isEditable ? 2.5 : 2}
-                        strokeDasharray={isEditable ? '0' : '6 3'}
-                      />
-                      {isEditable && <text x={110 + obstacle.x * 1.5} y={110 - obstacle.y * 1.5 + 4} textAnchor="middle" fontSize="8" fill="#fff">drag</text>}
-                    </g>
-                  );
-                })}
-                {plannerWaypoints.length > 0 && (
-                  <g>
-                    <polyline
-                      points={plannerWaypoints.map((point) => `${110 + point.x * 1.5},${110 - point.y * 1.5}`).join(' ')}
-                      fill="none"
-                      stroke="#22c55e"
-                      strokeWidth="3"
-                      strokeDasharray="6 4"
-                      opacity="0.9"
-                    />
-                    {plannerWaypoints.map((point, index) => (
-                      <g key={point.id} onPointerDown={(event) => handlePlannerWaypointPointerDown(event, point.id)} style={{ cursor: 'pointer' }}>
-                        <circle cx={110 + point.x * 1.5} cy={110 - point.y * 1.5} r="6" fill="#22c55e" stroke="#14532d" strokeWidth="2" />
-                        <text x={110 + point.x * 1.5} y={110 - point.y * 1.5 + 3} textAnchor="middle" fontSize="7" fill="#fff" fontWeight="700">{index + 1}</text>
-                      </g>
-                    ))}
-                  </g>
-                )}
-                {simulatorState.goal && (
-                  <g>
-                    <circle cx={110 + simulatorState.goal.x * 1.5} cy={110 - simulatorState.goal.y * 1.5} r={simulatorState.goal.radius * 1.5} fill={simulatorState.goalReached ? '#34d399' : '#a7f3d0'} fillOpacity="0.35" stroke="#22c55e" strokeWidth="2"/>
-                    <text x={110 + simulatorState.goal.x * 1.5} y={110 - simulatorState.goal.y * 1.5 - 12} textAnchor="middle" fontSize="9" fill="#166534" fontWeight="700">GOAL</text>
-                  </g>
-                )}
-                <polyline
-                  points={simulatorState.path.map((point) => `${110 + point.x * 1.5},${110 - point.y * 1.5}`).join(' ')}
-                  fill="none"
-                  stroke="#60a5fa"
-                  strokeWidth="3"
-                  strokeLinejoin="round"
-                  strokeLinecap="round"
-                  opacity="0.9"
-                />
-                <g transform={`translate(${110 + simulatorState.x * 1.5}, ${110 - simulatorState.y * 1.5}) rotate(${simulatorState.heading})`}>
-                  <rect x="-12" y="-10" width="24" height="20" rx="6" fill="#2563eb" stroke="#0f172a" strokeWidth="2"/>
-                  <polygon points="18,0 28,6 18,12" fill="#f59e0b"/>
-                  <circle cx="0" cy="0" r="3" fill="#f8fafc"/>
-                </g>
-              </svg>
-            </div>
-
-            <div className="space-y-2">
-              {G1_MOTION_TEMPLATES.map((template) => (
-                <button
-                  key={template.id}
-                  type="button"
-                  onClick={() => applyMotionTemplate(template)}
-                  className="w-full rounded-lg border border-slate-200 bg-white px-2 py-1.5 text-left text-xs font-medium text-slate-700 hover:bg-slate-50"
-                >
-                  {template.label}
-                </button>
-              ))}
-            </div>
-
-            <div className="flex items-center justify-between text-xs text-slate-600">
-              <span>Position: {simulatorState.x.toFixed(1)}, {simulatorState.y.toFixed(1)}</span>
-              <span>Heading: {simulatorState.heading.toFixed(0)}°</span>
-            </div>
-            <div className="grid grid-cols-2 gap-2 text-[11px] text-slate-600">
-              <div className="rounded-lg border border-slate-200 bg-slate-50 px-2 py-1.5">Torso pitch: {simulatorState.torsoPitch.toFixed(1)}°</div>
-              <div className="rounded-lg border border-slate-200 bg-slate-50 px-2 py-1.5">Torso roll: {simulatorState.torsoRoll.toFixed(1)}°</div>
-              <div className="rounded-lg border border-slate-200 bg-slate-50 px-2 py-1.5">Joints: {G1_EDU_23_ENV.jointCount}</div>
-              <div className="rounded-lg border border-slate-200 bg-slate-50 px-2 py-1.5">Collisions: {simulatorState.collisions || 0}</div>
-            </div>
-            <div className="rounded-lg border border-slate-200 bg-slate-50 px-2 py-1.5 text-[11px] text-slate-700">
-              <span className="font-semibold">Mission:</span> {simulatorState.goalReached ? 'Goal reached ✓' : simulatorState.blocked ? 'Stuck on obstacle ⚠️' : 'In progress'}
-            </div>
-            <div className="space-y-2">
-              {simulatorState.actions.map((action, index) => (
-                <div key={`${action.label}-${index}`} className="rounded-lg border border-slate-200 bg-slate-50 px-2 py-1.5">
-                  <p className="text-xs font-semibold text-slate-700">{action.label}</p>
-                  <p className="text-[11px] text-slate-500">{action.summary}</p>
-                </div>
-              ))}
-            </div>
-            <div className="space-y-2">
-              <p className="text-[10px] uppercase tracking-wide text-slate-500">Replay timeline</p>
-              {(simulatorState.timeline?.length ? simulatorState.timeline : [{ label: 'Waiting', summary: 'No motion yet' }]).slice(0, 5).map((step, index) => (
-                <div key={`${step.label}-${index}`} className="rounded-lg border border-slate-200 bg-white px-2 py-1.5">
-                  <p className="text-[11px] font-semibold text-slate-700">{step.label}</p>
-                  <p className="text-[10px] text-slate-500">{step.summary}</p>
-                </div>
-              ))}
-            </div>
           </div>
         </div>
       </div>
-
-      <div className="border-b border-slate-200 bg-slate-900 px-4 py-3 shadow-sm">
-        <div className="flex items-center gap-2 overflow-x-auto">
-          {overlayTabs.map((tab) => (
-            <button
-              key={tab.id}
-              type="button"
-              onClick={() => setMainTab(tab.id)}
-              className={`rounded-lg px-3 py-2 text-sm font-medium transition whitespace-nowrap ${mainTab === tab.id ? 'bg-blue-600 text-white shadow-sm' : 'bg-slate-100 text-slate-600 hover:bg-slate-200'}`}
-            >
-              {tab.label}
-            </button>
-          ))}
-        </div>
       </div>
+      )}
 
-      <div className="relative flex-1 overflow-hidden scene-shell">
-        <div className="absolute inset-0 bg-[radial-gradient(circle_at_top,_rgba(148,163,184,0.28),_rgba(15,23,42,0.04)_45%,_rgba(15,23,42,0.1))]" />
-        <div className="scene-platform absolute left-[-8%] right-[-8%] top-[16%] bottom-[-8%] rounded-[28%]" />
-        <div className="absolute inset-0">
-          <svg viewBox="0 0 220 220" className="scene-svg h-full w-full block">
-            <defs>
-              <pattern id="workspace-grid" width="20" height="20" patternUnits="userSpaceOnUse">
-                <path d="M 20 0 L 0 0 0 20" fill="none" stroke="#dfe7f3" strokeWidth="1"/>
-              </pattern>
-            </defs>
-            <rect x="0" y="0" width="220" height="220" fill="url(#workspace-grid)" />
-            {activeObstacles.map((obstacle) => {
-              const isStudentObstacle = String(obstacle.id).startsWith('student-');
-              const color = obstacle.color || (isStudentObstacle ? '#a78bfa' : '#fbbf24');
-              return (
-                <g key={obstacle.id}>
-                  <circle
-                    cx={110 + obstacle.x * 1.5}
-                    cy={110 - obstacle.y * 1.5}
-                    r={obstacle.radius * 1.5}
-                    fill={color}
-                    fillOpacity={isStudentObstacle ? 0.45 : 0.35}
-                    stroke={isStudentObstacle ? '#7c3aed' : '#f59e0b'}
-                    strokeWidth="2"
-                    strokeDasharray={isStudentObstacle ? '0' : '6 3'}
-                  />
-                </g>
-              );
-            })}
-            {plannerWaypoints.length > 0 && (
-              <g>
-                <polyline
-                  points={plannerWaypoints.map((point) => `${110 + point.x * 1.5},${110 - point.y * 1.5}`).join(' ')}
-                  fill="none"
-                  stroke="#22c55e"
-                  strokeWidth="3"
-                  strokeDasharray="6 4"
-                  opacity="0.9"
-                />
-                {plannerWaypoints.map((point, index) => (
-                  <g key={point.id}>
-                    <circle cx={110 + point.x * 1.5} cy={110 - point.y * 1.5} r="6" fill="#22c55e" stroke="#14532d" strokeWidth="2" />
-                    <text x={110 + point.x * 1.5} y={110 - point.y * 1.5 + 3} textAnchor="middle" fontSize="7" fill="#fff" fontWeight="700">{index + 1}</text>
-                  </g>
-                ))}
-              </g>
-            )}
-            {simulatorState.goal && (
-              <g>
-                <circle cx={110 + simulatorState.goal.x * 1.5} cy={110 - simulatorState.goal.y * 1.5} r={simulatorState.goal.radius * 1.5} fill={simulatorState.goalReached ? '#34d399' : '#a7f3d0'} fillOpacity="0.35" stroke="#22c55e" strokeWidth="2" />
-                <text x={110 + simulatorState.goal.x * 1.5} y={110 - simulatorState.goal.y * 1.5 - 12} textAnchor="middle" fontSize="9" fill="#166534" fontWeight="700">GOAL</text>
-              </g>
-            )}
-            <polyline
-              points={simulatorState.path.map((point) => `${110 + point.x * 1.5},${110 - point.y * 1.5}`).join(' ')}
-              fill="none"
-              stroke="#60a5fa"
-              strokeWidth="3"
-              strokeLinejoin="round"
-              strokeLinecap="round"
-              opacity="0.9"
-            />
-            {robotBody}
-          </svg>
-        </div>
-
-        {mainTab === 'blocks' && (
-          <div className="absolute inset-0 z-10 pointer-events-none">
-            <div ref={blocklyDiv} className="absolute inset-y-0 left-0 right-20 overflow-hidden pointer-events-auto" />
-          </div>
+      <div ref={sceneShellRef} className="relative flex-1 overflow-hidden scene-shell">
+        {isSimulationVisible && (
+          <>
+            <div className="absolute inset-0 bg-[radial-gradient(circle_at_top,_rgba(148,163,184,0.28),_rgba(15,23,42,0.04)_45%,_rgba(15,23,42,0.1))]" />
+            <div className="scene-platform absolute left-[-8%] right-[-8%] top-[16%] bottom-[-8%] rounded-[28%]" />
+            <div data-testid="simulation-view" className="absolute inset-0">
+              <G1Simulation3D
+                code={generatedCode}
+                simulatorState={simulatorState}
+                controllerVersion={controllerVersion}
+                recordedMotionPreview={recordedMotionPreview}
+                obstacles={activeObstacles}
+                waypoints={plannerWaypoints}
+                isWaypointPlacementEnabled={isWaypointPlacementEnabled}
+                onObstacleSelect={selectSceneObject}
+                onObstacleChange={updateStudentObstacle}
+                onWaypointChange={updatePlannerWaypoint}
+                onWaypointPlace={placePlannerWaypoint}
+                isPlaying={isPreviewPlaying}
+                playbackSpeed={playbackSpeed}
+                playbackProgress={playbackProgress}
+                gridSize={gridSize}
+                onPlaybackProgress={setPlaybackProgress}
+                onPlaybackToggle={(playing) => playing ? startSimulationPreview() : pauseSimulationPreview()}
+                onPlaybackReset={resetSimulationPreview}
+                onPlaybackSpeedChange={handlePlaybackSpeedChange}
+                workspacePanelRef={workspacePanelRef}
+              />
+            </div>
+          </>
         )}
 
         <div
-          className="absolute right-0 top-0 bottom-0 z-20 flex flex-col border-l border-slate-700 bg-slate-950/85 backdrop-blur-sm shadow-[0_0_30px_rgba(15,23,42,0.4)] transition-all duration-300"
-          style={{ width: toolPanelCollapsed ? 48 : toolPanelWidth }}
+          ref={workspacePanelRef}
+          data-testid="workspace-panel"
+          className={`z-40 flex flex-col overflow-visible border border-slate-700 bg-slate-950/90 shadow-[0_0_30px_rgba(15,23,42,0.5)] backdrop-blur-sm ${isSimulationVisible ? 'absolute rounded-xl' : 'relative h-full w-full rounded-none shadow-none'}`}
+          style={{
+            ...(isSimulationVisible ? {
+              top: toolPanelRect.top,
+              right: toolPanelCollapsed ? 16 : toolPanelRect.right,
+              width: toolPanelCollapsed ? 48 : `min(${toolPanelRect.width}px, calc(100% - 16px))`,
+              height: toolPanelCollapsed ? 48 : `min(${toolPanelRect.height}px, calc(100% - 16px))`,
+              maxHeight: 'calc(100% - 16px)',
+            } : {}),
+          }}
+          onPointerMove={updateToolPanelInteraction}
+          onPointerUp={endToolPanelInteraction}
+          onPointerCancel={endToolPanelInteraction}
         >
-          <div className="flex items-center justify-between border-b border-slate-700 bg-slate-900 px-2 py-2">
+          {isSimulationVisible && !toolPanelCollapsed && (
+            <>
+              <div className="absolute -left-1 top-3 bottom-3 z-40 w-2 cursor-ew-resize" onPointerDown={(event) => beginToolPanelInteraction(event, 'left')} />
+              <div className="absolute -right-1 top-3 bottom-3 z-40 w-2 cursor-ew-resize" onPointerDown={(event) => beginToolPanelInteraction(event, 'right')} />
+              <div className="absolute left-3 right-3 -top-1 z-40 h-2 cursor-ns-resize" onPointerDown={(event) => beginToolPanelInteraction(event, 'top')} />
+              <div className="absolute left-3 right-3 -bottom-1 z-40 h-2 cursor-ns-resize" onPointerDown={(event) => beginToolPanelInteraction(event, 'bottom')} />
+              <div className="absolute -left-1 -top-1 z-40 h-3 w-3 cursor-nwse-resize" onPointerDown={(event) => beginToolPanelInteraction(event, 'left top')} />
+              <div className="absolute -right-1 -top-1 z-40 h-3 w-3 cursor-nesw-resize" onPointerDown={(event) => beginToolPanelInteraction(event, 'right top')} />
+              <div className="absolute -left-1 -bottom-1 z-40 h-3 w-3 cursor-nesw-resize" onPointerDown={(event) => beginToolPanelInteraction(event, 'left bottom')} />
+              <div className="absolute -right-1 -bottom-1 z-40 h-3 w-3 cursor-nwse-resize" onPointerDown={(event) => beginToolPanelInteraction(event, 'right bottom')} />
+            </>
+          )}
+          <div
+            className={`flex items-center justify-between border-b border-slate-700 bg-slate-900 px-2 py-2 ${isSimulationVisible ? 'cursor-move' : ''}`}
+            onPointerDown={isSimulationVisible ? (event) => beginToolPanelInteraction(event, 'move') : undefined}
+          >
             <button
               type="button"
               onClick={() => setToolPanelCollapsed((value) => !value)}
+              onPointerDown={(event) => event.stopPropagation()}
+              aria-label={toolPanelCollapsed ? 'Expand workspace panel' : 'Collapse workspace panel'}
               className="inline-flex h-7 w-7 items-center justify-center rounded-md bg-slate-800 text-slate-200 hover:bg-slate-700"
             >
               {toolPanelCollapsed ? '»' : '«'}
@@ -2421,21 +7103,160 @@ export default function App() {
                 {overlayTabs.find((tab) => tab.id === mainTab)?.label}
               </span>
             )}
-            {!toolPanelCollapsed && (
-              <button
-                type="button"
-                onClick={() => setToolPanelWidth((value) => Math.min(560, value + 40))}
-                className="inline-flex h-7 w-7 items-center justify-center rounded-md bg-slate-800 text-slate-200 hover:bg-slate-700"
-                aria-label="Expand panel"
-              >
-                +
-              </button>
-            )}
+            {!toolPanelCollapsed && <div className="h-7 w-7" aria-hidden="true" />}
           </div>
 
-          {toolPanelCollapsed ? (
+          {!toolPanelCollapsed && (
+            <div className="border-b border-slate-700 bg-slate-900/90 p-2">
+              <div data-testid="workspace-actions" className="flex flex-wrap items-center gap-2">
+                <button type="button" onClick={handleRunSimulation} className="flex-1 rounded-md bg-emerald-500 px-2 py-2 text-[10px] font-bold text-slate-950 hover:bg-emerald-400">
+                  {isPreviewPlaying ? 'Running simulation' : 'Run simulation'}
+                </button>
+                {currentUser.role === 'student' && (
+                  <button type="button" onClick={handleSubmitToQueue} className="flex-1 rounded-md bg-violet-500 px-2 py-2 text-[10px] font-bold text-white hover:bg-violet-400">
+                    Submit to teacher
+                  </button>
+                )}
+                {currentUser.role === 'teacher' && (
+                  <button type="button" onClick={() => { setIsConnectionPanelOnly(false); setIsQueueOpen(true); }} className="flex-1 rounded-md bg-blue-500 px-2 py-2 text-[10px] font-bold text-white hover:bg-blue-400">
+                    Open queue
+                  </button>
+                )}
+                <button
+                  type="button"
+                  onClick={() => setIsLibraryOpen(true)}
+                  className="rounded-md bg-slate-700 px-2 py-2 text-[10px] font-bold text-white hover:bg-slate-600"
+                  title="Open project library"
+                >
+                    Library
+                </button>
+                {currentUser.role === 'teacher' && (
+                  <button
+                    type="button"
+                    onClick={handleRunCode}
+                    disabled={lidarScanJob?.status === 'scanning' && !isRunning}
+                    className="rounded-md bg-amber-500 px-2 py-2 text-[10px] font-bold text-slate-950 hover:bg-amber-400 disabled:cursor-not-allowed disabled:opacity-50"
+                    title={lidarScanJob?.status === 'scanning' ? 'SDK motion is locked while the LiDAR room scan is capturing' : isRunning ? 'Stops locomotion; cannot cancel an active arm preset' : 'Run code on connected robot'}
+                  >
+                    {isRunning ? 'Stop robot' : 'Robot run'}
+                  </button>
+                )}
+              </div>
+              <div className="mt-2 flex items-center justify-between text-[10px] text-slate-400">
+                <span>{currentUser.role === 'teacher' ? 'Teacher workspace' : 'Student workspace'}</span>
+                <div className="flex items-center gap-2">
+                  {currentUser.role === 'teacher' && (
+                    <button
+                      type="button"
+                      onClick={() => {
+                        setIsQueueOpen(false);
+                        setIsObjectPanelOpen(false);
+                        setIsConnectionPanelOnly(true);
+                      }}
+                      aria-label="Open robot connection"
+                      className="text-slate-300 hover:text-white"
+                    >
+                      Connection
+                    </button>
+                  )}
+                  <button
+                    type="button"
+                    onClick={() => {
+                      setIsQueueOpen(false);
+                      setIsConnectionPanelOnly(false);
+                      setIsObjectPanelOpen(true);
+                    }}
+                    aria-label="Open objects area"
+                    className="text-slate-300 hover:text-white"
+                  >
+                    Objects
+                  </button>
+                  <div className="relative">
+                    <button
+                      type="button"
+                      aria-label="Open project actions"
+                      aria-expanded={activeMenu === 'project'}
+                      onClick={(event) => {
+                        event.stopPropagation();
+                        if (activeMenu === 'project') {
+                          setActiveMenu(null);
+                          return;
+                        }
+                        const bounds = event.currentTarget.getBoundingClientRect();
+                        const margin = 8;
+                        const width = Math.min(224, window.innerWidth - margin * 2);
+                        const above = bounds.top - margin;
+                        const below = window.innerHeight - bounds.bottom - margin;
+                        const openAbove = above >= below;
+                        const availableHeight = Math.max(1, Math.min(520, openAbove ? above : below));
+                        setProjectMenuPosition({
+                          position: 'fixed',
+                          left: Math.max(margin, Math.min(bounds.left, window.innerWidth - width - margin)),
+                          top: openAbove
+                            ? Math.max(margin, bounds.top - availableHeight - margin)
+                            : bounds.bottom + margin,
+                          maxHeight: availableHeight,
+                        });
+                        setActiveMenu('project');
+                      }}
+                      className="text-slate-300 hover:text-white"
+                    >
+                      {t.projectMenu}
+                    </button>
+                    {activeMenu === 'project' && createPortal(
+                      <div
+                        role="menu"
+                        aria-label="Project actions"
+                        className="z-[100] w-56 max-w-[calc(100vw-1rem)] overflow-y-auto rounded-xl border border-slate-700 bg-slate-900 py-1 text-slate-200 shadow-xl"
+                        style={projectMenuPosition}
+                        onClick={(event) => event.stopPropagation()}
+                      >
+                        <MenuItem dark label={t.actSaveToAccount} icon={Save} onClick={() => { handleSaveCodeToAccount(); setActiveMenu(null); }} />
+                        <MenuItem dark label="Save as Project" icon={Save} onClick={() => { promptSaveNamedProject(); setActiveMenu(null); }} />
+                        {currentUser.role === 'teacher' && (
+                          <MenuItem dark label="Save as Starter Motion" icon={Save} onClick={() => { saveAsStarterMotion(); setActiveMenu(null); }} />
+                        )}
+                        <div className="my-1 h-px bg-slate-700"></div>
+                        <MenuItem dark label={t.actNew} icon={FileText} onClick={() => { handleClear(); setActiveMenu(null); }} />
+                        <MenuItem dark label={t.actImportJson} icon={FolderOpen} onClick={handleOpenProjectClick} />
+                        <MenuItem dark label={t.actExportJson} icon={Save} onClick={() => { saveProject(); setActiveMenu(null); }} />
+                        <MenuItem dark label={t.actImportPython} icon={Code} onClick={handleImportPythonClick} />
+                        <MenuItem dark label={t.actExportPy} icon={Download} onClick={() => { downloadPython(); setActiveMenu(null); }} />
+                        <div className="my-1 h-px bg-slate-700"></div>
+                        <MenuItem dark label={t.actUndo} icon={Undo} shortcut="Ctrl+Z" onClick={() => { handleUndo(); setActiveMenu(null); }} />
+                        <MenuItem dark label={t.actRedo} icon={Redo} shortcut="Ctrl+Y" onClick={() => { handleRedo(); setActiveMenu(null); }} />
+                        <MenuItem dark label={t.actClear} icon={Trash2} danger onClick={() => { handleClear(); setActiveMenu(null); }} />
+                      </div>,
+                      document.body,
+                    )}
+                  </div>
+                  <button
+                    type="button"
+                    onClick={() => setShowAppSettings(true)}
+                    aria-label="Open app settings"
+                    className="text-slate-300 hover:text-white"
+                  >
+                    Settings
+                  </button>
+                  {currentUser.role === 'teacher' && (
+                    <button
+                      type="button"
+                      onClick={() => setShowConfigEditor(true)}
+                      aria-label="Open robot configuration"
+                      className="text-slate-300 hover:text-white"
+                    >
+                      Configure
+                    </button>
+                  )}
+                  <button type="button" onClick={handleLogout} className="text-slate-300 hover:text-white">Logout</button>
+                </div>
+              </div>
+            </div>
+          )}
+
+          {toolPanelCollapsed && (
             <div className="flex flex-1 flex-col items-center gap-2 overflow-hidden py-2">
-              {overlayTabs.map((tab) => (
+              {unlockedOverlayTabs.map((tab) => (
                 <button
                   key={tab.id}
                   type="button"
@@ -2447,10 +7268,10 @@ export default function App() {
                 </button>
               ))}
             </div>
-          ) : (
-            <>
+          )}
+          <div className={`${toolPanelCollapsed ? 'hidden' : 'flex'} min-h-0 flex-1 flex-col`}>
               <div className="flex gap-2 border-b border-slate-700 bg-slate-900/70 p-2">
-                {overlayTabs.map((tab) => (
+                {unlockedOverlayTabs.map((tab) => (
                   <button
                     key={tab.id}
                     type="button"
@@ -2462,15 +7283,45 @@ export default function App() {
                 ))}
               </div>
 
-              <div className="flex-1 overflow-auto p-3">
-                {mainTab === 'blocks' && (
-                  <div className="space-y-3 text-slate-200">
-                    <div className="rounded-xl border border-slate-700 bg-slate-900 p-3">
-                      <p className="text-[10px] uppercase tracking-[0.18em] text-slate-400">Workspace</p>
-                      <div className="mt-3 flex gap-2">
-                        <button type="button" onClick={handleRunCode} className="flex-1 rounded-md bg-emerald-600 px-2 py-2 text-xs font-semibold text-white hover:bg-emerald-500">Run</button>
-                        <button type="button" onClick={handleClear} className="flex-1 rounded-md bg-slate-700 px-2 py-2 text-xs font-semibold text-slate-200 hover:bg-slate-600">Clear</button>
-                      </div>
+              <div className="flex min-h-0 flex-1 flex-col gap-2 overflow-hidden p-3">
+                <div className={`${mainTab === 'blocks' ? 'min-h-0 flex-[2_1_0%] overflow-y-auto' : 'hidden'} space-y-3 text-slate-200`}>
+                    <div className="relative h-[min(680px,calc(100vh-16rem))] min-h-[420px] overflow-hidden rounded-xl border border-slate-700 bg-slate-900">
+                      <div ref={blocklyDiv} className="h-full w-full" />
+                      {blockSyncError && (
+                        <div className="pointer-events-auto absolute inset-0 z-[10000] flex items-center justify-center overflow-y-auto bg-slate-800 p-4" role="alert">
+                          <div className="max-w-lg rounded-xl border border-amber-500/60 bg-amber-950 p-5 text-center shadow-xl">
+                            <p className="text-sm font-semibold text-amber-200">This code cannot be represented with Blocks</p>
+                            <p className="mt-2 text-xs leading-5 text-slate-200">{blockSyncError}</p>
+                            <p className="mt-2 text-[10px] text-slate-400">Your IDE code is preserved. Edit the unsupported line in the IDE to restore block editing.</p>
+                            <div className="mt-3 flex flex-wrap justify-center gap-2">
+                              <button
+                                type="button"
+                                onClick={() => setMainTab('ide')}
+                                className="rounded-md bg-amber-500 px-3 py-1.5 text-xs font-semibold text-slate-950 hover:bg-amber-400"
+                              >
+                                Edit in IDE
+                              </button>
+                              <button
+                                type="button"
+                                onClick={() => {
+                                  if (window.confirm('Clear the unsupported code from the IDE and Blocks workspace?')) {
+                                    applyGeneratedCode('', { syncBlocks: true });
+                                    setBlockSyncError('');
+                                  }
+                                }}
+                                className="rounded-md border border-amber-300/50 px-3 py-1.5 text-xs font-semibold text-amber-100 hover:bg-amber-900"
+                              >
+                                Clear unsupported code
+                              </button>
+                            </div>
+                          </div>
+                        </div>
+                      )}
+                      {!blockSyncError && !generatedCode.trim() && (
+                        <div className="pointer-events-none absolute inset-0 flex items-center justify-center bg-slate-900/90 p-4 text-center">
+                          <p className="max-w-sm text-xs leading-5 text-slate-300">Choose a command from the toolbox to get started. Your blocks will appear here.</p>
+                        </div>
+                      )}
                     </div>
                     <div className="rounded-xl border border-slate-700 bg-slate-900 p-3">
                       <p className="text-[10px] uppercase tracking-[0.18em] text-slate-400">Generated code</p>
@@ -2478,15 +7329,629 @@ export default function App() {
                         {generatedCode || '# Python code will appear here'}
                       </pre>
                     </div>
-                  </div>
-                )}
+                    {originalPlannerCode && pathPlannerMode === PLANNER_PATH_MODES.sensor_corrected && (
+                      <details open className="rounded-xl border border-amber-800 bg-amber-950/30 p-3">
+                        <summary className="cursor-pointer text-[10px] font-semibold uppercase tracking-wide text-amber-200">Original route · read only</summary>
+                        <pre className="mt-2 max-h-48 overflow-auto whitespace-pre-wrap break-words font-mono text-[11px] leading-5 text-amber-100">{originalPlannerCode}</pre>
+                      </details>
+                    )}
+                </div>
 
                 {mainTab === 'planner' && (
+                  <section
+                    data-testid="sidebar-panel-planner"
+                    className="flex min-h-0 flex-[2_1_0%] flex-col overflow-hidden rounded-xl border border-slate-700 bg-slate-950/60"
+                  >
+                    <div className="min-h-0 flex-1 overflow-y-auto overscroll-contain p-2">
                   <div className="space-y-3 text-slate-200">
+                    {session?.user?.role === 'teacher' && (
+                      <>
+                        <p className="rounded-lg border border-amber-500/30 bg-amber-950/40 p-2 text-[10px] text-amber-200">
+                          Compile remains the open-loop SDK path. Start Nav2 submits map-frame goals to the separate ROS controller and requires a commissioned gateway.
+                        </p>
+                    <div className="space-y-2 rounded-lg border border-slate-700 bg-slate-900 p-2">
+                      <div className="flex items-center justify-between gap-2">
+                        <span className="text-[10px] font-semibold uppercase tracking-wide text-slate-300">ROS navigation bridge</span>
+                        {session?.user?.role === 'teacher' && (
+                          <button
+                            type="button"
+                            onClick={handleCheckNavigationBridge}
+                            disabled={isNavigationBridgeChecking}
+                            className="rounded-md border border-cyan-700 px-2 py-1 text-[10px] font-semibold text-cyan-200 disabled:opacity-60"
+                          >
+                            {isNavigationBridgeChecking ? 'Checking…' : 'Check status'}
+                          </button>
+                        )}
+                      </div>
+                      <p role="status" aria-live="polite" className="break-words text-[10px] text-slate-400">
+                        {navigationBridgeStatus}
+                      </p>
+                      {navigationDiagnostics && (
+                        <div data-testid="navigation-diagnostics" className="space-y-1 break-words text-[10px] text-slate-400">
+                          <p>
+                            LiDAR {navigationDiagnostics.topics?.pointcloud || 'topic unavailable'}
+                            {' • '}frame {navigationDiagnostics.frames?.pointcloud || 'unavailable'}
+                            {' • '}{Number.isFinite(navigationDiagnostics.pointcloud?.rate_hz)
+                              ? `${navigationDiagnostics.pointcloud.rate_hz.toFixed(1)} Hz measured`
+                              : 'measured rate pending'}
+                            {' • '}sample age {navigationDiagnostics.pointcloud?.age_ms ?? '—'} ms
+                            {' • '}stamp age {navigationDiagnostics.pointcloud?.stamp_age_ms ?? '—'} ms
+                            {' • '}callback {navigationDiagnostics.pointcloud?.callback_duration_ms ?? '—'} ms
+                            {' • '}{navigationDiagnostics.pointcloud?.count ?? 0} valid clouds
+                          </p>
+                          {(navigationDiagnostics.pointcloud?.sources || []).map((source) => (
+                            <p key={source.topic} data-testid="navigation-pointcloud-source">
+                              {source.topic || 'PointCloud2 source'} · {source.ready ? 'contributing' : 'unavailable'}
+                              {source.frame_id ? ` · frame ${source.frame_id}` : ''}
+                              {source.age_ms != null ? ` · ${Math.round(source.age_ms)} ms old` : ''}
+                              {source.error ? ` · ${source.error}` : ''}
+                            </p>
+                          ))}
+                          {navigationDiagnostics.pointcloud?.discovery_error && (
+                            <p className="text-amber-300">PointCloud2 discovery: {navigationDiagnostics.pointcloud.discovery_error}</p>
+                          )}
+                          {navigationDiagnostics.pointcloud?.discovery_truncated > 0 && (
+                            <p className="text-amber-300">
+                              {navigationDiagnostics.pointcloud.discovery_truncated} additional PointCloud2 topic(s) omitted by the source limit.
+                            </p>
+                          )}
+                          <p>
+                            Map {navigationDiagnostics.topics?.map || 'topic unavailable'}
+                            {' • '}local costmap {navigationDiagnostics.topics?.local_costmap || 'topic unavailable'}
+                            {' • '}frame {navigationDiagnostics.frames?.map || 'unavailable'}
+                            {' • '}base {navigationDiagnostics.frames?.base || 'unavailable'}
+                            {' • '}threshold {navigationDiagnostics.map?.occupied_threshold ?? '—'}
+                            {navigationDiagnostics.map?.metadata && (
+                              <>
+                                {' • '}{navigationDiagnostics.map.metadata.resolution_m} m/cell
+                                {' • '}origin {navigationDiagnostics.map.metadata.origin.x.toFixed(2)}, {navigationDiagnostics.map.metadata.origin.y.toFixed(2)} m
+                                {' • '}map age {navigationDiagnostics.map.age_ms ?? '—'} ms
+                              </>
+                            )}
+                          </p>
+                          <p>
+                            Live obstacle layer {navigationDiagnostics.local_costmap?.ready
+                              ? `ready • ${navigationDiagnostics.local_costmap.obstacle_count ?? 0} points • ${navigationDiagnostics.local_costmap.age_ms ?? '—'} ms old`
+                              : 'unavailable'}
+                            {' • '}avoidance commissioning {navigationDiagnostics.local_costmap?.live_avoidance_enabled ? 'enabled' : 'not enabled'}
+                          </p>
+                          <p>
+                            Localization {navigationDiagnostics.localization?.quality || 'unavailable'}
+                            {' • '}actions Nav2 {navigationDiagnostics.actions?.navigation ? 'ready' : 'unavailable'},
+                            {' '}preview {navigationDiagnostics.actions?.route_preview ? 'ready' : 'unavailable'},
+                            {' '}Spin {navigationDiagnostics.actions?.spin ? 'ready' : 'unavailable'}
+                            {' • '}locomotion owner {navigationDiagnostics.controller?.owner || 'unverified'}
+                            {' • '}{navigationDiagnostics.controller?.ready ? 'commissioned' : 'not commissioned; motion locked'}
+                            {' • '}execution {navigationDiagnostics.execution_enabled ? 'enabled' : 'deployment-disabled'}
+                          </p>
+                        </div>
+                      )}
+                      {session && (
+                        <div className="space-y-2">
+                        <div className="flex flex-wrap gap-2" role="group" aria-label="Path planner mode">
+                          <button
+                            type="button"
+                            aria-pressed={navigationPlannerMode === 'static'}
+                            onClick={() => handleNavigationPlannerModeChange('static')}
+                            className={`rounded-md border px-2 py-1 text-[10px] font-semibold ${navigationPlannerMode === 'static' ? 'border-cyan-500 bg-cyan-950 text-cyan-100' : 'border-slate-600 text-slate-300'}`}
+                          >
+                            Static 360° map
+                          </button>
+                          <button
+                            type="button"
+                            aria-pressed={navigationPlannerMode === 'live'}
+                            onClick={() => handleNavigationPlannerModeChange('live')}
+                            className={`rounded-md border px-2 py-1 text-[10px] font-semibold ${navigationPlannerMode === 'live' ? 'border-emerald-500 bg-emerald-950 text-emerald-100' : 'border-slate-600 text-slate-300'}`}
+                          >
+                            Live adaptive
+                          </button>
+                        </div>
+                        <p className="text-[10px] text-slate-400">
+                          {navigationPlannerMode === 'live'
+                            ? 'Live adaptive keeps destinations fixed in map-frame coordinates, shows fresh Nav2 local-costmap obstacles, and relies on the commissioned Nav2 controller to adjust motion around them.'
+                            : 'Static planning uses the teacher-published 360° scan image. Waypoints are checked against both that saved map and the current live map before Nav2 may move.'}
+                        </p>
+                        <div className="flex items-center gap-2">
+                          <button
+                            type="button"
+                            onClick={handleLoadNavigationMap}
+                            disabled={isNavigationMapLoading}
+                            className="rounded-md border border-slate-600 px-2 py-1 text-[10px] font-semibold text-slate-200 disabled:opacity-60"
+                          >
+                            {isNavigationMapLoading
+                              ? 'Loading map…'
+                              : navigationPlannerMode === 'static'
+                                ? 'Load static 360° map'
+                                : 'Load live occupancy map'}
+                          </button>
+                          {navigationMapSnapshot && (
+                            <button
+                              type="button"
+                              onClick={() => setIsNavigationMapVisible((visible) => !visible)}
+                              className="rounded-md border border-slate-600 px-2 py-1 text-[10px] font-semibold text-slate-200"
+                            >
+                              {isNavigationMapVisible ? 'Hide overlay' : 'Show overlay'}
+                            </button>
+                          )}
+                        </div>
+                        </div>
+                      )}
+                      <p className="break-words text-[10px] text-slate-400">{navigationMapStatus}</p>
+                      <p className="text-[10px] text-amber-300">
+                        Execution requires the separately installed Nav2 gateway, a healthy map/localization/controller, and an accessible physical emergency stop.
+                      </p>
+                    </div>
+                    <div className="space-y-2 rounded-lg border border-cyan-800 bg-slate-900 p-2">
+                      <div className="flex flex-wrap items-center justify-between gap-2">
+                        <span className="text-[10px] font-semibold uppercase tracking-wide text-cyan-200">3D room scan</span>
+                        {session?.user?.role === 'teacher' && (
+                          <div className="flex flex-wrap gap-2">
+                            {!lidarScanJob || ['completed', 'failed', 'canceled'].includes(lidarScanJob.status) ? (
+                              <button
+                                type="button"
+                                onClick={handleStartLidarScan}
+                                disabled={isLidarScanStarting}
+                                className="rounded-md bg-cyan-700 px-2 py-1 text-[10px] font-semibold text-white disabled:opacity-50"
+                              >
+                                {isLidarScanStarting ? 'Starting…' : 'Start supervised 360° scan'}
+                              </button>
+                            ) : (
+                              <>
+                                <button
+                                  type="button"
+                                  onClick={handleCompleteLidarScan}
+                                  disabled={isLidarScanFinalizing || lidarScanJob?.rotation_status !== 'completed'}
+                                  className="rounded-md bg-amber-500 px-2 py-1 text-[10px] font-semibold text-slate-950 disabled:opacity-50"
+                                >
+                                  {isLidarScanFinalizing ? 'Validating…' : lidarScanJob?.rotation_status === 'completed' ? 'Validate 360° scan' : 'Waiting for 360° rotation'}
+                                </button>
+                                <button
+                                  type="button"
+                                  onClick={handleCancelLidarScan}
+                                  disabled={isLidarScanFinalizing}
+                                  className="rounded-md border border-red-700 px-2 py-1 text-[10px] font-semibold text-red-200 disabled:opacity-50"
+                                >
+                                  Cancel scan
+                                </button>
+                              </>
+                            )}
+                            {lidarScanJob?.status === 'completed' && (
+                              <button
+                                type="button"
+                                onClick={handlePublishLidarMap}
+                                className="rounded-md border border-emerald-600 px-2 py-1 text-[10px] font-semibold text-emerald-200"
+                              >
+                                Publish shared map
+                              </button>
+                            )}
+                          </div>
+                        )}
+                      </div>
+                      <p role="status" aria-live="polite" className="break-words text-[10px] text-slate-300">{lidarScanStatus}</p>
+                      <p className="text-[10px] leading-4 text-amber-200">
+                        The teacher-started scan uses Nav2’s commissioned Spin behavior and the existing G1 velocity bridge. It requires fresh LiDAR, localization, and SLAM map data. Keep the rotation area clear, supervise continuously, and keep the independent emergency stop ready. A failed or incomplete rotation cannot be published.
+                      </p>
+                      <p className="text-[10px] text-slate-400">{navigationLiveStatus}</p>
+                    </div>
+                      </>
+                    )}
+                    {session?.user?.role === 'teacher' && (
+                    <div className="space-y-2 rounded-lg border border-cyan-800 bg-slate-900 p-2">
+                      <div className="flex flex-wrap items-center justify-between gap-2">
+                        <span className="text-[10px] font-semibold uppercase tracking-wide text-cyan-200">Shared LiDAR map</span>
+                        {session?.user?.role === 'teacher' && (
+                          <button
+                            type="button"
+                            onClick={handleRefreshSharedLidarMap}
+                            disabled={isSharedLidarMapLoading}
+                            className="rounded-md border border-slate-600 px-2 py-1 text-[10px] font-semibold text-slate-200 disabled:opacity-60"
+                          >
+                            {isSharedLidarMapLoading ? 'Refreshing…' : 'Refresh shared map'}
+                          </button>
+                        )}
+                      </div>
+                      {session?.user?.role === 'teacher' ? (
+                        <label className="flex items-center justify-between gap-2 text-[10px] font-semibold text-slate-200">
+                          <span>Show shared map on student grids</span>
+                          <input
+                            type="checkbox"
+                            aria-label="Show shared LiDAR map overlay"
+                            checked={sharedLidarOverlayEnabled}
+                            onChange={(event) => handleSharedLidarOverlayToggle(event.target.checked)}
+                            className="h-4 w-4 accent-cyan-600"
+                          />
+                        </label>
+                      ) : (
+                        <p className="text-[10px] text-slate-300">
+                          Teacher-managed student grid overlay: {sharedLidarOverlayEnabled ? 'enabled' : 'disabled'}.
+                        </p>
+                      )}
+                      {sharedLidarOverlayEnabled && (
+                        <p className="text-[10px] text-slate-400">
+                          {sharedLidarMap?.map?.map
+                            ? `${sharedLidarMap.map.map.width * sharedLidarMap.map.map.resolution_m} m × ${sharedLidarMap.map.map.height * sharedLidarMap.map.map.resolution_m} m • ${sharedLidarMap.map.map.resolution_m} m/cell`
+                            : 'No shared room map is currently available.'}
+                        </p>
+                      )}
+                      <p role="status" aria-live="polite" className="break-words text-[10px] text-slate-400">{navigationLiveStatus}</p>
+                    </div>
+                    )}
+                    {session?.user?.role === 'teacher' && sharedLidarMap?.map?.map && (
+                      <div className="space-y-2 rounded-lg border border-slate-700 bg-slate-900 p-2">
+                        <div className="flex flex-wrap items-center justify-between gap-2">
+                          <span className="text-[10px] font-semibold uppercase tracking-wide text-slate-200">Published room map • 3D points projected to grid</span>
+                          <span className="text-[10px] text-slate-400">
+                            {sharedLidarMap.map.map.width * sharedLidarMap.map.map.resolution_m} m × {sharedLidarMap.map.map.height * sharedLidarMap.map.map.resolution_m} m • {sharedLidarMap.map.map.resolution_m} m/cell
+                          </span>
+                        </div>
+                        <p className="text-[10px] text-slate-400">
+                          Frame {sharedLidarMap.map.map.frame_id} • origin {sharedLidarMap.map.map.origin.x.toFixed(2)}, {sharedLidarMap.map.map.origin.y.toFixed(2)} m • {sharedLidarMap.pointcloud?.point_count || 0} 3D points
+                        </p>
+                        <svg
+                          viewBox={`0 0 ${sharedLidarMap.map.map.width * sharedLidarMap.map.map.resolution_m} ${sharedLidarMap.map.map.height * sharedLidarMap.map.map.resolution_m}`}
+                          role="img"
+                          aria-label="Published shared occupancy map with 3D LiDAR points colored by height"
+                          className="block max-h-72 w-full rounded-md bg-slate-100"
+                        >
+                          <rect
+                            x="0"
+                            y="0"
+                            width={sharedLidarMap.map.map.width * sharedLidarMap.map.map.resolution_m}
+                            height={sharedLidarMap.map.map.height * sharedLidarMap.map.map.resolution_m}
+                            fill="#f8fafc"
+                          />
+                          <g transform={`translate(0 ${sharedLidarMap.map.map.height * sharedLidarMap.map.map.resolution_m}) scale(1 -1)`}>
+                            <path d={sharedOccupiedCellsPath} fill="#ef4444" fillOpacity="0.45" />
+                            {sharedPointCloudPreview.map((point, index) => (
+                              <circle
+                                key={`${index}-${point.x}-${point.y}`}
+                                cx={point.mapX}
+                                cy={point.mapY}
+                                r={sharedLidarMap.map.map.resolution_m * 0.35}
+                                fill={point.z < 0.25 ? '#2563eb' : point.z < 1.2 ? '#16a34a' : point.z < 2.2 ? '#f59e0b' : '#a855f7'}
+                                fillOpacity="0.8"
+                              />
+                            ))}
+                          </g>
+                        </svg>
+                        <p className="text-[10px] text-slate-400">Blue: low points • green/orange: room-height structure • purple: high points. Overlay positions use the map’s resolution, origin, rotation, and frame.</p>
+                      </div>
+                    )}
+                    {isNavigationMapVisible && navigationMapSnapshot && (
+                      <div className="overflow-hidden rounded-lg border border-slate-700 bg-slate-800 p-1">
+                        <svg
+                          viewBox={`0 0 ${navigationMapSnapshot.map.width * navigationMapSnapshot.map.resolution_m} ${navigationMapSnapshot.map.height * navigationMapSnapshot.map.resolution_m}`}
+                          role="img"
+                          aria-label="ROS occupancy map and navigation destinations"
+                          onClick={handleNavigationMapClick}
+                          className={`block max-h-80 w-full rounded-md bg-slate-100 ${isNavigationGoalPlacementEnabled ? 'cursor-crosshair' : ''}`}
+                        >
+                          <defs>
+                            <pattern id="navigation-grid-pattern" width={navigationMapSnapshot.map.resolution_m} height={navigationMapSnapshot.map.resolution_m} patternUnits="userSpaceOnUse">
+                              <path d={`M ${navigationMapSnapshot.map.resolution_m} 0 L 0 0 0 ${navigationMapSnapshot.map.resolution_m}`} fill="none" stroke="#dfe7f3" strokeWidth="0.004"/>
+                            </pattern>
+                          </defs>
+                          <rect
+                            x="0"
+                            y="0"
+                            width={navigationMapSnapshot.map.width * navigationMapSnapshot.map.resolution_m}
+                            height={navigationMapSnapshot.map.height * navigationMapSnapshot.map.resolution_m}
+                            fill="url(#navigation-grid-pattern)"
+                          />
+                          <g
+                            ref={navigationMapCoordinatesRef}
+                            data-testid="navigation-map-coordinate-layer"
+                            transform={`translate(0 ${navigationMapSnapshot.map.height * navigationMapSnapshot.map.resolution_m}) scale(1 -1)`}
+                            style={{ cursor: isNavigationGoalPlacementEnabled ? 'crosshair' : 'default' }}
+                          >
+                            <rect
+                              x="0"
+                              y="0"
+                              width={navigationMapSnapshot.map.width * navigationMapSnapshot.map.resolution_m}
+                              height={navigationMapSnapshot.map.height * navigationMapSnapshot.map.resolution_m}
+                              fill="transparent"
+                              pointerEvents="none"
+                            />
+                            <g
+                            data-testid="ros-occupancy-overlay"
+                            pointerEvents="none"
+                            >
+                              <path d={navigationOccupiedCellsPath} fill="#ef4444" fillOpacity="0.72" />
+                            </g>
+                            {navigationLiveObstaclePreview.length > 0 && (
+                              <g data-testid="navigation-live-obstacles-overlay" pointerEvents="none">
+                                {navigationLiveObstaclePreview.map((point, index) => (
+                                  <circle
+                                    key={`live-obstacle-${index}-${point.x}-${point.y}`}
+                                    cx={point.mapX}
+                                    cy={point.mapY}
+                                    r={navigationMapSnapshot.map.resolution_m * 0.65}
+                                    fill="#111827"
+                                    fillOpacity="0.9"
+                                  />
+                                ))}
+                              </g>
+                            )}
+                            {navigationLivePosePreview && (
+                              <g data-testid="navigation-live-robot-pose" pointerEvents="none">
+                                <circle
+                                  cx={navigationLivePosePreview.x}
+                                  cy={navigationLivePosePreview.y}
+                                  r={navigationMapSnapshot.map.resolution_m * 2}
+                                  fill="#06b6d4"
+                                  stroke="#fff"
+                                  strokeWidth={navigationMapSnapshot.map.resolution_m * 0.3}
+                                />
+                                <path
+                                  d={`M${navigationLivePosePreview.x} ${navigationLivePosePreview.y}L${navigationLivePosePreview.x + Math.cos(navigationLivePosePreview.yaw_rad - navigationMapSnapshot.map.origin.yaw_rad) * navigationMapSnapshot.map.resolution_m * 5} ${navigationLivePosePreview.y + Math.sin(navigationLivePosePreview.yaw_rad - navigationMapSnapshot.map.origin.yaw_rad) * navigationMapSnapshot.map.resolution_m * 5}`}
+                                  stroke="#0891b2"
+                                  strokeWidth={navigationMapSnapshot.map.resolution_m * 0.6}
+                                />
+                              </g>
+                            )}
+                            {session?.user?.role === 'teacher' && lidarScanJob?.status === 'scanning' && (
+                              <g data-testid="navigation-live-lidar-scan-overlay" pointerEvents="none">
+                                {navigationLiveScanPreview.map((point, index) => (
+                                  <circle
+                                    key={`planner-scan-${index}-${point.x}-${point.y}`}
+                                    cx={point.mapX}
+                                    cy={point.mapY}
+                                    r={navigationMapSnapshot.map.resolution_m * 0.35}
+                                    fill={point.z < 0.25 ? '#2563eb' : point.z < 1.2 ? '#16a34a' : point.z < 2.2 ? '#f59e0b' : '#a855f7'}
+                                    fillOpacity="0.85"
+                                  />
+                                ))}
+                              </g>
+                            )}
+                            {navigationRoutePreviewPoints && (
+                              <polyline
+                                data-testid="navigation-route-preview"
+                                points={navigationRoutePreviewPoints}
+                                fill="none"
+                                stroke="#059669"
+                                strokeWidth={navigationMapSnapshot.map.resolution_m * 0.8}
+                                strokeLinecap="round"
+                                strokeLinejoin="round"
+                                pointerEvents="none"
+                              />
+                            )}
+                            {navigationRouteWaypoints.map((point, index) => {
+                              const local = worldToMapLocal(
+                                point.x, point.y, navigationMapSnapshot.map,
+                              );
+                              return (
+                                <g key={point.id} pointerEvents="none">
+                                  <circle
+                                    data-testid={`navigation-waypoint-${index + 1}`}
+                                    cx={local.x}
+                                    cy={local.y}
+                                    r={navigationMapSnapshot.map.resolution_m * 2}
+                                    fill={isNavigationWaypointInFreeSpace(point, navigationMapSnapshot) ? '#2563eb' : '#dc2626'}
+                                    stroke={isNavigationWaypointInFreeSpace(point, navigationMapSnapshot) ? '#fff' : '#fca5a5'}
+                                    strokeWidth={navigationMapSnapshot.map.resolution_m * 0.15}
+                                  />
+                                  <text
+                                    x={local.x}
+                                    y={local.y}
+                                    textAnchor="middle"
+                                    dominantBaseline="central"
+                                    fontSize={navigationMapSnapshot.map.resolution_m * 1.3}
+                                    fill="#fff"
+                                  >
+                                    {index + 1}
+                                  </text>
+                                </g>
+                              );
+                            })}
+                          </g>
+                        </svg>
+                      </div>
+                    )}
+                    {session && navigationMapSnapshot && (
+                      <div className="space-y-2 rounded-lg border border-slate-700 bg-slate-900 p-2">
+                        <p className="text-[10px] text-slate-300">
+                          Add ordered goals by clicking the map. Their world/map coordinates stay fixed as live updates arrive; blocked goals are highlighted and rejected by the backend before motion.
+                        </p>
+                        {navigationPlannerMode === 'live' && (
+                          <p role="status" className="text-[10px] text-emerald-200">
+                            {isLiveAvoidanceReady
+                              ? `Live local costmap • ${liveNavigationObstacles?.points?.length || 0} obstacle samples • ${liveNavigationObstacles?.age_ms ?? '—'} ms old • Nav2 adjusts motion using its commissioned local controller.`
+                              : `Adaptive execution locked • ${liveNavigationObstacles?.error || 'fresh costmap and explicit Nav2 avoidance commissioning are required.'}`}
+                          </p>
+                        )}
+                        <div className="flex flex-wrap gap-2">
+                          <button
+                            type="button"
+                            onClick={() => setIsNavigationGoalPlacementEnabled((enabled) => !enabled)}
+                            disabled={Boolean(navigationOperation && ['accepted', 'starting', 'running', 'cancel_requested'].includes(navigationOperation.status))}
+                            className={`rounded-md px-2 py-1 text-[10px] font-semibold ${isNavigationGoalPlacementEnabled ? 'bg-blue-600 text-white' : 'border border-slate-600 text-slate-200'} disabled:opacity-50`}
+                          >
+                            {isNavigationGoalPlacementEnabled ? 'Click map to add goals' : 'Add map goals'}
+                          </button>
+                          <button
+                            type="button"
+                            onClick={() => {
+                              navigationRouteWaypointsRef.current = [];
+                              setNavigationRouteWaypoints([]);
+                              setNavigationRoutePreview(null);
+                              setNavigationPreviewStatus('Destinations cleared');
+                            }}
+                            disabled={!navigationRouteWaypoints.length || Boolean(navigationOperation && ['accepted', 'starting', 'running', 'cancel_requested'].includes(navigationOperation.status))}
+                            className="rounded-md border border-slate-600 px-2 py-1 text-[10px] text-slate-200 disabled:opacity-50"
+                          >
+                            Clear goals
+                          </button>
+                          <button
+                            type="button"
+                            onClick={handlePreviewNavigationRoute}
+                            disabled={isNavigationPreviewing || !navigationRouteWaypoints.length || Boolean(navigationOperation && ['accepted', 'starting', 'running', 'cancel_requested'].includes(navigationOperation.status))}
+                            className="rounded-md border border-emerald-700 px-2 py-1 text-[10px] font-semibold text-emerald-200 disabled:opacity-50"
+                          >
+                            {isNavigationPreviewing ? 'Planning…' : 'Preview route • no motion'}
+                          </button>
+                          {session?.user?.role === 'teacher' ? (
+                            <button
+                              type="button"
+                              aria-label="Start Nav2"
+                              onClick={handleStartNavigation}
+                              disabled={isNavigationStarting || !isNavigationMotionReady || !navigationRouteWaypoints.length || !navigationRoutePreview || navigationRoutePreview.version !== navigationMapSnapshot.map.version || Boolean(navigationOperation && ['accepted', 'starting', 'running', 'cancel_requested'].includes(navigationOperation.status))}
+                              className="rounded-md bg-emerald-600 px-2 py-1 text-[10px] font-semibold text-white disabled:opacity-50"
+                            >
+                              {isNavigationStarting ? 'Starting…' : 'Approve & start Nav2'}
+                            </button>
+                          ) : (
+                            <button
+                              type="button"
+                              onClick={handleSubmitPlannerRequest}
+                              disabled={!navigationRouteWaypoints.length || !navigationRoutePreview || navigationRoutePreview.version !== navigationMapSnapshot.map.version}
+                              className="rounded-md border border-amber-600 px-2 py-1 text-[10px] font-semibold text-amber-200 disabled:opacity-50"
+                            >
+                              Send route to teacher for review
+                            </button>
+                          )}
+                          {navigationOperation && ['accepted', 'starting', 'running', 'cancel_requested'].includes(navigationOperation.status) && (
+                            <button
+                              type="button"
+                              onClick={handleStopNavigation}
+                              className="rounded-md bg-red-600 px-2 py-1 text-[10px] font-semibold text-white"
+                            >
+                              Request stop
+                            </button>
+                          )}
+                        </div>
+                        <p role="status" aria-live="polite" data-testid="navigation-execution-status" className="break-words text-[10px] text-cyan-200">
+                          {navigationExecutionStatus}
+                        </p>
+                        <p role="status" aria-live="polite" data-testid="navigation-preview-status" className="break-words text-[10px] text-emerald-200">
+                          {navigationPreviewStatus}
+                        </p>
+                        {navigationRouteWaypoints.map((point, index) => (
+                          <div key={point.id} className="flex items-center justify-between text-[10px] text-slate-400">
+                            <span>Goal {index + 1}: {point.x.toFixed(2)}, {point.y.toFixed(2)} m ({navigationMapSnapshot.map.frame_id})</span>
+                            <button
+                              type="button"
+                              onClick={() => {
+                                const remaining = navigationRouteWaypointsRef.current.filter((item) => item.id !== point.id);
+                                navigationRouteWaypointsRef.current = remaining;
+                                setNavigationRouteWaypoints(remaining);
+                                setNavigationRoutePreview(null);
+                                setNavigationPreviewStatus('Destinations changed • preview the route again');
+                              }}
+                              disabled={Boolean(navigationOperation && ['accepted', 'starting', 'running', 'cancel_requested'].includes(navigationOperation.status))}
+                              className="text-red-300 disabled:opacity-50"
+                            >
+                              Remove
+                            </button>
+                          </div>
+                        ))}
+                      </div>
+                    )}
                     <div className="flex gap-2">
-                      <button type="button" onClick={addPlannerWaypoint} className="flex-1 rounded-md bg-blue-600 px-2 py-2 text-[10px] font-semibold text-white hover:bg-blue-500">Add waypoint</button>
+                      {session?.user?.role === 'teacher' && (
+                        <select
+                          aria-label="Path planner mode"
+                          value={pathPlannerMode}
+                          onChange={(event) => handlePathPlannerModeChange(event.target.value)}
+                          className="min-w-0 flex-1 rounded-md border border-slate-600 bg-slate-800 px-2 py-2 text-[10px] font-semibold text-slate-200"
+                        >
+                          {Object.entries(PLANNER_MODE_LABELS).map(([mode, label]) => (
+                            <option key={mode} value={mode}>{label}</option>
+                          ))}
+                        </select>
+                      )}
+                      <button
+                        type="button"
+                        aria-label="Place waypoint"
+                        aria-pressed={isWaypointPlacementEnabled}
+                        onClick={() => setIsWaypointPlacementEnabled((enabled) => !enabled)}
+                        className={`flex-1 rounded-md px-2 py-2 text-[10px] font-semibold text-white ${isWaypointPlacementEnabled ? 'bg-cyan-600 hover:bg-cyan-500' : 'bg-blue-600 hover:bg-blue-500'}`}
+                      >
+                        {isWaypointPlacementEnabled ? 'Click grid to place' : 'Place waypoint'}
+                      </button>
                       <button type="button" onClick={compilePlannerPath} className="flex-1 rounded-md bg-emerald-600 px-2 py-2 text-[10px] font-semibold text-white hover:bg-emerald-500">Compile</button>
                     </div>
+                    {session && session.user.role !== 'teacher' && (
+                      <button
+                        type="button"
+                        onClick={handleSubmitPlannerRequest}
+                        className="w-full rounded-md border border-amber-600 bg-amber-950/40 px-2 py-2 text-[10px] font-semibold text-amber-200 hover:bg-amber-900/50"
+                      >
+                        Send {PLANNER_MODE_LABELS[pathPlannerMode]} request to teacher
+                      </button>
+                    )}
+                    {session?.user?.role !== 'teacher' && (
+                      <p className="text-[10px] text-slate-400">Teacher-selected mode: {PLANNER_MODE_LABELS[pathPlannerMode]}</p>
+                    )}
+                    {pathPlannerMode === PLANNER_PATH_MODES.sensor_corrected && session?.user?.role === 'teacher' && (
+                      <button
+                        type="button"
+                        onClick={handleRunCheckpointedPlanner}
+                        disabled={isRunning || !plannerRouteVariants.initial}
+                        className="w-full rounded-md bg-amber-500 px-2 py-2 text-[10px] font-semibold text-slate-950 disabled:opacity-50"
+                      >
+                        {isRunning ? 'Running SDK path and checking waypoints…' : 'Run SDK path • checkpoint and correct'}
+                      </button>
+                    )}
+                    {pathPlannerMode === PLANNER_PATH_MODES.autonomous && (
+                      <p className="rounded-md border border-amber-700 bg-amber-950/40 p-2 text-[10px] text-amber-200">
+                        Autonomous mode runs only from the teacher Nav2 map controls. The completed Nav2 feedback path—not the preview—is translated to SDK commands.
+                      </p>
+                    )}
+                    {pathPlannerMode !== PLANNER_PATH_MODES.manual && (
+                      <div className="space-y-1 rounded-md border border-slate-700 bg-slate-900 p-2">
+                        <p className="text-[10px] uppercase tracking-wide text-slate-300">Compiled route variants</p>
+                        <div className="flex flex-wrap gap-2">
+                          {['initial', 'corrected', 'final'].filter((variant) => (
+                            typeof plannerRouteVariants[variant] === 'string' && plannerRouteVariants[variant].length > 0
+                          )).map((variant) => (
+                            <button
+                              key={variant}
+                              type="button"
+                              aria-pressed={selectedPlannerVariant === variant}
+                              onClick={() => {
+                                setSelectedPlannerVariant(variant);
+                                const nextCode = plannerRouteVariants[variant];
+                                if (nextCode) {
+                                  compiledPlannerCodeRef.current = nextCode;
+                                  updateGeneratedCode(nextCode);
+                                }
+                              }}
+                              className={`rounded-md border px-2 py-1 text-[10px] font-semibold ${selectedPlannerVariant === variant ? 'border-emerald-500 bg-emerald-950 text-emerald-100' : 'border-slate-600 text-slate-300'}`}
+                            >
+                              {variant === 'initial' ? 'Initial' : variant === 'corrected' ? 'Corrected' : 'Final'}
+                            </button>
+                          ))}
+                        </div>
+                        <p className="text-[10px] text-slate-400">
+                          {pathPlannerMode === PLANNER_PATH_MODES.sensor_corrected
+                            ? 'Initial is the compiled SDK plan. Corrected appears only after checkpointed SDK execution and contains the commands actually sent, including any measured corrections.'
+                            : 'The autonomous SDK variant appears only after a successful Nav2 run with a valid localization feedback trace.'}
+                        </p>
+                      </div>
+                    )}
+                    {session?.user?.username && pathPlannerMode !== PLANNER_PATH_MODES.manual
+                      && (plannerRouteVariants.corrected || plannerRouteVariants.final) && (
+                      <div className="flex flex-wrap items-center gap-2">
+                        <input
+                          value={plannerProjectLabel}
+                          onChange={(event) => setPlannerProjectLabel(event.target.value)}
+                          placeholder="Planner route label"
+                          className="flex-1 rounded-md border border-slate-600 bg-slate-800 px-2 py-1 text-[10px] text-slate-100"
+                        />
+                        <button
+                          type="button"
+                          onClick={savePathPlannerProject}
+                          className="rounded-md bg-slate-700 px-2 py-1 text-[10px] font-semibold text-white"
+                        >
+                          Save path project
+                        </button>
+                      </div>
+                    )}
+                    {isWaypointPlacementEnabled && (
+                      <p className="rounded-lg border border-cyan-500/30 bg-cyan-950/50 p-2 text-xs text-cyan-200">
+                        Click an open spot on the grid to place a waypoint, or click again to cancel.
+                      </p>
+                    )}
                     {plannerWaypoints.length === 0 ? (
                       <p className="rounded-lg border border-dashed border-slate-600 bg-slate-900 p-3 text-xs text-slate-400">No waypoints yet.</p>
                     ) : (
@@ -2496,6 +7961,11 @@ export default function App() {
                             <span className="text-[10px] font-semibold uppercase tracking-wide text-slate-300">Waypoint {index + 1}</span>
                             <button type="button" onClick={() => removePlannerWaypoint(point.id)} className="text-[10px] text-red-400">Delete</button>
                           </div>
+                          {index > 0 && (
+                            <p data-testid="waypoint-distance" className="mb-2 text-[10px] font-semibold text-cyan-300">
+                              {Math.hypot(point.x - plannerWaypoints[index - 1].x, point.y - plannerWaypoints[index - 1].y).toFixed(2)} m from waypoint {index}
+                            </p>
+                          )}
                           <div className="grid grid-cols-2 gap-2 text-[10px] text-slate-300">
                             <label>
                               X
@@ -2509,87 +7979,667 @@ export default function App() {
                         </div>
                       ))
                     )}
+                    {plannerWaypoints.length > 1 && (
+                      <p data-testid="waypoint-total-distance" className="rounded-lg border border-slate-700 bg-slate-900 p-2 text-xs font-semibold text-slate-200">
+                        {plannerWaypoints.slice(1).reduce((total, point, index) => (
+                          total + Math.hypot(
+                            point.x - plannerWaypoints[index].x,
+                            point.y - plannerWaypoints[index].y,
+                          )
+                        ), 0).toFixed(2)} m total
+                      </p>
+                    )}
                   </div>
+                    </div>
+                  </section>
+                )}
+
+                {mainTab === 'prompt' && (
+                  <section
+                    data-testid="sidebar-panel-prompt"
+                    className="flex min-h-0 flex-[2_1_0%] flex-col overflow-hidden rounded-xl border border-slate-700 bg-slate-950/60"
+                  >
+                    <div className="min-h-0 flex-1 overflow-y-auto overscroll-contain p-2">
+                  <div className="space-y-3 text-slate-200">
+                    {controllerVersion === 'duet' && renderDuetMotionModeSelector()}
+                    <div className="rounded-xl border border-cyan-400/30 bg-cyan-500/10 p-3">
+                      <p className="text-[10px] uppercase tracking-[0.18em] text-cyan-200">Text to motion</p>
+                      <p className="mt-2 text-xs leading-5 text-slate-300">
+                        {controllerVersion === 'duet'
+                          ? 'Describe a bounded movement using the approved DUET locomotion, arm, gesture, and timing library. Unsupported requests stay visible instead of becoming SDK commands.'
+                          : 'Describe a short safe movement sequence. The generated commands sync to Blocks, IDE, and the live G1 simulation.'}
+                      </p>
+                    </div>
+                    <textarea
+                      value={motionPrompt}
+                      onChange={(event) => setMotionPrompt(event.target.value)}
+                      className="h-28 w-full resize-none rounded-xl border border-slate-700 bg-slate-900 p-3 text-sm leading-6 text-slate-100 outline-none focus:border-cyan-400"
+                      placeholder={controllerVersion === 'duet'
+                        ? 'Example: move forward for 1 second, then wave left for 1 second'
+                        : 'Example: walk forward 3 steps, turn left, wave'}
+                    />
+                    <div className="flex flex-wrap gap-2">
+                      {(controllerVersion === 'duet'
+                        ? [
+                          'Move forward for 1 second, then turn left for 1 second',
+                          'Strafe left for 1 second, then wave left high for 1 second',
+                          'Raise both arms high for 2 seconds',
+                          'Hold both arms above head for 3 seconds',
+                        ]
+                        : [
+                          'Walk forward 3 steps, turn left 90 degrees, then wave',
+                          'Walk backward 2 steps and turn right 90 degrees',
+                          'Repeat a square path 2 times',
+                        ]).map((example) => (
+                        <button key={example} type="button" onClick={() => setMotionPrompt(example)} className="rounded-md bg-slate-800 px-2 py-1.5 text-left text-[10px] text-slate-300 hover:bg-slate-700">
+                          {example}
+                        </button>
+                      ))}
+                    </div>
+                    <div className={`grid ${controllerVersion === 'duet' ? 'grid-cols-1' : 'grid-cols-2'} gap-2`}>
+                      <button type="button" onClick={() => generateMotionFromPrompt(false)} className="rounded-md bg-slate-700 px-3 py-2 text-xs font-semibold text-white hover:bg-slate-600">
+                        {controllerVersion === 'duet' && duetMotionMode === 'follow'
+                          ? 'Create DUET follow series'
+                          : controllerVersion === 'duet' ? 'Generate DUET commands' : 'Local generate'}
+                      </button>
+                      {controllerVersion !== 'duet' && (
+                        <button type="button" onClick={() => generateMotionFromPrompt(true)} disabled={motionPromptStatus === 'loading'} className="rounded-md bg-cyan-500 px-3 py-2 text-xs font-semibold text-slate-950 hover:bg-cyan-400 disabled:opacity-60">
+                          {motionPromptStatus === 'loading' ? 'Generating...' : 'Generate with HF'}
+                        </button>
+                      )}
+                    </div>
+                    <p className="text-[10px] text-slate-400">
+                      {controllerVersion === 'duet'
+                        ? 'DUET prompts are compiled locally and validated; video or prompt content is not sent to a text-generation service.'
+                        : motionPromptStatus === 'hf' ? motionPromptResult?.source : motionPromptStatus === 'fallback' ? 'HF unavailable; local compiler used.' : 'Both paths sync to Blocks, IDE, and 3D.'}
+                    </p>
+                    {motionPromptResult && (
+                      <div className="space-y-2 rounded-xl border border-slate-700 bg-slate-900 p-3">
+                        <p className="text-xs font-semibold text-cyan-200">{motionPromptResult.summary}</p>
+                        {motionPromptResult.steps.map((step, index) => (
+                          <div key={`${step.code}-${index}`} className="flex items-center justify-between gap-2 rounded-md bg-slate-800 px-2 py-1.5 text-[10px]">
+                            <span className="text-slate-200">{index + 1}. {step.label}</span>
+                            <code className="text-cyan-300">{step.code}</code>
+                          </div>
+                        ))}
+                        {motionPromptResult.unknown.map((message) => <p key={message} className="text-xs text-amber-300">{message}</p>)}
+                      </div>
+                    )}
+                    {controllerVersion === 'duet' && renderDuetMotionLibrary()}
+                  </div>
+                    </div>
+                  </section>
                 )}
 
                 {mainTab === 'camera' && (
+                  <section
+                    data-testid="sidebar-panel-camera"
+                    className="flex min-h-0 flex-[2_1_0%] flex-col overflow-hidden rounded-xl border border-slate-700 bg-slate-950/60"
+                  >
+                    <div className="min-h-0 flex-1 overflow-y-auto overscroll-contain p-2">
                   <div className="space-y-3 text-slate-200">
+                    {controllerVersion === 'duet' && renderDuetMotionModeSelector()}
                     <div className="rounded-xl border border-slate-700 bg-slate-900 p-3">
-                      <p className="text-[10px] uppercase tracking-[0.18em] text-slate-400">Live pose</p>
-                      <div className="mt-2 flex items-center justify-between">
-                        <span className="text-sm text-slate-200">Pose recognized</span>
-                        <span className="rounded-full bg-emerald-500/20 px-2 py-1 text-[10px] font-semibold text-emerald-300">Ready</span>
+                      <p className="text-[10px] uppercase tracking-[0.18em] text-slate-400">Camera preview</p>
+                      <label className="mt-2 block text-xs text-slate-300">
+                        Camera source
+                        <select
+                          value={cameraInputSource}
+                          onChange={(event) => setCameraInputSource(event.target.value)}
+                          className="mt-1 block w-full rounded-md border border-slate-600 bg-slate-800 px-2 py-2 text-xs text-white"
+                        >
+                          <option value="device">This device (private preview)</option>
+                          {currentUser.role === 'teacher' && (
+                            <option value="robot">G1 ROS camera (teacher preview)</option>
+                          )}
+                        </select>
+                      </label>
+                      {cameraInputSource === 'device' ? (
+                        <>
+                          <video
+                            ref={deviceCameraVideoRef}
+                            autoPlay
+                            playsInline
+                            muted
+                            aria-label="Private live camera preview from this device"
+                            className="mt-3 aspect-video w-full rounded-lg bg-black object-contain"
+                          />
+                          <div className="mt-2 flex items-center justify-between gap-2">
+                            <span role="status" aria-live="polite" className="text-[10px] text-slate-300">
+                              {deviceCameraStatus}
+                            </span>
+                            <button
+                              type="button"
+                              onClick={isDeviceCameraActive ? stopDeviceCamera : startDeviceCamera}
+                              disabled={deviceCameraStatus === 'Requesting camera permission…'}
+                              className="shrink-0 rounded-md bg-cyan-600 px-2.5 py-1.5 text-[10px] font-semibold text-white disabled:opacity-50"
+                            >
+                              {deviceCameraStatus === 'Requesting camera permission…'
+                                ? 'Requesting…'
+                                : isDeviceCameraActive ? 'Stop preview' : 'Start preview'}
+                            </button>
+                          </div>
+                          {deviceCameraError && (
+                            <p role="alert" className="mt-2 text-[10px] text-rose-300">{deviceCameraError}</p>
+                          )}
+                          <p className="mt-2 text-[10px] text-slate-400">
+                            The preview stays in this browser tab. Frames are not sent to Uni-EDU-Studio, recorded, or saved. Safari requires HTTPS except on localhost.
+                          </p>
+                        </>
+                      ) : currentUser.role === 'teacher' && cameraInputSource === 'robot' ? (
+                        <div className="mt-3 space-y-2">
+                          <label className="block text-xs text-slate-300">
+                            ROS image topic
+                            <select
+                              aria-label="Robot camera topic"
+                              value={selectedRobotCameraTopic}
+                              onChange={(event) => setSelectedRobotCameraTopic(event.target.value)}
+                              className="mt-1 block w-full rounded-md border border-slate-600 bg-slate-800 px-2 py-2 text-xs text-white"
+                            >
+                              <option value="">Select a fresh discovered topic</option>
+                              {Object.values(sensorDiagnostics?.cameras?.sources || {}).flatMap((source) => (
+                                (source.image_topics || [])
+                                  .filter((topic) => topic.fresh && topic.type === 'sensor_msgs/msg/Image')
+                                  .map((topic) => (
+                                    <option key={topic.name} value={topic.name}>
+                                      {topic.name} · {topic.frame_id}
+                                    </option>
+                                  ))
+                              ))}
+                            </select>
+                          </label>
+                          <canvas
+                            ref={robotCameraCanvasRef}
+                            aria-label="Transient G1 ROS camera preview"
+                            className="aspect-video w-full rounded-lg bg-black object-contain"
+                          />
+                          <p role="status" aria-live="polite" className="text-[10px] text-slate-300">
+                            {selectedRobotCameraTopic ? robotCameraStatus : 'Run teacher sensor discovery and select one fresh image topic.'}
+                          </p>
+                          {robotCameraError && (
+                            <p role="alert" className="text-[10px] text-rose-300">{robotCameraError}</p>
+                          )}
+                          <p className="text-[10px] text-slate-400">
+                            Frames are transient, authenticated, and not recorded or uploaded to storage. Camera data is diagnostic-only.
+                          </p>
+                        </div>
+                      ) : null}
+                      <p className="mt-3 text-[10px] text-amber-300">
+                        {controllerVersion === 'duet'
+                          ? 'DUET pose estimation is approximate and maps only to approved arm commands; it does not reproduce human joint angles exactly.'
+                          : 'Camera-to-motion pose inference is not implemented in legacy SDK mode.'}
+                      </p>
+                    </div>
+                    {controllerVersion === 'duet' ? (
+                      <section className="space-y-3 rounded-xl border border-cyan-400/20 bg-slate-900 p-3">
+                        <div>
+                          <p className="text-[10px] font-semibold uppercase tracking-[0.16em] text-cyan-200">Vision to DUET motion</p>
+                          <p className="mt-1 text-[10px] leading-4 text-slate-400">
+                            Analyze a local video or capture five seconds from the selected camera. Pose inference runs in this browser; frames are not uploaded or saved.
+                          </p>
+                        </div>
+                        <label className="block text-xs text-slate-300">
+                          Optional DUET prompt guidance
+                          <textarea
+                            value={visionMotionPrompt}
+                            onChange={(event) => setVisionMotionPrompt(event.target.value)}
+                            className="mt-1 h-16 w-full resize-none rounded-md border border-slate-700 bg-slate-950 p-2 text-xs text-slate-100"
+                            placeholder="Example: wave left high for 1 second"
+                          />
+                        </label>
+                        <label className="block text-xs text-slate-300">
+                          Upload a local video (30 seconds maximum)
+                          <input
+                            type="file"
+                            accept="video/*"
+                            onChange={(event) => {
+                              const file = event.target.files?.[0];
+                              if (!file) return;
+                              if (!file.type.startsWith('video/') || file.size > 50 * 1024 * 1024) {
+                                setVisionMotionStatus('Choose a video file smaller than 50 MB.');
+                                event.target.value = '';
+                                return;
+                              }
+                              setMotionVideoUrl(URL.createObjectURL(file));
+                              setVisionMotionStatus('Video loaded locally. Analyze it to draft approved DUET commands.');
+                            }}
+                            className="mt-1 block w-full text-[10px] text-slate-300 file:mr-2 file:rounded-md file:border-0 file:bg-slate-700 file:px-2 file:py-1 file:text-[10px] file:font-semibold file:text-white"
+                          />
+                        </label>
+                        {motionVideoUrl && (
+                          <video
+                            ref={motionVideoRef}
+                            src={motionVideoUrl}
+                            controls
+                            playsInline
+                            preload="metadata"
+                            aria-label="Local uploaded motion video"
+                            className="aspect-video w-full rounded-lg bg-black object-contain"
+                          />
+                        )}
+                        {currentUser.role === 'teacher' ? (
+                          <div className="grid grid-cols-2 gap-2">
+                            <button
+                              type="button"
+                              onClick={() => analyzeVisionMotion(true)}
+                              disabled={!motionVideoUrl || isVisionMotionAnalyzing}
+                              className="rounded-md bg-cyan-600 px-2 py-2 text-[10px] font-semibold text-white disabled:opacity-50"
+                            >
+                              Analyze uploaded video
+                            </button>
+                            <button
+                              type="button"
+                              onClick={() => analyzeVisionMotion(false)}
+                              disabled={isVisionMotionAnalyzing || (
+                                cameraInputSource === 'device'
+                                  ? !isDeviceCameraActive
+                                  : !selectedRobotCameraTopic
+                              )}
+                              className="rounded-md bg-blue-600 px-2 py-2 text-[10px] font-semibold text-white disabled:opacity-50"
+                            >
+                              Capture live motion
+                            </button>
+                          </div>
+                        ) : (
+                          <p className="text-[10px] text-amber-300">A teacher must launch vision-to-motion analysis.</p>
+                        )}
+                        {isVisionMotionAnalyzing && (
+                          <progress aria-label="Vision analysis progress" max="1" value={visionMotionProgress} className="w-full" />
+                        )}
+                        {visionMotionStatus && (
+                          <p role="status" aria-live="polite" className="text-[10px] text-slate-300">{visionMotionStatus}</p>
+                        )}
+                        {motionPromptResult?.source === 'Local browser pose estimation' && (
+                          <pre className="max-h-36 overflow-auto whitespace-pre-wrap rounded-md bg-slate-950 p-2 font-mono text-[10px] text-cyan-200">{motionPromptResult.code}</pre>
+                        )}
+                        <p className="text-[10px] leading-4 text-slate-500">
+                          The MediaPipe runtime and pose model are fetched from their published CDNs; camera and video frames remain in the browser. Review and explicitly run the generated DUET program before saving it.
+                        </p>
+                      </section>
+                    ) : (
+                      <div className="rounded-xl border border-amber-200/50 bg-amber-500/10 p-3 text-amber-100">
+                        <p className="text-[10px] font-semibold uppercase tracking-[0.18em] text-amber-300">Example program</p>
+                        <p className="mt-2 text-xs">This inserts a fixed example program; it does not use camera frames. Saving is a separate, explicit action.</p>
+                        <button type="button" onClick={handleRecordMotionCapture} className="mt-3 w-full rounded-md bg-blue-600 px-3 py-2 text-xs font-semibold text-white hover:bg-blue-500">Insert example program</button>
                       </div>
-                    </div>
-                    <div className="rounded-xl border border-amber-200/50 bg-amber-500/10 p-3 text-amber-100">
-                      <p className="text-[10px] font-semibold uppercase tracking-[0.18em] text-amber-300">Overwrite warning</p>
-                      <p className="mt-2 text-xs">Recording will replace the current code in the Blocks and IDE tabs.</p>
-                      <button type="button" onClick={handleRecordMotionCapture} className="mt-3 w-full rounded-md bg-blue-600 px-3 py-2 text-xs font-semibold text-white hover:bg-blue-500">Record motion + update tabs</button>
-                    </div>
+                    )}
                     <div className="rounded-xl border border-slate-700 bg-slate-900 p-3">
                       <p className="text-[10px] uppercase tracking-[0.18em] text-slate-400">Quick actions</p>
-                      <div className="mt-2 space-y-2 text-xs text-slate-200">
-                        <button type="button" onClick={() => insertRobotCommand('robot.stand();')} className="block w-full rounded-md bg-slate-800 px-2 py-1.5 text-left hover:bg-slate-700">Stand</button>
-                        <button type="button" onClick={() => insertRobotCommandWithValue('walkForward', 3, 'steps')} className="block w-full rounded-md bg-slate-800 px-2 py-1.5 text-left hover:bg-slate-700">Walk Forward (steps)</button>
-                        <button type="button" onClick={() => insertRobotCommandWithValue('wait', 1, 'seconds')} className="block w-full rounded-md bg-slate-800 px-2 py-1.5 text-left hover:bg-slate-700">Wait (seconds)</button>
-                        <button type="button" onClick={() => insertRobotCommand('robot.raiseBothArms();')} className="block w-full rounded-md bg-slate-800 px-2 py-1.5 text-left hover:bg-slate-700">Raise Both Arms</button>
+                      <div className="mt-2 max-h-56 space-y-2 overflow-y-auto text-xs text-slate-200">
+                        {(controllerVersion === 'duet'
+                          ? getDuetCommandExamples(savedDuetMotions).map(({ label, code }) => [label, code])
+                          : [
+                            ['Stand / Ready', 'robot.stand()'],
+                            ['Walk Forward (3 steps)', 'robot.walk(3)'],
+                            ['Turn Left (90°)', 'robot.turn("left", 90)'],
+                            ['Hands Up arm preset', 'robot.arm_action("hands up")'],
+                          ]).map(([label, code]) => (
+                          <button
+                            key={code}
+                            type="button"
+                            onClick={() => insertRobotCommand(code)}
+                            className="block w-full rounded-md bg-slate-800 px-2 py-1.5 text-left hover:bg-slate-700"
+                          >
+                            {label}
+                          </button>
+                        ))}
                       </div>
                     </div>
+                    {controllerVersion === 'duet' && renderDuetMotionLibrary()}
                   </div>
+                    </div>
+                  </section>
                 )}
 
                 {mainTab === 'ide' && (
-                  <div className="space-y-3 text-slate-200">
+                  <div className="min-h-0 flex-[2_1_0%] overflow-y-auto space-y-3 text-slate-200">
                     <div className="rounded-xl border border-slate-700 bg-slate-900 p-3">
-                      <p className="text-[10px] uppercase tracking-[0.18em] text-slate-400">Quick commands</p>
-                      <div className="mt-2 space-y-2 text-xs">
-                        {quickRobotCommands.slice(0, 8).map((command) => (
-                          <button
-                            key={command.label || command.snippet || 'quick-command'}
-                            type="button"
-                            onClick={() => { if (command.action) command.action(); else if (command.snippet) insertRobotCommand(command.snippet); }}
-                            className="block w-full rounded-md bg-slate-800 px-2 py-1.5 text-left text-slate-200 hover:bg-slate-700"
-                          >
-                            {command.label || command.snippet}
-                          </button>
-                        ))}
+                      <p className="text-[10px] uppercase tracking-[0.18em] text-slate-400">
+                        {controllerVersion === 'duet' ? 'DUET command reference' : 'Legacy command reference'}
+                      </p>
+                      <input
+                        type="search"
+                        aria-label="Search IDE commands and shared motions"
+                        value={ideCommandSearch}
+                        onChange={(event) => setIdeCommandSearch(event.target.value)}
+                        placeholder="Search commands and shared motions"
+                        className="mt-2 w-full rounded-md border border-slate-700 bg-slate-950 px-2 py-1.5 text-[10px] text-slate-100"
+                      />
+                      <div className="mt-2 space-y-1.5 text-[10px]">
+                        {(() => {
+                          const query = ideCommandSearch.trim().toLocaleLowerCase();
+                          const visibleEntries = ideCommandEntries.filter((entry) => (
+                            !query || `${entry.label} ${entry.script} ${entry.description}`.toLocaleLowerCase().includes(query)
+                          ));
+                          const categories = [...new Set(visibleEntries.map((entry) => entry.category))];
+                          return categories.map((category) => (
+                            <details key={category} className="rounded-md bg-slate-800 px-2 py-1.5">
+                              <summary className="cursor-pointer font-semibold text-slate-200">
+                                {category} <span className="text-slate-500">({visibleEntries.filter((entry) => entry.category === category).length})</span>
+                              </summary>
+                              <div className="mt-2 space-y-2">
+                                {visibleEntries.filter((entry) => entry.category === category).map((entry) => (
+                                  <div key={entry.key} className="border-t border-slate-700 pt-2">
+                                    <span className="block text-slate-200">{entry.label}</span>
+                                    <code className="break-all text-cyan-300">{entry.script}</code>
+                                    <p className="mt-1 text-slate-400">{entry.description}</p>
+                                    {controllerVersion === 'legacy' && entry.sdkMethod && (
+                                      <p className="mt-1 text-emerald-300">Unitree SDK: {entry.sdkMethod}</p>
+                                    )}
+                                    {controllerVersion === 'legacy' && entry.method === 'arm_action' && (
+                                      <p className="mt-1 text-amber-300">Stop cannot cancel an arm preset; keep the area clear.</p>
+                                    )}
+                                    {controllerVersion === 'legacy' && entry.adapters && !entry.adapters.simulator && (
+                                      <p className="mt-1 text-amber-300">Hardware only; not simulated.</p>
+                                    )}
+                                  </div>
+                                ))}
+                              </div>
+                            </details>
+                          ));
+                        })()}
+                        <details className="rounded-md border border-cyan-800 bg-slate-800 px-2 py-1.5">
+                          <summary className="cursor-pointer font-semibold text-cyan-200">
+                            Shared {controllerVersion.toUpperCase()} motions
+                          </summary>
+                          <div className="mt-2 space-y-2">
+                            {sharedMotions
+                              .filter((motion) => motion.controller_version === controllerVersion)
+                              .filter((motion) => !ideCommandSearch.trim()
+                                || `${motion.name} ${motion.code}`.toLocaleLowerCase().includes(ideCommandSearch.trim().toLocaleLowerCase()))
+                              .map((motion) => (
+                                <details key={motion.id} className="rounded bg-slate-900 p-2">
+                                  <summary className="cursor-pointer text-slate-100">{motion.name}</summary>
+                                  <p className="mt-1 text-slate-400">Type this stable call into the IDE when you want to run the shared sequence:</p>
+                                  <code className="mt-1 block break-all text-cyan-300">
+                                    {controllerVersion === 'duet' ? 'duet' : 'robot'}.shared_motion({JSON.stringify(motion.id)})
+                                  </code>
+                                  <pre className="mt-2 max-h-40 overflow-auto whitespace-pre-wrap break-words rounded bg-slate-950 p-2 font-mono text-slate-300">{motion.code}</pre>
+                                </details>
+                              ))}
+                            {sharedMotions.filter((motion) => motion.controller_version === controllerVersion).length === 0 && (
+                              <p className="text-slate-400">No shared motions for this controller yet.</p>
+                            )}
+                          </div>
+                        </details>
+                        <details className="rounded-md bg-slate-800 px-2 py-1.5">
+                          <summary className="cursor-pointer font-semibold text-slate-200">Loops</summary>
+                          <code className="mt-2 block text-cyan-300">for _ in range(3):</code>
+                          <code className="block pl-3 text-cyan-300">{controllerVersion === 'duet' ? 'duet.move(0.15, 0, 0, 1)' : 'robot.walk(2)'}</code>
+                          <p className="mt-1 text-slate-400">Repeat an indented group of commands.</p>
+                        </details>
                       </div>
                     </div>
                     <textarea
                       value={generatedCode || ''}
                       onChange={(event) => {
-                        const result = sanitizeRobotCode(event.target.value);
-                        const nextCode = result.code || event.target.value;
-                        setGeneratedCode(nextCode);
-                        setSafetyNotice(result.changed ? 'One or more values were adjusted to the safe range.' : '');
-                        syncBlocksFromGeneratedCode(nextCode);
+                        const nextCode = event.target.value;
+                        applyGeneratedCode(nextCode, { syncBlocks: false, preserveFormatting: true });
+                        setBlockSyncError('');
                       }}
+                      onBlur={() => syncBlocksFromGeneratedCode(generatedCodeRef.current)}
                       spellCheck={false}
                       className="h-64 w-full resize-none rounded-xl border border-slate-700 bg-slate-900 p-3 font-mono text-[11px] leading-6 text-slate-100 outline-none"
                     />
+                    {controllerVersion === 'duet' && (
+                      <section className="rounded-xl border border-slate-700 bg-slate-900 p-3">
+                        <div className="flex items-start justify-between gap-3">
+                          <div>
+                            <p className="text-[10px] font-semibold uppercase tracking-[0.18em] text-slate-300">Saved arm sequences</p>
+                            <p className="mt-1 text-[10px] leading-4 text-slate-400">
+                              Save an arm-only program assembled from approved DUET pose and gesture blocks. Stored in this browser for this user.
+                            </p>
+                          </div>
+                          <span className="shrink-0 text-[10px] text-slate-500">
+                            {savedDuetArmMotions.length}/{MAX_SAVED_DUET_ARM_MOTIONS}
+                          </span>
+                        </div>
+                        <div className="mt-3 flex gap-2">
+                          <input
+                            aria-label="Saved arm sequence name"
+                            value={duetArmMotionName}
+                            onChange={(event) => setDuetArmMotionName(event.target.value)}
+                            maxLength={40}
+                            placeholder="Sequence name"
+                            className="min-w-0 flex-1 rounded-md border border-slate-700 bg-slate-950 px-2 py-1.5 text-xs text-slate-100 outline-none focus:border-blue-500"
+                          />
+                          <button
+                            type="button"
+                            onClick={saveDuetArmMotion}
+                            disabled={duetArmMotionError.startsWith('Could not load saved DUET arm sequences:')}
+                            className="rounded-md bg-blue-600 px-3 py-1.5 text-xs font-semibold text-white hover:bg-blue-500 disabled:cursor-not-allowed disabled:opacity-50"
+                          >
+                            Save current sequence
+                          </button>
+                        </div>
+                        {duetArmMotionError && (
+                          <div className="mt-2 flex items-start justify-between gap-3" role="alert">
+                            <p className="text-[10px] text-amber-300">{duetArmMotionError}</p>
+                            {duetArmMotionError.startsWith('Could not load saved DUET arm sequences:')
+                              && <button type="button" onClick={clearSavedDuetArmMotions} className="shrink-0 text-[10px] text-amber-200 underline">Clear corrupt library</button>}
+                          </div>
+                        )}
+                        {savedDuetArmMotions.length > 0 && (
+                          <ul className="mt-3 space-y-2">
+                            {savedDuetArmMotions.map((motion) => (
+                              <li key={motion.name} className="flex items-center justify-between gap-2 rounded-md bg-slate-800 px-2 py-1.5">
+                                <span className="min-w-0 truncate text-xs text-slate-200">{motion.name}</span>
+                                <div className="flex shrink-0 gap-2">
+                                  <button type="button" onClick={() => insertSavedDuetArmMotion(motion)} className="text-[10px] font-semibold text-cyan-300 hover:text-cyan-200">Insert</button>
+                                  <button type="button" onClick={() => deleteSavedDuetArmMotion(motion.name)} className="text-[10px] text-slate-400 hover:text-red-300">Delete</button>
+                                </div>
+                              </li>
+                            ))}
+                          </ul>
+                        )}
+                      </section>
+                    )}
+                    {blockSyncError && <p role="alert" className="text-xs text-amber-300">{blockSyncError}</p>}
+                    {safetyNotice && <p className="text-[10px] text-amber-300">{safetyNotice}</p>}
+                    <p className="text-[10px] text-slate-400">IDE text is synchronized to Blocks when you leave the editor. Incomplete or unsupported lines remain editable here but cannot be shown as Blocks.</p>
+                    {originalPlannerCode && pathPlannerMode === PLANNER_PATH_MODES.sensor_corrected && (
+                      <details open className="rounded-xl border border-amber-800 bg-amber-950/30 p-3">
+                        <summary className="cursor-pointer text-[10px] font-semibold uppercase tracking-wide text-amber-200">Original route · read only</summary>
+                        <pre className="mt-2 max-h-48 overflow-auto whitespace-pre-wrap break-words font-mono text-[11px] leading-5 text-amber-100">{originalPlannerCode}</pre>
+                      </details>
+                    )}
+                    {controllerVersion === 'duet'
+                      ? <p className="text-[10px] text-amber-300">DUET arm poses and gestures use an approved, mirrored 23-DOF target catalog. Timed holds return to carry; hold-until-reset requires an explicit reset. Physical arm targets remain unavailable unless the deployed gateway advertises arm_targets and the separate hardware acceptance gates are satisfied. Simulator motion is only a command-space preview; direct posture/height control is not exposed.</p>
+                      : <p className="text-[10px] text-slate-400">The IDE and Blocks support front-obstacle distance conditions. Physical conditions require a fresh MID-360 reading (500 ms maximum) from the configured provider; missing or stale readings abort and request a stop.</p>}
                   </div>
                 )}
               </div>
 
-              <div className="border-t border-slate-700 bg-slate-900 p-2">
-                <label className="flex items-center justify-between gap-2 text-[10px] uppercase tracking-[0.18em] text-slate-400">
-                  <span>Panel width</span>
-                  <span>{toolPanelWidth}px</span>
-                </label>
-                <input
-                  type="range"
-                  min="280"
-                  max="560"
-                  step="20"
-                  value={toolPanelWidth}
-                  onChange={(event) => setToolPanelWidth(Number(event.target.value))}
-                  className="mt-2 w-full accent-blue-500"
-                />
+              <div className="border-t border-slate-700 bg-slate-900 p-2 text-center text-[10px] uppercase tracking-[0.14em] text-slate-500">
+                Drag the header to move. Drag any edge to resize.
               </div>
-            </>
-          )}
+          </div>
         </div>
       </div>
+      {queueReviewItem && (
+        <div
+          className="fixed inset-0 z-[70] flex items-center justify-center bg-slate-950/70 p-3 sm:p-6"
+          role="presentation"
+          onClick={() => {
+            if (!isQueueReviewRunning && !queueReviewNavigationOperation) setQueueReviewItem(null);
+          }}
+        >
+          <section
+            role="dialog"
+            aria-modal="true"
+            aria-labelledby="queue-review-title"
+            className="flex max-h-[92vh] w-full max-w-3xl flex-col overflow-hidden rounded-lg border border-slate-700 bg-slate-950 text-slate-100 shadow-2xl"
+            onClick={(event) => event.stopPropagation()}
+          >
+            <header className="flex items-start justify-between gap-4 border-b border-slate-800 px-4 py-3">
+              <div className="min-w-0">
+                <p className="text-[10px] font-semibold uppercase tracking-[0.16em] text-cyan-300">Teacher approval required</p>
+                <h2 id="queue-review-title" className="mt-1 truncate text-base font-semibold">{queueReviewItem.name}</h2>
+                <p className="mt-1 text-xs text-slate-400">
+                  Submitted by {queueReviewItem.student} · {queueReviewItem.controller_version === 'duet' ? 'DUET v2' : 'G1 SDK'} · {queueReviewItem.status}
+                </p>
+              </div>
+              <button
+                type="button"
+                onClick={() => setQueueReviewItem(null)}
+                disabled={isQueueReviewRunning || Boolean(queueReviewNavigationOperation && !['completed', 'succeeded', 'canceled', 'failed'].includes(queueReviewNavigationOperation.status))}
+                aria-label="Close request review"
+                className="rounded-md p-1.5 text-slate-400 hover:bg-slate-800 hover:text-white disabled:opacity-40"
+              >
+                <X size={18} />
+              </button>
+            </header>
+
+            <div className="min-h-0 flex-1 space-y-3 overflow-y-auto p-4">
+              {queueReviewPlannerRequest && (
+                <div className="rounded-md border border-cyan-900 bg-cyan-950/40 p-3">
+                  <p className="text-xs font-semibold text-cyan-200">
+                    {PLANNER_MODE_LABELS[queueReviewPlannerRequest.planner_mode] || queueReviewPlannerRequest.planner_mode}
+                  </p>
+                  <p className="mt-1 text-[11px] text-slate-300">
+                    {queueReviewPlannerRequest.planner_mode === PLANNER_PATH_MODES.autonomous
+                      ? `${queueReviewPlannerRequest.navigation?.waypoints?.length || 0} map goals · ${queueReviewPlannerRequest.navigation?.map_id || 'map unavailable'} ${queueReviewPlannerRequest.navigation?.version || ''}`
+                      : `${queueReviewWaypoints.length} planner-grid waypoints`}
+                  </p>
+                </div>
+              )}
+
+              <details open className="rounded-md border border-slate-800 bg-slate-900/70 p-3">
+                <summary className="cursor-pointer text-xs font-semibold text-slate-200">Exact command preview</summary>
+                <pre className="mt-2 max-h-56 overflow-auto whitespace-pre-wrap break-words rounded bg-black/50 p-3 font-mono text-[11px] leading-5 text-emerald-200">
+                  {queueReviewItem.code || '(No direct SDK commands; review planner goals and generated route data below.)'}
+                </pre>
+              </details>
+
+              {queueReviewPlannerRequest && queueReviewPlannerRequest.planner_mode !== PLANNER_PATH_MODES.autonomous && (
+                <section className="rounded-md border border-slate-800 bg-slate-900/70 p-3">
+                  <h3 className="text-xs font-semibold text-slate-200">Submitted planner grid</h3>
+                  {queueReviewWaypoints.length > 0 ? (
+                    <svg viewBox="0 0 400 240" role="img" aria-label="Submitted planner waypoints" className="mt-2 h-48 w-full rounded bg-slate-950">
+                      <path d="M 40 120 H 360 M 200 20 V 220" stroke="#334155" strokeWidth="1" />
+                      {queueReviewWaypoints.length > 1 && (
+                        <polyline
+                          points={queueReviewWaypoints.map((point) => `${200 + Number(point.x) * 16},${120 - Number(point.y) * 10}`).join(' ')}
+                          fill="none"
+                          stroke="#22d3ee"
+                          strokeWidth="3"
+                        />
+                      )}
+                      {queueReviewWaypoints.map((point, index) => (
+                        <g key={`${point.x}:${point.y}:${index}`}>
+                          <circle cx={200 + Number(point.x) * 16} cy={120 - Number(point.y) * 10} r="7" fill={index === 0 ? '#34d399' : '#f59e0b'} />
+                          <text x={208 + Number(point.x) * 16} y={116 - Number(point.y) * 10} fill="#e2e8f0" fontSize="10">{index + 1}</text>
+                        </g>
+                      ))}
+                    </svg>
+                  ) : <p className="mt-2 text-xs text-slate-400">No planner-grid waypoints were saved with this request.</p>}
+                  <pre className="mt-2 max-h-28 overflow-auto whitespace-pre-wrap break-words rounded bg-black/40 p-2 font-mono text-[10px] text-slate-300">
+                    {JSON.stringify(queueReviewWaypoints, null, 2)}
+                  </pre>
+                </section>
+              )}
+
+              {queueReviewPlannerRequest?.planner_mode === PLANNER_PATH_MODES.autonomous && (
+                <section className="rounded-md border border-slate-800 bg-slate-900/70 p-3">
+                  <div className="flex flex-wrap items-center justify-between gap-2">
+                    <h3 className="text-xs font-semibold text-slate-200">Autonomous route preview</h3>
+                    <button
+                      type="button"
+                      onClick={handlePreviewQueuedNavigation}
+                      disabled={isQueueReviewPreviewing || isQueueReviewRunning}
+                      className="rounded-md border border-emerald-700 px-2.5 py-1.5 text-[10px] font-semibold text-emerald-200 disabled:opacity-50"
+                    >
+                      {isQueueReviewPreviewing ? 'Planning…' : 'Preview route · no motion'}
+                    </button>
+                  </div>
+                  <p className="mt-2 text-[10px] text-slate-400">
+                    Map {queueReviewPlannerRequest.navigation?.map_id} · version {queueReviewPlannerRequest.navigation?.version} · frame {queueReviewPlannerRequest.navigation?.frame_id}
+                  </p>
+                  <pre className="mt-2 max-h-28 overflow-auto whitespace-pre-wrap break-words rounded bg-black/40 p-2 font-mono text-[10px] text-slate-300">
+                    {JSON.stringify(queueReviewPlannerRequest.navigation?.waypoints || [], null, 2)}
+                  </pre>
+                  {queueReviewNavigationPreview && (
+                    <pre className="mt-2 max-h-40 overflow-auto whitespace-pre-wrap break-words rounded bg-black/40 p-2 font-mono text-[10px] text-cyan-200">
+                      {JSON.stringify(queueReviewNavigationPreview.path || [], null, 2)}
+                    </pre>
+                  )}
+                </section>
+              )}
+
+              <details open className="rounded-md border border-slate-800 bg-slate-900/70 p-3">
+                <summary className="cursor-pointer text-xs font-semibold text-slate-200">Complete submitted project state</summary>
+                <dl className="mt-2 grid grid-cols-1 gap-2 text-[11px] sm:grid-cols-2">
+                  <div><dt className="text-slate-500">Project name</dt><dd className="break-words text-slate-200">{queueReviewSnapshot.name || queueReviewPlannerRequest?.planner_label || queueReviewItem.name}</dd></div>
+                  <div><dt className="text-slate-500">Planner mode</dt><dd className="text-slate-200">{PLANNER_MODE_LABELS[queueReviewSnapshot.plannerMode] || queueReviewSnapshot.plannerMode || queueReviewPlannerRequest?.planner_mode || 'Not set'}</dd></div>
+                  <div><dt className="text-slate-500">Planner label</dt><dd className="break-words text-slate-200">{queueReviewSnapshot.plannerLabel || queueReviewPlannerRequest?.planner_label || 'Not set'}</dd></div>
+                  <div><dt className="text-slate-500">Selected route variant</dt><dd className="text-slate-200">{queueReviewSnapshot.selectedPlannerVariant || queueReviewPlannerRequest?.selected_variant || 'Not set'}</dd></div>
+                </dl>
+                {[
+                  ['Scene objects', queueReviewSnapshot.sceneObjects || []],
+                  ['Saved planner waypoints', queueReviewSnapshot.plannerWaypoints || []],
+                  ['Planner route variants', queueReviewSnapshot.plannerVariants || queueReviewPlannerRequest?.route_variants || {}],
+                  ['Legacy generated code', queueReviewSnapshot.generatedCode || ''],
+                  ['DUET generated code', queueReviewSnapshot.duetCode || ''],
+                ].map(([label, value]) => (
+                  <details key={label} open className="mt-2 rounded bg-black/30 p-2">
+                    <summary className="cursor-pointer text-[10px] font-semibold text-slate-300">{label}</summary>
+                    <pre className="mt-2 max-h-32 overflow-auto whitespace-pre-wrap break-words font-mono text-[10px] text-slate-400">
+                      {typeof value === 'string' ? value || '(empty)' : JSON.stringify(value, null, 2)}
+                    </pre>
+                  </details>
+                ))}
+              </details>
+
+              {queueReviewError && <p role="alert" className="text-xs text-red-300">{queueReviewError}</p>}
+              {queueReviewStatus && <p role="status" aria-live="polite" className="text-xs text-cyan-200">{queueReviewStatus}</p>}
+              {queueReviewItem?.controller_version === 'duet' && renderDuetMotionSaveForm()}
+              {queueReviewSavedProject && (
+                <div className="flex flex-wrap items-center justify-between gap-2 rounded-md border border-emerald-800 bg-emerald-950/40 p-3">
+                  <p className="min-w-0 text-xs text-emerald-200">Saved project: {queueReviewSavedProject.name}</p>
+                  <button
+                    type="button"
+                    onClick={() => {
+                      loadProjectFromLibrary(queueReviewSavedProject);
+                      setQueueReviewItem(null);
+                    }}
+                    className="rounded-md bg-emerald-700 px-2.5 py-1.5 text-[10px] font-semibold text-white hover:bg-emerald-600"
+                  >
+                    Open project
+                  </button>
+                </div>
+              )}
+            </div>
+
+            <footer className="flex flex-wrap justify-end gap-2 border-t border-slate-800 px-4 py-3">
+              {(isQueueReviewRunning || Boolean(queueReviewNavigationOperation && !['completed', 'succeeded', 'canceled', 'failed'].includes(queueReviewNavigationOperation.status))) && (
+                <button
+                  type="button"
+                  onClick={handleStopQueuedExecution}
+                  className="mr-auto rounded-md bg-red-700 px-3 py-2 text-xs font-semibold text-white hover:bg-red-600"
+                >
+                  Request stop
+                </button>
+              )}
+              <button
+                type="button"
+                onClick={() => setQueueReviewItem(null)}
+                disabled={isQueueReviewRunning || Boolean(queueReviewNavigationOperation && !['completed', 'succeeded', 'canceled', 'failed'].includes(queueReviewNavigationOperation.status))}
+                className="rounded-md border border-slate-700 px-3 py-2 text-xs font-semibold text-slate-300 disabled:opacity-50"
+              >
+                Close
+              </button>
+              <button
+                type="button"
+                onClick={handleApproveQueuedExecution}
+                disabled={isQueueReviewRunning || queueReviewItem.status !== 'queued' || (queueReviewPlannerRequest?.planner_mode === PLANNER_PATH_MODES.autonomous && !queueReviewNavigationPreview)}
+                className="rounded-md bg-emerald-600 px-3 py-2 text-xs font-semibold text-white hover:bg-emerald-500 disabled:cursor-not-allowed disabled:opacity-50"
+              >
+                {isQueueReviewRunning ? 'Starting…' : 'Approve & run queued request'}
+              </button>
+            </footer>
+          </section>
+        </div>
+      )}
     </div>
   );
 }

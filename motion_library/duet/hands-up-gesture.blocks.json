@@ -1,0 +1,15 @@
+{
+  "format": "uni-edu-studio-block-example-v1",
+  "controller_version": "duet",
+  "name": "hands-up-gesture",
+  "title": "Hands Up Gesture",
+  "blocks": [
+    {
+      "type": "duet_command_gesture_hands_up",
+      "method": "gesture_hands_up",
+      "inputs": [
+        "1"
+      ]
+    }
+  ]
+}

@@ -1,0 +1,41 @@
+{
+  "format": "uni-edu-studio-block-example-v1",
+  "controller_version": "legacy",
+  "name": "walk-backward-then-clap",
+  "title": "Walk Backwards Then Clap",
+  "blocks": [
+    {
+      "type": "g1_command_stand",
+      "method": "stand",
+      "inputs": []
+    },
+    {
+      "type": "g1_command_backward",
+      "method": "backward",
+      "inputs": [
+        "2"
+      ]
+    },
+    {
+      "type": "g1_command_wait",
+      "method": "wait",
+      "inputs": [
+        "2"
+      ]
+    },
+    {
+      "type": "g1_command_arm_action_clap",
+      "method": "arm_action",
+      "inputs": [
+        "\"clap\""
+      ]
+    },
+    {
+      "type": "g1_command_wait",
+      "method": "wait",
+      "inputs": [
+        "2"
+      ]
+    }
+  ]
+}

@@ -1,0 +1,13 @@
+{
+  "format": "uni-edu-studio-block-example-v1",
+  "controller_version": "duet",
+  "name": "turn-around-180",
+  "title": "Turn Around 180",
+  "blocks": [
+    {
+      "type": "duet_command_turn_around_180",
+      "method": "turn_around_180",
+      "inputs": []
+    }
+  ]
+}

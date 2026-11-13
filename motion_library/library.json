@@ -1,0 +1,194 @@
+[
+  {
+    "name": "walk-forward",
+    "title": "Walk Forward",
+    "description": "Get ready, then take two small forward steps.",
+    "code": "robot.stand()\nrobot.wait(2)\nrobot.walk(2)",
+    "controller_version": "legacy",
+    "builtin": true
+  },
+  {
+    "name": "walk-backward",
+    "title": "Walk Backward",
+    "description": "Get ready, then take two small backward steps.",
+    "code": "robot.stand()\nrobot.wait(2)\nrobot.backward(2)",
+    "controller_version": "legacy",
+    "builtin": true
+  },
+  {
+    "name": "turn-around-180",
+    "title": "Turn Around 180",
+    "description": "Turn in place by about 180 degrees. The final angle is approximate.",
+    "code": "robot.stand()\nrobot.wait(2)\nrobot.turn_around_180()",
+    "controller_version": "legacy",
+    "builtin": true
+  },
+  {
+    "name": "hands-up-gesture",
+    "title": "Hands Up Gesture",
+    "description": "Run a fixed, teacher-supervised G1 arm preset.",
+    "code": "robot.stand()\nrobot.wait(2)\nrobot.arm_action(\"hands up\")",
+    "controller_version": "legacy",
+    "builtin": true
+  },
+  {
+    "name": "turn-left-90",
+    "title": "Turn Left 90 Degrees",
+    "description": "Get ready, pause, then make an approximate quarter turn to the left.",
+    "code": "robot.stand()\nrobot.wait(2)\nrobot.turn(\"left\", 90)",
+    "controller_version": "legacy",
+    "builtin": true
+  },
+  {
+    "name": "sidestep-right",
+    "title": "Sidestep Right",
+    "description": "Get ready, pause, then take two small steps to the right.",
+    "code": "robot.stand()\nrobot.wait(2)\nrobot.sidestep(\"right\", 2)",
+    "controller_version": "legacy",
+    "builtin": true
+  },
+  {
+    "name": "walk-backward-then-clap",
+    "title": "Walk Backwards Then Clap",
+    "description": "Walk backward, pause, then run the fixed clap arm preset.",
+    "code": "robot.stand()\nrobot.backward(2)\nrobot.wait(2)\nrobot.arm_action(\"clap\")\nrobot.wait(2)",
+    "controller_version": "legacy",
+    "builtin": true
+  },
+  {
+    "name": "high-five-turn-around-walk-forward",
+    "title": "High Five, Turn Around, Walk Forward",
+    "description": "Run a fixed high-five preset, pause, turn approximately 180 degrees, then walk forward.",
+    "code": "robot.stand()\nrobot.arm_action(\"high five\")\nrobot.wait(2)\nrobot.turn_around_180()\nrobot.walk(2)",
+    "controller_version": "legacy",
+    "builtin": true
+  },
+  {
+    "name": "walk-forward-turn-around-walk-back",
+    "title": "Walk Forward, Turn Around, Walk Back",
+    "description": "Walk forward, turn approximately 180 degrees, walk back, then stand.",
+    "code": "robot.stand()\nrobot.wait(2)\nrobot.walk(2)\nrobot.turn_around_180()\nrobot.backward(2)\nrobot.stand()",
+    "controller_version": "legacy",
+    "builtin": true
+  },
+  {
+    "name": "walk-in-a-square-looped",
+    "title": "Walk in a Square",
+    "description": "Repeat a short forward walk, left quarter-turn, and pause four times.",
+    "code": "robot.stand()\nfor _ in range(4):\n    robot.walk(2)\n    robot.turn(\"left\", 90)\n    robot.wait(2)",
+    "controller_version": "legacy",
+    "builtin": true
+  },
+  {
+    "name": "follow-along-walk-and-wave",
+    "title": "Follow Along: Walk and Wave",
+    "description": "Take one short walk, then perform a fixed hands-up gesture.",
+    "code": "robot.stand()\nrobot.wait(2)\nrobot.walk(1)\nrobot.hold_arm(\"hands up\", 2)",
+    "controller_version": "legacy",
+    "builtin": true
+  },
+  {
+    "name": "follow-along-walk-turn-return",
+    "title": "Follow Along: Walk, Turn, Return",
+    "description": "Walk, make an approximate half-turn in place, then walk back.",
+    "code": "robot.stand()\nrobot.wait(2)\nrobot.walk(2)\nrobot.turn_around_180()\nrobot.backward(2)\nrobot.stand()",
+    "controller_version": "legacy",
+    "builtin": true
+  },
+  {
+    "name": "follow-along-classroom-groove",
+    "title": "Follow Along: Classroom Groove",
+    "description": "A short walk, a quarter turn, and a fixed clap preset.",
+    "code": "robot.stand()\nrobot.wait(2)\nrobot.walk(1)\nrobot.turn(\"left\", 90)\nrobot.arm_action(\"clap\")\nrobot.stand()",
+    "controller_version": "legacy",
+    "builtin": true
+  },
+  {
+    "name": "front-sensor-stop-or-go",
+    "title": "Front Sensor: Stop or Go",
+    "description": "Requires a fresh MID-360 front-distance sample; stand instead of walking when clearance is under one metre.",
+    "code": "robot.stand()\nif robot.front_distance_m() < 1:\n    robot.stand()\nelse:\n    robot.walk(1)",
+    "controller_version": "legacy",
+    "builtin": true
+  },
+  {
+    "name": "rear-sensor-stop-or-go",
+    "title": "Rear Sensor: Stop or Go",
+    "description": "Requires a fresh MID-360 rear-distance sample; stand instead of backing up when clearance is under one metre.",
+    "code": "robot.stand()\nif robot.rear_distance_m() < 1:\n    robot.stand()\nelse:\n    robot.backward(1)",
+    "controller_version": "legacy",
+    "builtin": true
+  },
+  {
+    "name": "walk-forward",
+    "title": "Walk Forward",
+    "description": "Take one short, conservative DUET forward motion.",
+    "code": "duet.walk(1)",
+    "controller_version": "duet",
+    "builtin": true
+  },
+  {
+    "name": "walk-backward",
+    "title": "Walk Backward",
+    "description": "Take one short, conservative DUET backward motion.",
+    "code": "duet.backward(1)",
+    "controller_version": "duet",
+    "builtin": true
+  },
+  {
+    "name": "turn-around-180",
+    "title": "Turn Around 180",
+    "description": "Turn in place by about 180 degrees using bounded yaw segments. The final angle is approximate.",
+    "code": "duet.turn_around_180()",
+    "controller_version": "duet",
+    "builtin": true
+  },
+  {
+    "name": "hands-up-gesture",
+    "title": "Hands Up Gesture",
+    "description": "Run the catalogued DUET hands-up gesture through the approved arm-target gateway.",
+    "code": "duet.gesture_hands_up(1)",
+    "controller_version": "duet",
+    "builtin": true
+  },
+  {
+    "name": "follow-along-walk-and-wave",
+    "title": "Follow Along: Walk and Wave",
+    "description": "Run a short forward motion and fixed hands-up gesture concurrently.",
+    "code": "with duet.concurrent():\n    duet.walk(1)\n    duet.gesture_hands_up(1)",
+    "controller_version": "duet",
+    "builtin": true
+  },
+  {
+    "name": "follow-along-walk-turn-return",
+    "title": "Follow Along: Walk, Turn, Return",
+    "description": "Walk, make an approximate half-turn in place, then walk back.",
+    "code": "duet.walk(1)\nduet.turn_around_180()\nduet.backward(1)",
+    "controller_version": "duet",
+    "builtin": true
+  },
+  {
+    "name": "follow-along-classroom-groove",
+    "title": "Follow Along: Classroom Groove",
+    "description": "A short walk, a timed left turn, and a fixed clap gesture.",
+    "code": "duet.walk(1)\nduet.turn_left(1)\nduet.gesture_clap(1)",
+    "controller_version": "duet",
+    "builtin": true
+  },
+  {
+    "name": "front-sensor-stop-or-go",
+    "title": "Front Sensor: Stop or Go",
+    "description": "Requires a fresh MID-360 front-distance sample; explicitly stop when clearance is under one metre.",
+    "code": "if duet.front_distance_m() < 1:\n    duet.stop()\nelse:\n    duet.walk(1)",
+    "controller_version": "duet",
+    "builtin": true
+  },
+  {
+    "name": "rear-sensor-stop-or-go",
+    "title": "Rear Sensor: Stop or Go",
+    "description": "Requires a fresh MID-360 rear-distance sample; explicitly stop when clearance is under one metre.",
+    "code": "if duet.rear_distance_m() < 1:\n    duet.stop()\nelse:\n    duet.backward(1)",
+    "controller_version": "duet",
+    "builtin": true
+  }
+]

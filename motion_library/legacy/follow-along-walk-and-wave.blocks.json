@@ -1,0 +1,35 @@
+{
+  "format": "uni-edu-studio-block-example-v1",
+  "controller_version": "legacy",
+  "name": "follow-along-walk-and-wave",
+  "title": "Follow Along: Walk and Wave",
+  "blocks": [
+    {
+      "type": "g1_command_stand",
+      "method": "stand",
+      "inputs": []
+    },
+    {
+      "type": "g1_command_wait",
+      "method": "wait",
+      "inputs": [
+        "2"
+      ]
+    },
+    {
+      "type": "g1_command_walk",
+      "method": "walk",
+      "inputs": [
+        "1"
+      ]
+    },
+    {
+      "type": "g1_command_hold_arm",
+      "method": "hold_arm",
+      "inputs": [
+        "\"hands up\"",
+        "2"
+      ]
+    }
+  ]
+}

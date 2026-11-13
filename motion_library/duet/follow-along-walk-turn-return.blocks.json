@@ -1,0 +1,27 @@
+{
+  "format": "uni-edu-studio-block-example-v1",
+  "controller_version": "duet",
+  "name": "follow-along-walk-turn-return",
+  "title": "Follow Along: Walk, Turn, Return",
+  "blocks": [
+    {
+      "type": "duet_command_walk",
+      "method": "walk",
+      "inputs": [
+        "1"
+      ]
+    },
+    {
+      "type": "duet_command_turn_around_180",
+      "method": "turn_around_180",
+      "inputs": []
+    },
+    {
+      "type": "duet_command_backward",
+      "method": "backward",
+      "inputs": [
+        "1"
+      ]
+    }
+  ]
+}

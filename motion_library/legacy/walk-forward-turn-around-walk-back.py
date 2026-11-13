@@ -1,0 +1,6 @@
+robot.stand()
+robot.wait(2)
+robot.walk(2)
+robot.turn_around_180()
+robot.backward(2)
+robot.stand()

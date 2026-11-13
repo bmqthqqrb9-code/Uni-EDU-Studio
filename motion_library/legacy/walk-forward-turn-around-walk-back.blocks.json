@@ -1,0 +1,44 @@
+{
+  "format": "uni-edu-studio-block-example-v1",
+  "controller_version": "legacy",
+  "name": "walk-forward-turn-around-walk-back",
+  "title": "Walk Forward, Turn Around, Walk Back",
+  "blocks": [
+    {
+      "type": "g1_command_stand",
+      "method": "stand",
+      "inputs": []
+    },
+    {
+      "type": "g1_command_wait",
+      "method": "wait",
+      "inputs": [
+        "2"
+      ]
+    },
+    {
+      "type": "g1_command_walk",
+      "method": "walk",
+      "inputs": [
+        "2"
+      ]
+    },
+    {
+      "type": "g1_command_turn_around_180",
+      "method": "turn_around_180",
+      "inputs": []
+    },
+    {
+      "type": "g1_command_backward",
+      "method": "backward",
+      "inputs": [
+        "2"
+      ]
+    },
+    {
+      "type": "g1_command_stand",
+      "method": "stand",
+      "inputs": []
+    }
+  ]
+}

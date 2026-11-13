@@ -1,0 +1,5 @@
+robot.stand()
+robot.backward(2)
+robot.wait(2)
+robot.arm_action("clap")
+robot.wait(2)

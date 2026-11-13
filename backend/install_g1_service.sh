@@ -1,0 +1,215 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+PROJECT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+SDK_ENV_DIR="${G1_SDK_ENV_DIR:-$HOME/venvs/g1-sdk}"
+if [[ ! -x "$SDK_ENV_DIR/bin/python" ]]; then
+  SDK_ENV_DIR="$HOME/venvs/g1-sdk-py312"
+fi
+PYTHON="$SDK_ENV_DIR/bin/python"
+DUET_CONTROL_DIR="${DUET_CONTROL_DIR:-$HOME/.cache/uni-edu-duet}"
+UNITREE_INTERFACE="${UNITREE_INTERFACE:-eth0}"
+
+if [[ ! -x "$PYTHON" ]]; then
+  echo "Unitree SDK virtual environment not found. Set G1_SDK_ENV_DIR to its path." >&2
+  exit 1
+fi
+if [[ "$DUET_CONTROL_DIR" != /* ]]; then
+  echo "DUET_CONTROL_DIR must be an absolute path." >&2
+  exit 1
+fi
+if ! command -v npm >/dev/null 2>&1; then
+  echo "Node.js and npm are required for the initial frontend build." >&2
+  exit 1
+fi
+
+LIDAR_CONFIGURED=0
+LIDAR_CONFIG_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/uni-edu-studio"
+LIDAR_ENV_FILE="$LIDAR_CONFIG_DIR/lidar.env"
+LIDAR_PREVIOUSLY_INSTALLED=0
+if [[ -f "$LIDAR_CONFIG_DIR/lidar-installed" && -f "$LIDAR_ENV_FILE" ]]; then
+  LIDAR_PREVIOUSLY_INSTALLED=1
+fi
+if [[ "${INSTALL_G1_LIDAR:-0}" == "1" ]]; then
+  if bash "$PROJECT_DIR/backend/install_g1_lidar.sh"; then
+    LIDAR_CONFIGURED=1
+  else
+    if [[ "$LIDAR_PREVIOUSLY_INSTALLED" == "1" ]]; then
+      echo "WARNING: LiDAR setup retry did not complete; preserving the existing LiDAR installation and configuration." >&2
+    else
+      echo "WARNING: LiDAR setup did not complete; continuing with the G1 SDK backend and ordinary supported SDK commands." >&2
+      echo "Distance-condition programs will remain fail-closed until LiDAR setup succeeds." >&2
+    fi
+  fi
+elif [[ -f "$LIDAR_CONFIG_DIR/lidar-installed" ]]; then
+  LIDAR_CONFIGURED=1
+fi
+
+echo "Checking Unitree SDK imports using $PYTHON"
+CYCLONEDDS_HOME="$HOME/cyclonedds/install" "$PYTHON" -c \
+  "from unitree_sdk2py.core.channel import ChannelFactoryInitialize; from unitree_sdk2py.g1.loco.g1_loco_client import LocoClient"
+
+echo "Preparing the vendored DUET G1 controller (without starting it)"
+python3 "$PROJECT_DIR/backend/duet_setup.py" --prepare
+DUET_EXPECTED_POLICY_ID="$(python3 "$PROJECT_DIR/backend/duet_setup.py" --policy-id)"
+echo "DUET backend policy identity: $DUET_EXPECTED_POLICY_ID"
+python3 "$PROJECT_DIR/vendor/DUET/deploy/robots/g1_23dof/install_user_service.py" \
+  --interface "$UNITREE_INTERFACE" \
+  --control-dir "$DUET_CONTROL_DIR"
+
+echo "Installing backend dependencies"
+"$PYTHON" -m pip install -r "$PROJECT_DIR/backend/requirements.txt"
+
+echo "Preparing hosted frontend dependencies (cached packages are preferred)"
+cd "$PROJECT_DIR"
+if ! npm install --prefer-offline --no-audit --no-fund; then
+  echo "Frontend dependency installation failed; see npm output above." >&2
+  exit 1
+fi
+echo "Building the hosted frontend bundle"
+npm run build
+
+UNIT_DIR="$HOME/.config/systemd/user"
+mkdir -p "$UNIT_DIR"
+cat > "$UNIT_DIR/uni-edu-studio.service" <<EOF
+[Unit]
+Description=Uni EDU Studio G1 robot control backend
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=$PROJECT_DIR
+Environment=CYCLONEDDS_HOME=$HOME/cyclonedds/install
+Environment=UNITREE_DOMAIN_ID=0
+Environment=UNITREE_INTERFACE=$UNITREE_INTERFACE
+Environment=UNI_EDU_PORT=5179
+Environment=DUET_CONTROL_DIR=$DUET_CONTROL_DIR
+Environment=DUET_EXPECTED_POLICY_ID=$DUET_EXPECTED_POLICY_ID
+ExecStart=$PYTHON $PROJECT_DIR/backend/server.py
+Restart=on-failure
+RestartSec=3
+
+[Install]
+WantedBy=default.target
+EOF
+
+if [[ "$LIDAR_CONFIGURED" == "1" || -f "$LIDAR_ENV_FILE" ]]; then
+  python3 - "$UNIT_DIR/uni-edu-studio.service" "$LIDAR_ENV_FILE" "$LIDAR_CONFIGURED" <<'PY'
+from pathlib import Path
+import sys
+
+unit_path = Path(sys.argv[1])
+environment_file = sys.argv[2]
+lidar_setup_succeeded = sys.argv[3] == "1"
+unit = unit_path.read_text(encoding="utf-8")
+environment = Path(environment_file).read_text(encoding="utf-8").splitlines()
+settings = dict(line.split("=", 1) for line in environment if "=" in line)
+runtime = settings.get("G1_LIDAR_ROS_RUNTIME", "")
+driver_required = settings.get("G1_LIDAR_DRIVER_REQUIRED", "1") == "1"
+axis_confirmed = settings.get("G1_LIDAR_AXIS_CONFIRMED") == "1"
+calibration_confirmed = settings.get("G1_DISTANCE_CALIBRATION_CONFIRMED") == "1"
+if lidar_setup_succeeded and runtime == "host":
+    dependencies = []
+    if driver_required:
+        dependencies.append("uni-edu-lidar-driver.service")
+    if axis_confirmed and calibration_confirmed:
+        dependencies.append("uni-edu-lidar-provider.service")
+    if dependencies:
+        dependency_list = " ".join(dependencies)
+        unit = unit.replace(
+            "Wants=network-online.target\n",
+            f"Wants=network-online.target {dependency_list}\n",
+        )
+        unit = unit.replace(
+            "After=network-online.target\n",
+            f"After=network-online.target {dependency_list}\n",
+        )
+unit = unit.replace("[Service]\n", f"[Service]\nEnvironmentFile={environment_file}\n")
+unit_path.write_text(unit, encoding="utf-8")
+PY
+fi
+
+systemctl --user daemon-reload
+if [[ "$LIDAR_CONFIGURED" == "1" ]]; then
+  AXIS_SETTING="$(grep '^G1_LIDAR_AXIS_CONFIRMED=' "$LIDAR_ENV_FILE" || printf 'G1_LIDAR_AXIS_CONFIRMED=1')"
+  AXIS_CONFIRMED="${AXIS_SETTING#*=}"
+  CALIBRATION_SETTING="$(grep '^G1_DISTANCE_CALIBRATION_CONFIRMED=' "$LIDAR_ENV_FILE" || printf 'G1_DISTANCE_CALIBRATION_CONFIRMED=0')"
+  CALIBRATION_CONFIRMED="${CALIBRATION_SETTING#*=}"
+  DRIVER_SETTING="$(grep '^G1_LIDAR_DRIVER_REQUIRED=' "$LIDAR_ENV_FILE" || printf 'G1_LIDAR_DRIVER_REQUIRED=1')"
+  DRIVER_REQUIRED="${DRIVER_SETTING#*=}"
+  if grep -q '^G1_LIDAR_ROS_RUNTIME=host$' "$LIDAR_ENV_FILE"; then
+    if [[ "$DRIVER_REQUIRED" == "1" ]]; then
+      systemctl --user enable --now uni-edu-lidar-driver.service
+    else
+      echo "Reusing the discovered ROS point-cloud stream; no Livox driver service will be started."
+    fi
+    if [[ "$AXIS_CONFIRMED" == "1" && "$CALIBRATION_CONFIRMED" == "1" ]]; then
+      systemctl --user enable --now uni-edu-lidar-provider.service
+    else
+      systemctl --user disable --now uni-edu-lidar-provider.service >/dev/null 2>&1 || true
+    fi
+  fi
+  if [[ "$AXIS_CONFIRMED" != "1" || "$CALIBRATION_CONFIRMED" != "1" ]]; then
+    if [[ "$DRIVER_REQUIRED" == "1" ]]; then
+      echo "MID-360 driver installed for diagnostics; distance provider/conditions remain disabled pending axis and metric calibration verification."
+    else
+      echo "Existing sensor stream is available for diagnostics; physical distance conditions remain disabled pending verified calibration."
+    fi
+  else
+    echo "Sensor provider service is installed. Fresh sensor data will be checked only after a teacher clicks Connect."
+  fi
+elif [[ -f "$LIDAR_ENV_FILE" ]]; then
+  echo "LiDAR setup did not complete; reusing the saved provider configuration for diagnostics."
+  SAVED_ROS_RUNTIME="$(awk -F= '$1 == "G1_LIDAR_ROS_RUNTIME" {sub(/^[^=]*=/, ""); print; exit}' "$LIDAR_ENV_FILE")"
+  if [[ "$SAVED_ROS_RUNTIME" == "container" ]]; then
+    PROVIDER_SERVICE_MANAGER=(sudo systemctl)
+  elif [[ "$SAVED_ROS_RUNTIME" == "host" ]]; then
+    PROVIDER_SERVICE_MANAGER=(systemctl --user)
+  else
+    PROVIDER_SERVICE_MANAGER=()
+  fi
+  if [[ "${#PROVIDER_SERVICE_MANAGER[@]}" -gt 0 ]] &&
+     "${PROVIDER_SERVICE_MANAGER[@]}" cat uni-edu-lidar-provider.service >/dev/null 2>&1; then
+    echo "Starting the previously configured LiDAR provider for diagnostics; distance remains fail-closed without fresh validated data."
+    if ! "${PROVIDER_SERVICE_MANAGER[@]}" restart uni-edu-lidar-provider.service; then
+      echo "WARNING: The existing LiDAR provider could not be restarted; inspect its service logs." >&2
+    fi
+  else
+    echo "No existing LiDAR provider service is available to start; sensor diagnostics will report it unavailable." >&2
+  fi
+fi
+systemctl --user enable uni-edu-studio.service
+systemctl --user restart uni-edu-studio.service
+APP_READY=0
+for attempt in {1..15}; do
+  if "$PYTHON" -c \
+    'from urllib.request import ProxyHandler, build_opener; build_opener(ProxyHandler({})).open("http://127.0.0.1:5179/", timeout=1).read(1)' \
+    >/dev/null 2>&1; then
+    APP_READY=1
+    break
+  fi
+  sleep 1
+done
+if [[ "$APP_READY" != "1" ]]; then
+  echo "Uni EDU Studio did not serve its frontend on http://127.0.0.1:5179 after restart." >&2
+  echo "Service status and recent logs:" >&2
+  systemctl --user --no-pager -l status uni-edu-studio.service >&2 || true
+  journalctl --user -u uni-edu-studio.service -n 40 --no-pager >&2 || true
+  exit 1
+fi
+sudo loginctl enable-linger "$USER"
+
+echo
+echo "Uni EDU Studio is serving its frontend and will start automatically at boot."
+echo "Open http://<this-computer-wifi-ip>:5179 on a device connected to the same Wi-Fi."
+echo "Check service status with: systemctl --user status uni-edu-studio"
+echo "DUET controller unit is installed but is NOT enabled or started."
+echo "Before any operator start: verify robot model, clear the area, have a qualified operator present, review the unit, and confirm the chosen DDS interface."
+echo "Only when the operator is ready, start it explicitly with: systemctl --user start duet-g1-controller.service"
+echo "DUET backend socket directory: $DUET_CONTROL_DIR"
+if [[ "$LIDAR_CONFIGURED" != "1" && "$LIDAR_PREVIOUSLY_INSTALLED" != "1" ]]; then
+  echo "The app/backend is installed without LiDAR. SDK connection and supported non-conditional SDK commands remain available."
+elif [[ "$LIDAR_CONFIGURED" != "1" && "$LIDAR_PREVIOUSLY_INSTALLED" == "1" ]]; then
+  echo "The existing LiDAR services/configuration were preserved; the latest LiDAR setup retry did not complete."
+fi

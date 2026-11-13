@@ -1,0 +1,351 @@
+import { createEmptyG1Edu23State, G1_EDU_23_ENV } from './g1Edu23Env.js';
+import {
+  getDuetCommand,
+  parseDuetProgram,
+} from './duetCommands.js';
+import { G1_NOMINAL_STEP_METERS } from './g1Commands.js';
+import { getDuetArmCatalog, getDuetArmPoseTarget } from './duetArmCatalog.js';
+import { G1_MODEL_INFO } from './g1ModelRuntime.js';
+import { getG1GaitEnvelope, getG1GaitJointTargets } from './g1Gait.js';
+
+const FRAME_RATE = 30;
+const RADIANS_TO_DEGREES = 180 / Math.PI;
+const ARM_POSE_CARRY = getDuetArmPoseTarget('carry');
+const ARM_JOINT_NAMES = getDuetArmCatalog().jointOrder;
+
+function appendFrame(frames, state, joints, actions, timeline, elapsed, mode = 'duet-preview') {
+  const snapshot = {
+    ...state,
+    path: [...state.path],
+    joints: { ...joints },
+    actions: [...actions],
+    timeline: [...timeline],
+    mode,
+    time: Number(elapsed.toFixed(3)),
+    collisions: 0,
+    blocked: false,
+  };
+  frames.push(snapshot);
+}
+
+function getGaitPhaseIncrement(vx, vy, yawRate, duration) {
+  const translationPhase = Math.hypot(vx, vy) * duration / (2 * G1_NOMINAL_STEP_METERS);
+  const turnPhase = Math.abs(yawRate) * duration / (Math.PI / 2);
+  return Math.max(translationPhase, turnPhase);
+}
+
+function simulateMove(command, frames, state, joints, actions, timeline, elapsed) {
+  const [vx, vy, yawRate, duration] = command.values;
+  const frameCount = Math.max(1, Math.ceil(duration * FRAME_RATE));
+  let gaitPhase = 0;
+  actions.push({
+    label: 'DUET velocity',
+    summary: `vx ${vx.toFixed(2)} m/s, vy ${vy.toFixed(2)} m/s, yaw ${yawRate.toFixed(2)} rad/s for ${duration.toFixed(1)} s`,
+  });
+  timeline.push(actions[actions.length - 1]);
+  for (let frame = 0; frame < frameCount; frame += 1) {
+    const dt = duration / frameCount;
+    const headingRadians = (state.heading * Math.PI) / 180;
+    state.x += (vx * Math.cos(headingRadians) - vy * Math.sin(headingRadians)) * dt;
+    state.y += (vx * Math.sin(headingRadians) + vy * Math.cos(headingRadians)) * dt;
+    state.heading += yawRate * dt * RADIANS_TO_DEGREES;
+    state.torsoPitch = vx * 12;
+    state.torsoRoll = vy * 12;
+    state.path.push({ x: Number(state.x.toFixed(3)), y: Number(state.y.toFixed(3)) });
+    elapsed.value += dt;
+    gaitPhase += getGaitPhaseIncrement(vx, vy, yawRate, dt);
+    const progress = (frame + 1) / frameCount;
+    Object.assign(
+      joints,
+      getG1GaitJointTargets(
+        gaitPhase * Math.PI * 2,
+        Math.hypot(vx, vy) > 0 || Math.abs(yawRate) > 0
+          ? getG1GaitEnvelope(progress)
+          : 0,
+        state.torsoPitch,
+        state.torsoRoll,
+      ),
+    );
+    appendFrame(frames, state, joints, actions, timeline, elapsed.value);
+  }
+  state.torsoPitch = 0;
+  state.torsoRoll = 0;
+  Object.assign(joints, getG1GaitJointTargets(gaitPhase * Math.PI * 2, 0));
+  appendFrame(frames, state, joints, actions, timeline, elapsed.value);
+}
+
+function simulateArmTarget(target, duration, label, frames, state, joints, actions, timeline, elapsed) {
+  const initial = ARM_JOINT_NAMES.map((name) => joints[name] || 0);
+  const targetDegrees = target.map((radians) => radians * RADIANS_TO_DEGREES);
+  const frameCount = Math.max(1, Math.ceil(duration * FRAME_RATE));
+  const posePreset = ['carry', 'forward', 'box_hold'].includes(label);
+  actions.push({
+    label: 'DUET arm pose',
+    summary: `Preview ${posePreset ? 'the ' : ''}${label.replaceAll('_', ' ')}${posePreset ? ' preset' : ''} over ${duration.toFixed(1)} s`,
+  });
+  timeline.push(actions[actions.length - 1]);
+  for (let frame = 1; frame <= frameCount; frame += 1) {
+    const progress = frame / frameCount;
+    ARM_JOINT_NAMES.forEach((name, index) => {
+      joints[name] = Number((initial[index] + (targetDegrees[index] - initial[index]) * progress).toFixed(2));
+    });
+    elapsed.value += duration / frameCount;
+    appendFrame(frames, state, joints, actions, timeline, elapsed.value);
+  }
+}
+
+function simulateConcurrent(movement, gesture, frames, state, joints, actions, timeline, elapsed, heldPose) {
+  const movementPreset = getDuetCommand(movement.method)?.motion;
+  const [vx, vy, yawRate, moveDuration] = movementPreset
+    ? [movementPreset.vx, movementPreset.vy, movementPreset.yawRate, movement.values[0]]
+    : movement.values;
+  const armDefinition = getDuetCommand(gesture.method);
+  const isPoseHold = armDefinition.poseInput;
+  const armDuration = isPoseHold ? (gesture.values[0] || moveDuration) : gesture.values[0];
+  const armSequence = isPoseHold
+    ? [{
+      pose: gesture.poseName,
+      target: getDuetArmPoseTarget(gesture.poseName),
+      duration: 1,
+    }]
+    : armDefinition.armTargets.map((target, index) => ({
+      pose: armDefinition.armPoses[index],
+      target,
+      duration: armDuration,
+    }));
+  const totalArmDuration = isPoseHold
+    ? gesture.method === 'hold_pose' ? 1 + armDuration : Math.max(1, moveDuration)
+    : armSequence.reduce((total, step) => total + step.duration, 0);
+  const totalDuration = Math.max(moveDuration, totalArmDuration);
+  actions.push({
+    label: 'DUET concurrent move + arm',
+    summary: `Preview ${gesture.method.replaceAll('_', ' ')} while ${movement.method === 'move' ? `moving at vx ${vx.toFixed(2)}, vy ${vy.toFixed(2)}, yaw ${yawRate.toFixed(2)}` : `performing ${movement.method.replaceAll('_', ' ')}`} for ${moveDuration.toFixed(1)} s`,
+  });
+  timeline.push(actions[actions.length - 1]);
+
+  let taskElapsed = 0;
+  let armIndex = 0;
+  let armSegmentStart = 0;
+  let gaitPhase = 0;
+  let armInitial = ARM_JOINT_NAMES.map((name) => joints[name] || 0);
+  while (taskElapsed < totalDuration) {
+    const dt = Math.min(1 / FRAME_RATE, totalDuration - taskElapsed);
+    if (taskElapsed < moveDuration) {
+      const moveDt = Math.min(dt, moveDuration - taskElapsed);
+      const headingRadians = (state.heading * Math.PI) / 180;
+      state.x += (vx * Math.cos(headingRadians) - vy * Math.sin(headingRadians)) * moveDt;
+      state.y += (vx * Math.sin(headingRadians) + vy * Math.cos(headingRadians)) * moveDt;
+      state.heading += yawRate * moveDt * RADIANS_TO_DEGREES;
+      state.torsoPitch = vx * 12;
+      state.torsoRoll = vy * 12;
+      state.path.push({ x: Number(state.x.toFixed(3)), y: Number(state.y.toFixed(3)) });
+      gaitPhase += getGaitPhaseIncrement(vx, vy, yawRate, moveDt);
+    } else {
+      state.torsoPitch = 0;
+      state.torsoRoll = 0;
+    }
+    while (
+      armIndex + 1 < armSequence.length
+      && taskElapsed >= armSegmentStart + armSequence[armIndex].duration
+    ) {
+      armInitial = armSequence[armIndex].target.map((radians) => radians * RADIANS_TO_DEGREES);
+      armSegmentStart += armSequence[armIndex].duration;
+      armIndex += 1;
+    }
+    const currentArm = armSequence[armIndex];
+    const targetDegrees = currentArm.target.map((radians) => radians * RADIANS_TO_DEGREES);
+    const armProgress = Math.min(1, (taskElapsed + dt - armSegmentStart) / currentArm.duration);
+    const moveProgress = Math.min(1, (taskElapsed + dt) / Math.max(moveDuration, 0.001));
+    Object.assign(
+      joints,
+      getG1GaitJointTargets(
+        gaitPhase * Math.PI * 2,
+        taskElapsed + dt < moveDuration && (Math.hypot(vx, vy) > 0 || Math.abs(yawRate) > 0)
+          ? getG1GaitEnvelope(moveProgress)
+          : 0,
+        state.torsoPitch,
+        state.torsoRoll,
+      ),
+    );
+    ARM_JOINT_NAMES.forEach((name, index) => {
+      joints[name] = Number((armInitial[index] + (targetDegrees[index] - armInitial[index]) * armProgress).toFixed(2));
+    });
+    taskElapsed += dt;
+    elapsed.value += dt;
+    appendFrame(frames, state, joints, actions, timeline, elapsed.value);
+  }
+  state.torsoPitch = 0;
+  state.torsoRoll = 0;
+  const settledGait = getG1GaitJointTargets(gaitPhase * Math.PI * 2, 0);
+  Object.entries(settledGait).forEach(([name, value]) => {
+    if (!ARM_JOINT_NAMES.includes(name)) joints[name] = value;
+  });
+  appendFrame(frames, state, joints, actions, timeline, elapsed.value);
+  if (isPoseHold && gesture.method === 'hold_pose_until_reset') {
+    heldPose.name = gesture.poseName;
+  } else if (isPoseHold && gesture.method === 'hold_pose') {
+    simulateArmTarget(ARM_POSE_CARRY, 1, 'carry', frames, state, joints, actions, timeline, elapsed);
+  }
+}
+
+function closestObstacleDistance(state, obstacles, sector) {
+  const radians = (state.heading * Math.PI) / 180;
+  const direction = sector === 'rear' ? -1 : 1;
+  let closestDistance = 40;
+  obstacles.forEach((obstacle) => {
+    const dx = Number(obstacle.x) - state.x;
+    const dy = Number(obstacle.y) - state.y;
+    const forward = direction * (dx * Math.cos(radians) + dy * Math.sin(radians));
+    const lateral = direction * (-dx * Math.sin(radians) + dy * Math.cos(radians));
+    if (forward <= 0 || Math.abs(Math.atan2(lateral, forward)) > Math.PI / 6) return;
+    const radius = Number.isFinite(Number(obstacle.radius)) ? Math.max(0, Number(obstacle.radius)) : 0;
+    closestDistance = Math.min(closestDistance, Math.max(0, Math.hypot(forward, lateral) - radius));
+  });
+  return closestDistance;
+}
+
+function containsCommands(nodes) {
+  return nodes.some((node) => (
+    node.type === 'condition'
+      ? containsCommands(node.then) || containsCommands(node.else)
+      : node.type === 'repeat'
+        ? containsCommands(node.body)
+        : true
+  ));
+}
+
+export function simulateDuetG1Edu23Program(code, { obstacles = G1_EDU_23_ENV.defaultObstacles } = {}) {
+  const nodes = parseDuetProgram(code);
+  if (!containsCommands(nodes)) {
+    return [{
+      ...createEmptyG1Edu23State(),
+      status: 'Idle',
+      mode: 'duet-preview',
+      actions: [{ label: 'Idle', summary: 'Add a DUET command to preview the robot.' }],
+    }];
+  }
+  const state = { ...createEmptyG1Edu23State(), status: 'DUET preview' };
+  const joints = Object.fromEntries(G1_MODEL_INFO.joints.map((joint) => [joint, 0]));
+  const frames = [];
+  const actions = [];
+  const timeline = [];
+  const elapsed = { value: 0 };
+  const heldPose = { name: null };
+  appendFrame(frames, state, joints, actions, timeline, elapsed.value);
+
+  const pendingCommands = [...nodes].reverse();
+  while (pendingCommands.length) {
+    const command = pendingCommands.pop();
+    if (command.type === 'repeat') {
+      for (let iteration = 0; iteration < command.times; iteration += 1) {
+        pendingCommands.push(...[...command.body].reverse());
+      }
+      continue;
+    }
+    if (command.type === 'condition') {
+      let selectedThen;
+      let summary;
+      let label;
+      if (typeof command.value === 'boolean') {
+        selectedThen = command.value;
+        summary = `${command.code} -> ${selectedThen ? 'then' : 'else'}`;
+        label = 'Boolean condition';
+      } else {
+        const sector = command.sensor === 'rear_distance_m' ? 'rear' : 'forward';
+        const distance = closestObstacleDistance(state, obstacles, sector);
+        const operators = {
+          '<': (left, right) => left < right,
+          '<=': (left, right) => left <= right,
+          '>': (left, right) => left > right,
+          '>=': (left, right) => left >= right,
+          '==': (left, right) => left === right,
+          '!=': (left, right) => left !== right,
+        };
+        selectedThen = operators[command.operator](distance, command.threshold);
+        summary = `Nearest ${sector} obstacle: ${distance.toFixed(2)} m ${command.operator} ${command.threshold} m -> ${selectedThen ? 'then' : 'else'}`;
+        label = 'Distance condition';
+      }
+      actions.push({ label, summary });
+      timeline.push(actions[actions.length - 1]);
+      elapsed.value += 1 / FRAME_RATE;
+      appendFrame(frames, state, joints, actions, timeline, elapsed.value);
+      pendingCommands.push(...[...(selectedThen ? command.then : command.else)].reverse());
+      continue;
+    }
+    const preset = getDuetCommand(command.method)?.motion;
+    if (command.method === 'move' || preset) {
+      const movement = preset
+        ? { ...command, values: [preset.vx, preset.vy, preset.yawRate, command.values[0]] }
+        : command;
+      simulateMove(movement, frames, state, joints, actions, timeline, elapsed);
+    } else if (command.type === 'concurrent') {
+      simulateConcurrent(command.movement, command.gesture, frames, state, joints, actions, timeline, elapsed, heldPose);
+    } else if (getDuetCommand(command.method)?.armPoses) {
+      const duration = command.values[0];
+      const definition = getDuetCommand(command.method);
+      definition.armTargets.forEach((target, index) => {
+        simulateArmTarget(
+          target,
+          duration,
+          definition.armPoses[index],
+          frames,
+          state,
+          joints,
+          actions,
+          timeline,
+          elapsed,
+        );
+      });
+    } else if (command.method === 'hold_pose' || command.method === 'hold_pose_until_reset') {
+      const target = getDuetArmPoseTarget(command.poseName);
+      simulateArmTarget(target, 1, command.poseName, frames, state, joints, actions, timeline, elapsed);
+      if (command.method === 'hold_pose') {
+        const holdSeconds = command.values[0];
+        const frameCount = Math.ceil(holdSeconds * FRAME_RATE);
+        for (let frame = 0; frame < frameCount; frame += 1) {
+          elapsed.value += holdSeconds / frameCount;
+          appendFrame(frames, state, joints, actions, timeline, elapsed.value);
+        }
+        simulateArmTarget(ARM_POSE_CARRY, 1, 'carry', frames, state, joints, actions, timeline, elapsed);
+      } else {
+        heldPose.name = command.poseName;
+      }
+    } else if (command.method === 'reset_arms') {
+      simulateArmTarget(ARM_POSE_CARRY, 1, 'carry', frames, state, joints, actions, timeline, elapsed);
+      heldPose.name = null;
+    } else if (command.method === 'wait') {
+      const [duration] = command.values;
+      const frameCount = Math.max(1, Math.ceil(duration * FRAME_RATE));
+      actions.push({ label: 'Wait', summary: `Wait for ${duration.toFixed(1)} s` });
+      timeline.push(actions[actions.length - 1]);
+      for (let frame = 0; frame < frameCount; frame += 1) {
+        elapsed.value += duration / frameCount;
+        appendFrame(frames, state, joints, actions, timeline, elapsed.value);
+      }
+    } else if (command.method === 'stop') {
+      state.status = 'Stopped';
+      ARM_JOINT_NAMES.forEach((name, index) => {
+        joints[name] = Number((ARM_POSE_CARRY[index] * RADIANS_TO_DEGREES).toFixed(2));
+      });
+      heldPose.name = null;
+      actions.push({ label: 'DUET stop', summary: 'Stop requested.' });
+      timeline.push(actions[actions.length - 1]);
+      appendFrame(frames, state, joints, actions, timeline, elapsed.value);
+      break;
+    }
+  }
+  if (heldPose.name && state.status !== 'Stopped') {
+    simulateArmTarget(ARM_POSE_CARRY, 1, 'carry reset on program completion', frames, state, joints, actions, timeline, elapsed);
+  }
+  state.status = state.status === 'Stopped' ? 'Stopped' : 'DUET preview complete';
+  return frames;
+}
+
+export function getDuetSimulationModelInfo() {
+  return {
+    robotType: G1_EDU_23_ENV.robotType,
+    jointCount: G1_MODEL_INFO.jointCount,
+    jointNames: [...G1_MODEL_INFO.joints],
+    accuracy: 'Command-space preview; learned balance and physical motion are not reproduced.',
+  };
+}

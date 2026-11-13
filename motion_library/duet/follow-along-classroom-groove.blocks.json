@@ -1,0 +1,29 @@
+{
+  "format": "uni-edu-studio-block-example-v1",
+  "controller_version": "duet",
+  "name": "follow-along-classroom-groove",
+  "title": "Follow Along: Classroom Groove",
+  "blocks": [
+    {
+      "type": "duet_command_walk",
+      "method": "walk",
+      "inputs": [
+        "1"
+      ]
+    },
+    {
+      "type": "duet_command_turn_left",
+      "method": "turn_left",
+      "inputs": [
+        "1"
+      ]
+    },
+    {
+      "type": "duet_command_gesture_clap",
+      "method": "gesture_clap",
+      "inputs": [
+        "1"
+      ]
+    }
+  ]
+}

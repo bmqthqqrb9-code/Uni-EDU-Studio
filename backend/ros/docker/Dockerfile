@@ -1,0 +1,65 @@
+FROM ros:humble-ros-base-jammy
+
+ENV DEBIAN_FRONTEND=noninteractive
+ENV CMAKE_BUILD_PARALLEL_LEVEL=2
+ENV LD_LIBRARY_PATH=/usr/local/lib:/usr/local/lib/aarch64-linux-gnu
+SHELL ["/bin/bash", "-o", "pipefail", "-c"]
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    build-essential \
+    cmake \
+    git \
+    libapr1-dev \
+    libpcl-dev \
+    python3-colcon-common-extensions \
+    ros-humble-launch-ros \
+    ros-humble-pcl-conversions \
+    ros-humble-robot-state-publisher \
+    ros-humble-rosidl-default-generators \
+    ros-humble-rosidl-generator-dds-idl \
+    ros-humble-sensor-msgs-py \
+    ros-humble-std-msgs \
+    ros-humble-tf2-ros \
+    && rm -rf /var/lib/apt/lists/*
+
+COPY backend/ros/unitree_hg /opt/g1_state_ws/src/unitree_hg
+RUN source /opt/ros/humble/setup.bash \
+    && cd /opt/g1_state_ws \
+    && colcon build --packages-select unitree_hg
+
+ARG INSTALL_LIVOX_DRIVER=0
+RUN if [[ "$INSTALL_LIVOX_DRIVER" == "1" ]]; then \
+      mkdir -p /opt/livox_ws/src \
+      && git clone --depth 1 https://github.com/Livox-SDK/Livox-SDK2.git /tmp/Livox-SDK2 \
+      && cmake -S /tmp/Livox-SDK2 -B /tmp/Livox-SDK2/build \
+      && cmake --build /tmp/Livox-SDK2/build --parallel 2 \
+      && cmake --install /tmp/Livox-SDK2/build \
+      && ldconfig \
+      && ldconfig -p | grep -F 'liblivox_lidar_sdk_shared.so' \
+      && rm -rf /tmp/Livox-SDK2 \
+      && git clone --depth 1 https://github.com/Livox-SDK/livox_ros_driver2.git \
+        /opt/livox_ws/src/livox_ros_driver2 \
+      && cd /opt/livox_ws/src/livox_ros_driver2 \
+      && source /opt/ros/humble/setup.bash \
+      && bash -e ./build.sh humble \
+      && rm -rf /opt/livox_ws/src/livox_ros_driver2/.git; \
+    else \
+      echo "Skipping Livox driver build; an existing ROS point-cloud source is being reused."; \
+    fi
+
+COPY backend/ros/mid360_launch.py /opt/uni-edu/ros/mid360_launch.py
+COPY backend/ros/g1_sensor_runtime.launch.py /opt/uni-edu/ros/g1_sensor_runtime.launch.py
+COPY backend/ros/g1_joint_state_bridge.py /opt/uni-edu/ros/g1_joint_state_bridge.py
+COPY backend/ros/g1_joint_state.py /opt/uni-edu/ros/g1_joint_state.py
+COPY backend/ros_lidar_provider.py /opt/uni-edu/ros_lidar_provider.py
+COPY backend/sensor_calibration.py /opt/uni-edu/sensor_calibration.py
+COPY vendor/DUET/src/assets/robots/unitree_g1/xmls/g1_23dof.xml /opt/uni-edu/g1_23dof.xml
+COPY g1_23dof.urdf.txt /opt/uni-edu/g1_23dof.urdf.txt
+COPY backend/ros/docker/entrypoint.sh /usr/local/bin/uni-edu-ros-entrypoint
+
+ENV G1_SENSOR_URDF_PATH=/opt/uni-edu/g1_23dof.urdf.txt
+ENV G1_SENSOR_GEOMETRY_PATH=/opt/uni-edu/g1_23dof.xml
+
+RUN chmod 755 /usr/local/bin/uni-edu-ros-entrypoint
+
+ENTRYPOINT ["/usr/local/bin/uni-edu-ros-entrypoint"]

@@ -1,0 +1,39 @@
+{
+  "format": "uni-edu-studio-block-example-v1",
+  "controller_version": "legacy",
+  "name": "high-five-turn-around-walk-forward",
+  "title": "High Five, Turn Around, Walk Forward",
+  "blocks": [
+    {
+      "type": "g1_command_stand",
+      "method": "stand",
+      "inputs": []
+    },
+    {
+      "type": "g1_command_arm_action_high_five",
+      "method": "arm_action",
+      "inputs": [
+        "\"high five\""
+      ]
+    },
+    {
+      "type": "g1_command_wait",
+      "method": "wait",
+      "inputs": [
+        "2"
+      ]
+    },
+    {
+      "type": "g1_command_turn_around_180",
+      "method": "turn_around_180",
+      "inputs": []
+    },
+    {
+      "type": "g1_command_walk",
+      "method": "walk",
+      "inputs": [
+        "2"
+      ]
+    }
+  ]
+}

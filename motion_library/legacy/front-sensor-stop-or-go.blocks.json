@@ -1,0 +1,46 @@
+{
+  "format": "uni-edu-studio-block-example-v1",
+  "controller_version": "legacy",
+  "name": "front-sensor-stop-or-go",
+  "title": "Front Sensor: Stop or Go",
+  "blocks": [
+    {
+      "type": "g1_command_stand",
+      "method": "stand",
+      "inputs": []
+    },
+    {
+      "type": "controls_if",
+      "sensor_block_type": "g1_front_distance_m",
+      "operator": "<",
+      "threshold": 1.0,
+      "test": {
+        "type": "logic_compare",
+        "operator": "<",
+        "left": {
+          "type": "g1_front_distance_m"
+        },
+        "right": {
+          "type": "math_number",
+          "value": 1.0
+        }
+      },
+      "then": [
+        {
+          "type": "g1_command_stand",
+          "method": "stand",
+          "inputs": []
+        }
+      ],
+      "else": [
+        {
+          "type": "g1_command_walk",
+          "method": "walk",
+          "inputs": [
+            "1"
+          ]
+        }
+      ]
+    }
+  ]
+}
