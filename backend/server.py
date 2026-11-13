@@ -4026,6 +4026,13 @@ def duet_connect(user: dict = Depends(auth_required)):
                     or "DUET ownership is unknown; refusing to connect or change controller ownership."
                 ),
             )
+        if current.get("motionOwner") == "duet":
+            if current.get("ready") is not True:
+                raise HTTPException(
+                    status_code=409,
+                    detail="DUET owns the low-command channel, but its gateway is not ready; refusing a controller transition.",
+                )
+            return connect_duet_controller()
         if current.get("motionOwner") not in {"none", None}:
             raise HTTPException(
                 status_code=409,
@@ -4053,11 +4060,12 @@ def duet_connect(user: dict = Depends(auth_required)):
                     (
                         "The DUET controller service started in its no-command handoff state. "
                         "It did not publish low-level commands or change the FSM. Do not switch to "
-                        "FixStand if the robot is already standing in Velocity; that transition may "
-                        "change its posture. If it is already in Velocity, leave it there and press "
-                        "Connect again when the gateway is ready. If the current FSM cannot be verified, "
-                        "do not attempt a mode transition based on this status; have an onsite operator "
-                        "verify the controller and robot state."
+                        "FixStand if the robot is already in Velocity. Leave it there and press Connect "
+                        "again when the gateway is ready. A missing gateway does not establish the "
+                        "robot's actual FSM or posture. Do not attempt a mode transition based only on "
+                        "this status. A qualified onsite operator must verify the controller and robot "
+                        "state and follow the model-specific procedure before deciding whether "
+                        "FixStand then Velocity is appropriate."
                         if service_started
                         else "The DUET controller service is active, but its command gateway is unavailable "
                         "and its startup state cannot be verified. Do not attempt a mode transition based "

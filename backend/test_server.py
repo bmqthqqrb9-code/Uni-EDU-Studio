@@ -38,8 +38,9 @@ class ServerClassroomTests(unittest.TestCase):
         self.assertEqual(response["status"], "service_active_gateway_unavailable")
         self.assertTrue(response["operatorActionRequired"])
         self.assertIn("no-command handoff state", response["message"])
-        self.assertIn("Do not switch to FixStand if the robot is already standing in Velocity", response["message"])
-        self.assertIn("do not attempt a mode transition based on this status", response["message"])
+        self.assertIn("Do not switch to FixStand if the robot is already in Velocity", response["message"])
+        self.assertIn("A missing gateway does not establish the robot's actual FSM or posture", response["message"])
+        self.assertIn("Do not attempt a mode transition based only on this status", response["message"])
         start_service.assert_called_once_with()
         connect.assert_not_called()
 
@@ -57,6 +58,26 @@ class ServerClassroomTests(unittest.TestCase):
         duet_status.assert_not_called()
         service_state.assert_not_called()
         connect.assert_not_called()
+
+    def test_duet_connect_acquires_lease_when_duet_velocity_already_owns_lowcmd(self):
+        velocity_status = {
+            "connected": True,
+            "ready": True,
+            "controlLease": False,
+            "motionOwner": "duet",
+            "programActive": False,
+        }
+        connected = {**velocity_status, "controlLease": True}
+        with patch.object(
+            server, "robot_status", return_value={"sdkAvailable": True, "running": False}
+        ), patch.object(server, "duet_controller_status", return_value=velocity_status), \
+                patch.object(server, "connect_duet_controller", return_value=connected) as acquire, \
+                patch.object(server, "start_duet_controller_service") as start_service:
+            response = server.duet_connect({"role": "teacher"})
+
+        self.assertEqual(response, connected)
+        acquire.assert_called_once_with()
+        start_service.assert_not_called()
 
     def test_duet_connect_never_starts_an_already_active_but_unavailable_controller(self):
         unavailable = {

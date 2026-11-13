@@ -2478,9 +2478,12 @@ export default function App() {
     }
     if (controllerVersion === 'duet' && !isRobotConnected) {
       const approved = window.confirm(
-        'Start the DUET controller in its no-command handoff state? '
-        + 'The app will not change the FSM or issue motion. An onsite operator must verify '
-        + 'the G1 is stable before deliberately entering FixStand and Velocity with the controller.',
+        'Start the DUET controller in its no-command Handoff state? '
+        + 'Connect will not change the FSM or put the robot into Velocity, and Handoff does not '
+        + 'actively hold the robot posture. An idle legacy SDK connection may remain initialized, but its '
+        + 'motion commands are blocked while DUET is active. Connect does not change the FSM. '
+        + 'Do not use FixStand as a generic Ready step. '
+        + 'Continue only if a qualified onsite operator has verified the robot and its active controller state.',
       );
       if (!approved) return;
     }
@@ -3002,7 +3005,10 @@ export default function App() {
     try {
       const status = await nextConnection.status();
       const connected = nextVersion === 'duet'
-        ? status.connected === true && status.ready === true && status.motionOwner === 'duet'
+        ? status.connected === true
+          && status.ready === true
+          && status.controlLease === true
+          && status.motionOwner === 'duet'
         : status.sdkAvailable === true;
       if (nextVersion === 'duet') {
         const motionActive = status.motionActive === true;
